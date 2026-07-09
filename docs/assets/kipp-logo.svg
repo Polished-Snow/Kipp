@@ -1,0 +1,18 @@
+<svg width="460" height="120" viewBox="0 0 460 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="kippGrad" x1="0" y1="0" x2="460" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="0.55" stop-color="#38BDF8"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+  <!-- spark mark: a stylized token stream flowing into a chevron -->
+  <g transform="translate(18,22)">
+    <rect x="0"  y="30" width="14" height="14" rx="4" fill="#6366F1" opacity="0.55"/>
+    <rect x="22" y="30" width="14" height="14" rx="4" fill="#6366F1" opacity="0.8"/>
+    <rect x="44" y="30" width="14" height="14" rx="4" fill="url(#kippGrad)"/>
+    <path d="M70 8 L104 37 L70 66" stroke="url(#kippGrad)" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+  <text x="150" y="82" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="64" font-weight="800" letter-spacing="1" fill="url(#kippGrad)">Kipp</text>
+  <text x="152" y="106" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="15" letter-spacing="2.5" fill="#7C8698">HAND-WRITTEN INFERENCE ENGINE</text>
+</svg>

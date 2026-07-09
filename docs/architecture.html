@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — Kipp</title>
+<meta name="description" content="Kipp's design constraints, planned components, backends, and correctness boundaries.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9889;</text></svg>">
+<style>
+:root{
+  --bg:#0b0e14; --panel:#11151f; --panel2:#151a26; --border:#232a3a;
+  --text:#e6e9ef; --muted:#9aa3b2; --faint:#7c8698;
+  --accent:#6366f1; --accent2:#22d3ee;
+  --code-bg:#0d1118; --good:#34d399; --warn:#fbbf24;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
+a{color:var(--accent2);text-decoration:none}
+a:hover{text-decoration:underline}
+code,pre{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:.9em}
+code{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:.12em .4em}
+pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto;line-height:1.55}
+pre code{background:none;border:none;padding:0}
+.wrap{max-width:960px;margin:0 auto;padding:0 24px}
+header.site{position:sticky;top:0;z-index:10;background:rgba(11,14,20,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
+header.site .wrap{display:flex;align-items:center;gap:22px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--text)}
+.brand:hover{text-decoration:none}
+.brand .mark{display:inline-block;width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+nav.top{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
+nav.top a{color:var(--muted);padding:6px 11px;border-radius:8px;font-size:14px}
+nav.top a:hover{color:var(--text);background:var(--panel2);text-decoration:none}
+nav.top a.active{color:var(--text);background:var(--panel2);border:1px solid var(--border)}
+main{padding:48px 0 24px}
+.hero{text-align:center;padding:56px 0 8px}
+.hero img{max-width:420px;width:90%}
+.hero p.tag{margin:18px auto 0;max-width:640px;font-size:19px;color:var(--muted)}
+.hero .cta{margin-top:28px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-block;padding:10px 20px;border-radius:10px;font-weight:600;font-size:15px;border:1px solid var(--border);color:var(--text);background:var(--panel2)}
+.btn:hover{text-decoration:none;border-color:var(--accent)}
+.btn.primary{background:linear-gradient(135deg,var(--accent),#4f46e5);border-color:transparent}
+.btn.primary:hover{filter:brightness(1.12)}
+.notice{margin:36px 0;padding:14px 18px;border:1px solid var(--warn);border-left-width:4px;border-radius:10px;background:rgba(251,191,36,.06);color:var(--text);font-size:15px}
+h1{font-size:34px;letter-spacing:-.5px;margin-bottom:8px}
+h2{font-size:24px;margin:44px 0 14px;letter-spacing:-.3px}
+h2 .h-mark{color:var(--accent2);margin-right:8px}
+h3{font-size:18px;margin:28px 0 10px}
+p{margin:12px 0;color:var(--text)}
+p.lead{color:var(--muted);font-size:17px}
+ul,ol{margin:12px 0 12px 24px;color:var(--text)}
+li{margin:6px 0}
+li::marker{color:var(--accent2)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin:24px 0}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px 22px}
+.card h3{margin:0 0 8px;font-size:16px}
+.card p{margin:0;color:var(--muted);font-size:14.5px}
+table{width:100%;border-collapse:collapse;margin:18px 0;font-size:15px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border)}
+th{color:var(--faint);font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:1px}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid var(--border)}
+.pill.todo{color:var(--warn);border-color:rgba(251,191,36,.4)}
+.pill.ref{color:var(--good);border-color:rgba(52,211,153,.4)}
+.tree{color:var(--muted)}
+.tree b{color:var(--text)}
+footer.site{margin-top:72px;border-top:1px solid var(--border);padding:28px 0 40px;color:var(--faint);font-size:14px}
+footer.site .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+footer.site a{color:var(--muted)}
+blockquote{border-left:3px solid var(--accent);padding:4px 18px;margin:16px 0;color:var(--muted)}
+@media (max-width:640px){header.site .wrap{height:auto;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}}
+</style>
+</head>
+<body>
+<header class="site"><div class="wrap">
+  <a class="brand" href="index.html"><span class="mark"></span>Kipp</a>
+  <nav class="top"><a href="index.html">Home</a><a href="architecture.html" class="active">Architecture</a><a href="roadmap.html">Roadmap</a><a href="model-support.html">Model Support</a><a href="benchmarks.html">Benchmarks</a><a href="contributing.html">Contributing</a><a href="https://github.com/Polished-Snow/Kipp">GitHub &#8599;</a></nav>
+</div></header>
+<main><div class="wrap">
+
+<h1>Architecture</h1>
+<p class="lead">This document is intentionally model-agnostic until Kipp's first target model family is selected.</p>
+
+<h2><span class="h-mark">#</span>Design constraints</h2>
+<ul>
+  <li>Implement <strong>one model family deeply</strong> rather than building a generic runner.</li>
+  <li>Keep the inference path native and readable, with C as the center of gravity.</li>
+  <li>Use <strong>mmap-backed model loading</strong> where the selected format permits it.</li>
+  <li>Keep CPU, Metal, and CUDA behavior behind explicit boundaries.</li>
+  <li>Establish correctness on the CPU reference path <em>before</em> optimizing kernels.</li>
+  <li>Keep Python and shell outside the inference process.</li>
+</ul>
+
+<h2><span class="h-mark">#</span>Planned components</h2>
+<h3>Model and weights</h3>
+<p><code>src/kipp.c</code> will parse the selected model's metadata and tensor layout, validate supported variants, and map weights without unnecessary copies. Exact formats, quantization schemes, and tokenizer behavior remain undecided.</p>
+
+<h3>Forward pass</h3>
+<p>The reference forward pass will remain linear and model-specific so a reader can follow one token from embeddings through logits. Backend dispatch must not obscure the model's computation graph.</p>
+
+<h3>Backends</h3>
+<table>
+  <tr><th>Backend</th><th>Role</th><th>Location</th><th>Status</th></tr>
+  <tr><td><strong>CPU</strong></td><td>Correctness &amp; debugging reference, portable C11. Never optimized at the GPU paths' expense.</td><td><code>src/kipp.c</code></td><td><span class="pill todo">planned</span></td></tr>
+  <tr><td><strong>Metal</strong></td><td>Apple Silicon kernels; Objective-C confined to the bridge file.</td><td><code>src/metal/kipp_metal.m</code></td><td><span class="pill todo">planned</span></td></tr>
+  <tr><td><strong>CUDA</strong></td><td>NVIDIA kernels and launch code, isolated so CUDA changes can't silently alter other paths.</td><td><code>src/cuda/kipp_cuda.cu</code></td><td><span class="pill todo">planned</span></td></tr>
+  <tr><td><strong>ROCm / HIP</strong></td><td>Explicitly deferred to a separate, community-maintained branch.</td><td>&mdash;</td><td><span class="pill todo">deferred</span></td></tr>
+</table>
+<p>Backend interfaces, supported hardware, and kernel placement will be fixed after model selection.</p>
+
+<h3>Runtime and serving</h3>
+<p><code>src/kipp_server.c</code> will eventually provide small OpenAI- and Anthropic-compatible endpoints. Scheduling, KV-cache layout, batching, and streaming semantics remain design work; none is implemented by this scaffold.</p>
+
+<h2><span class="h-mark">#</span>Correctness boundaries</h2>
+<p>Reference test vectors will be generated by tooling and stored or reproduced under <code>tests/test-vectors/</code>. Backend outputs must be compared against the CPU reference path with tolerances documented per numeric format.</p>
+<blockquote>A backend is not considered working until it has been run on its actual hardware.</blockquote>
+
+<h2><span class="h-mark">#</span>Open decisions</h2>
+<ul>
+  <li>First model family and exact supported checkpoints</li>
+  <li>Weight container and quantization formats</li>
+  <li>Tokenizer ownership and chat-template behavior</li>
+  <li>KV-cache representation and capacity policy</li>
+  <li>Initial API surface and concurrency model</li>
+  <li>Minimum supported Apple and NVIDIA hardware</li>
+</ul>
+
+</div></main>
+<footer class="site"><div class="wrap">
+  <span>&copy; 2026 Kipp contributors &middot; MIT License</span>
+  <span>
+    <a href="https://github.com/Polished-Snow/Kipp">GitHub</a> &middot;
+    <a href="https://x.com/polished_snow">X / Twitter</a> &middot;
+    <a href="https://www.linkedin.com/company/plsn">LinkedIn</a>
+  </span>
+</div></footer>
+</body>
+</html>
