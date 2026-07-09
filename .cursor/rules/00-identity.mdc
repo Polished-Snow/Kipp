@@ -1,0 +1,9 @@
+---
+description: What Kipp is and isn't
+alwaysApply: true
+---
+Kipp is a narrow, single-model-family, hand-written inference engine —
+architecturally in the lineage of antirez/ds4 and ggml-org/whisper.cpp, not
+a generic runner like llama.cpp or vLLM. Never suggest reaching for PyTorch,
+ONNX Runtime, or another Python ML framework inside the inference path —
+tooling scripts (conversion, benchmarking) are the only place Python belongs.

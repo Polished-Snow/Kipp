@@ -1,0 +1,26 @@
+# Build products
+/build/
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+*.exe
+
+# Model artifacts and generated test data
+/models/
+*.gguf
+*.safetensors
+*.bin
+/tests/test-vectors/*
+!/tests/test-vectors/.gitkeep
+
+# Tooling caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Editor and operating-system files
+.DS_Store
+*.swp

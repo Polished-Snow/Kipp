@@ -1,0 +1,12 @@
+---
+description: Language stack and style conventions
+alwaysApply: true
+---
+- C is the primary language. Keep it C11, no compiler-specific extensions
+  unless a backend genuinely requires them.
+- Objective-C is confined to the Metal bridge file(s) only.
+- Metal Shading Language kernels live under `metal/`, CUDA kernels under
+  `cuda/`.
+- No dependency on PyTorch, JAX, or any generic tensor framework in `src/`.
+- Favor small, readable functions over generic/abstracted ones — this
+  engine targets one model family, not many; don't over-generalize.

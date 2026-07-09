@@ -1,0 +1,12 @@
+---
+description: Testing discipline before claiming something works
+alwaysApply: true
+---
+- Never report a backend (Metal/CUDA/CPU) as working unless you actually ran
+  it on that backend in this session. If you lack access to hardware for a
+  backend, say so plainly and ask before claiming success.
+- Every change to the KV cache, scheduler, or quantization path needs a
+  corresponding test in `tests/` before it's considered done.
+- When in doubt about correctness vs. speed, choose correctness first —
+  this project's parent company builds for critical systems, so "probably
+  right and fast" is not the bar.
