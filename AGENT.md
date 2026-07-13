@@ -1,7 +1,8 @@
 # Kipp — Agent Instructions
 
-Kipp is a small, hand-written inference engine for [TARGET MODEL — fill in
-once chosen]. It is not a generic model runner — keep it narrow.
+Kipp is a small, hand-written inference engine for the pinned
+`Qwen/Qwen3-4B-Base` checkpoint documented in `docs/ARCHITECTURE.md`. It is not
+a generic Qwen or GGUF runner — keep it narrow.
 
 - Core language is C. Objective-C only where Metal requires a bridge. Metal
   Shading Language for Apple GPU kernels. CUDA for NVIDIA kernels. Keep these

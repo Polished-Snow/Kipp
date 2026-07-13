@@ -14,6 +14,8 @@
 *.bin
 /tests/test-vectors/*
 !/tests/test-vectors/.gitkeep
+!/tests/test-vectors/qwen3-4b-base/
+!/tests/test-vectors/qwen3-4b-base/**
 
 # Tooling caches and local environments
 __pycache__/
