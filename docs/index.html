@@ -97,20 +97,20 @@ blockquote{border-left:3px solid var(--accent);padding:4px 18px;margin:16px 0;co
   <div class="card"><h3>&#129517; One model family, deeply</h3><p>Kipp is not a generic runner. It will support one explicitly selected model family and a small, documented set of checkpoints — in the lineage of whisper.cpp and antirez/ds4, not llama.cpp or vLLM.</p></div>
   <div class="card"><h3>&#128274; Correctness first</h3><p>The CPU path is the reference. Every GPU backend must match its outputs within documented tolerances, on real hardware, before it is called working.</p></div>
   <div class="card"><h3>&#128190; mmap-backed loading</h3><p>Model weights are mapped, not eagerly copied into RAM, wherever the selected weight format permits it.</p></div>
-  <div class="card"><h3>&#127760; Small serving surface</h3><p>A minimal server with OpenAI- and Anthropic-compatible endpoints is planned once native inference exists — scheduling and batching only arrive with correctness tests.</p></div>
+  <div class="card"><h3>&#127760; Small serving surface</h3><p>A minimal, non-streaming OpenAI Completions server runs today, one request at a time on loopback — scheduling and batching only arrive with correctness tests.</p></div>
 </div>
 
 <h2><span class="h-mark">#</span>Repository tour</h2>
-<p>The codebase is intentionally small. Every path below exists today; the source files are placeholders that compile cleanly and state their future role.</p>
+<p>The codebase is intentionally small. Every path below exists today and is implemented through the CPU oracle, KV sessions, the validated Metal backend, native sampling, and the minimal Completions server.</p>
 <pre class="tree"><code><b>Kipp/</b>
 &#9500;&#9472; <b>src/</b>
 &#9474;  &#9500;&#9472; kipp.c            &#8592; core engine: model loading, tensors, the reference forward pass
-&#9474;  &#9500;&#9472; kipp_server.c     &#8592; future OpenAI- &amp; Anthropic-compatible HTTP server
+&#9474;  &#9500;&#9472; kipp_server.c     &#8592; non-streaming OpenAI Completions server (loopback)
 &#9474;  &#9500;&#9472; <b>metal/</b>kipp_metal.m &#8592; the only Objective-C in the project; Metal bridge for Apple GPUs
 &#9474;  &#9492;&#9472; <b>cuda/</b>kipp_cuda.cu  &#8592; CUDA kernels + host launch code, isolated from other backends
 &#9500;&#9472; <b>tests/</b>
 &#9474;  &#9500;&#9472; kipp_test.c       &#8592; native test harness
-&#9474;  &#9492;&#9472; test-vectors/     &#8592; model-generated reference vectors (generated, not committed)
+&#9474;  &#9492;&#9472; test-vectors/     &#8592; pinned model-generated reference vectors
 &#9500;&#9472; <b>tools/</b>               &#8592; Python/shell tooling only — never part of inference
 &#9474;  &#9500;&#9472; download_model.sh &#8592; fetch + verify model artifacts
 &#9474;  &#9500;&#9472; convert_to_gguf.py&#8592; convert source weights into Kipp's supported format
@@ -123,10 +123,11 @@ blockquote{border-left:3px solid var(--accent);padding:4px 18px;margin:16px 0;co
 
 <h2><span class="h-mark">#</span>Building</h2>
 <p>Each backend has an explicit target — there is no auto-detection, by design:</p>
-<pre><code>make cpu          # CPU reference path (currently builds placeholders only)
-make metal        # Apple Silicon backend   — not implemented yet
-make cuda-generic # generic NVIDIA backend  — not implemented yet
-make cuda-spark   # tuned NVIDIA config     — not implemented yet</code></pre>
+<pre><code>make cpu          # CPU reference oracle + CLI
+make metal        # Apple Silicon backend   — validated on Apple M5
+make server-metal # OpenAI Completions server on the Metal backend
+make cuda-generic # generic NVIDIA backend  — unvalidated until Phase 4 hardware
+make cuda-spark   # tuned NVIDIA config     — unvalidated until Phase 4 hardware</code></pre>
 <p>The CPU target compiles with <code>-std=c11 -Wall -Wextra -Wpedantic</code> and is expected to stay warning-clean.</p>
 
 <h2><span class="h-mark">#</span>Where to go next</h2>

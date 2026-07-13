@@ -1,0 +1,118 @@
+{
+  "argmax": 6313,
+  "artifacts": {
+    "final_norm": {
+      "bytes": 10240,
+      "path": "final-norm-last.f32",
+      "sha256": "75f9c2b2c980d52b3ac8fd42055f94b9cba8c4306d73f8835d94ad3a8227a485",
+      "shape": [
+        1,
+        2560
+      ]
+    },
+    "layer0": {
+      "bytes": 10240,
+      "path": "layer0-last.f32",
+      "sha256": "7d6ed230a137244ad0942400ccbf0a86770122c3154762fc1cf3b435ec373bcf",
+      "shape": [
+        1,
+        2560
+      ]
+    },
+    "logits": {
+      "bytes": 607744,
+      "path": "logits.f32",
+      "sha256": "5bace487421e10a5d608cf62c8c77fbab375020f5c38f935a9f349c11f47cf75",
+      "shape": [
+        151936
+      ]
+    },
+    "prompt": {
+      "bytes": 9,
+      "path": "prompt.txt",
+      "sha256": "8cc2af1f1cb112e5b982be07cdb71b2a73a87e4d32a5a80413bf0b66ae58d43a"
+    },
+    "tokenizer_cases": {
+      "bytes": 469,
+      "case_count": 10,
+      "path": "tokenizer-cases.bin",
+      "sha256": "65635c812300ed9a305a7b002afffd5548b774fc3e83e6e113209fb18a83acd8"
+    },
+    "tokens": {
+      "bytes": 12,
+      "path": "tokens.u32",
+      "sha256": "8d9f88f75ede40d1cf74de51b310b3a71fd35ecf37ab5b9af06ad71d34bf1a9f",
+      "shape": [
+        3
+      ]
+    }
+  },
+  "decoded_utf8": "Hi 世界",
+  "gguf_sha256": "ed64343b88b6b551cf16ff5e3c085f30573a4f01d39d713edb6154275a50c46f",
+  "prompt_utf8": "Hi 世界",
+  "repository": "Qwen/Qwen3-4B-Base",
+  "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+  "schema": 1,
+  "source_manifest_sha256": "84078ca4abd33032a8f1dbbed2ecec7a57c4705708353c9257cffa1051f573e2",
+  "token_ids": [
+    13048,
+    220,
+    99489
+  ],
+  "tolerances": {
+    "argmax": "exact",
+    "full_logits_nmse_max": 1e-05
+  },
+  "tooling": {
+    "attention": "eager",
+    "numpy": "2.5.1",
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "python": "3.12.13",
+    "safetensors": "0.8.0",
+    "torch": "2.13.0",
+    "transformers": "5.13.0",
+    "weight_compute_dtype": "float32 cast from pinned BF16"
+  },
+  "top_10": [
+    {
+      "logit": 28.036386489868164,
+      "token_id": 6313
+    },
+    {
+      "logit": 26.579317092895508,
+      "token_id": 3837
+    },
+    {
+      "logit": 26.443376541137695,
+      "token_id": 17701
+    },
+    {
+      "logit": 26.214012145996094,
+      "token_id": 0
+    },
+    {
+      "logit": 25.993791580200195,
+      "token_id": 198
+    },
+    {
+      "logit": 25.578317642211914,
+      "token_id": 271
+    },
+    {
+      "logit": 25.1628475189209,
+      "token_id": 2219
+    },
+    {
+      "logit": 24.979652404785156,
+      "token_id": 4894
+    },
+    {
+      "logit": 24.7629337310791,
+      "token_id": 11
+    },
+    {
+      "logit": 24.709402084350586,
+      "token_id": 220
+    }
+  ]
+}

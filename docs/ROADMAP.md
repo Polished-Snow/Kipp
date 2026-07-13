@@ -1,44 +1,62 @@
 # Kipp Roadmap
 
-The order below is provisional until the first target model family is chosen.
-Correctness gates each phase; dates and performance claims are intentionally
-absent.
+This sequence is binding unless `ARCHITECTURE.md` is explicitly revised.
+Correctness gates every phase; dates and speculative performance claims are
+intentionally absent.
 
-## Phase 0 — Select and specify the model
+**Status (v0.0.1):** Phases 0 through 3 are complete and gated on Apple M5 hardware.
+Native sampling, session truncation, and the Phase 6 Completions subset
+(with SSE streaming, prefix reuse, and multi-choice requests) are
+implemented and tested. Phase 5 continuous batching is live: batched
+multi-sequence evaluation (`kipp_eval_batch`, gated batched-equals-isolated)
+plus a FIFO event-loop scheduler in the server with chunked prefill,
+admission control, and disconnect cancellation. KV blocks and prefix
+sharing across sessions remain deferred. Phase 4 CUDA code exists but stops
+short of a success claim until it runs on NVIDIA hardware.
 
-- Choose one model family and a deliberately small initial checkpoint set.
-- Confirm model and weight licenses permit the intended distribution.
-- Document tensor shapes, tokenizer behavior, precision, and hardware needs.
-- Replace target-model placeholders and write Kipp's one-line description.
+## Phase 0 — Specify the model
+
+- Pin `Qwen/Qwen3-4B-Base` and its exact revision.
+- Confirm model, tokenizer, and weight licenses.
+- Fix tensor shapes, tokenizer behavior, precision, memory, and API boundaries.
 
 ## Phase 1 — Build the CPU reference path
 
-- Define the minimal native model format and mmap-backed loader.
-- Implement tokenizer, forward pass, sampling, and deterministic test vectors.
-- Add end-to-end correctness tests for supported checkpoints.
+- Convert the pinned BF16 weights into Kipp's strict GGUF subset.
+- Implement mmap-backed loading, native tokenization, scalar operators, and
+  the readable full-prompt forward pass.
+- Pass deterministic full-logit vectors with exact argmax and NMSE at most
+  `1e-5`.
 
-## Phase 2 — Add the Metal backend
+## Phase 2 — Add the KV cache
 
-- Define a narrow C-to-Objective-C backend boundary.
-- Implement and validate Apple Silicon kernels against CPU reference outputs.
-- Measure memory use, prefill throughput, and token-generation latency.
+- Add bounded contiguous BF16 K/V storage and session lifecycle.
+- Match no-cache CPU recomputation for incremental decoding.
 
-## Phase 3 — Add isolated CUDA backends
+## Phase 3 — Add the Metal backend
 
-- Implement a generic CUDA path without coupling it to Metal internals.
-- Add a separately tuned `cuda-spark` configuration if target hardware
-  justifies it.
-- Validate both CUDA targets on actual NVIDIA hardware.
+- Implement Apple Silicon kernels behind the fixed backend boundary.
+- Validate prefill and decode against CPU on actual Metal hardware.
 
-## Phase 4 — Serve and schedule
+## Phase 4 — Add the CUDA backend
 
-- Add minimal OpenAI- and Anthropic-compatible streaming APIs.
-- Introduce batching and KV-cache management only with correctness tests.
-- Define failure behavior, resource limits, and reproducible benchmarks.
+- Implement isolated resident-weight CUDA execution.
+- Validate on the provided NVIDIA machine; stop if hardware is unavailable.
 
-## Deferred
+## Phase 5 — Continuous batching
+
+- Introduce KV blocks and a small FIFO scheduler.
+- Require batched requests to reproduce isolated execution.
+
+## Phase 6 — Serve
+
+- Add the approved non-streaming OpenAI Completions subset.
+- Keep HTTP, scheduling, and backend execution separate.
+
+## Phase 7 — Explicitly reviewed optimizations
 
 - ROCm/HIP support, on a separate community-maintained branch
 - Additional model families
 - Generic tensor-runtime or arbitrary-GGUF compatibility
+- Quantization, prefix/radix caching, SSD streaming, and speculative decoding
 - Broad API parity with llama.cpp, vLLM, or SGLang
