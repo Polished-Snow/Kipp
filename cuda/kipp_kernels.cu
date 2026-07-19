@@ -33,11 +33,10 @@ __global__ void bf16_roundtrip_kernel(const float *input, uint16_t *bits,
 }
 
 __global__ void embed_kernel(const uint16_t *embedding, float *output,
-                             uint32_t token) {
+                             uint32_t token, uint32_t length) {
     uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < KIPP_EMBEDDING_LENGTH) {
-        size_t source =
-            static_cast<size_t>(token) * KIPP_EMBEDDING_LENGTH + index;
+    if (index < length) {
+        size_t source = static_cast<size_t>(token) * length + index;
         output[index] = bf16_to_float(embedding[source]);
     }
 }
@@ -161,19 +160,19 @@ __global__ void kv_write_kernel(const float *key, const float *value,
 __global__ void cached_gqa_kernel(
     const float *query, const uint16_t *key_cache,
     const uint16_t *value_cache, float *scores, float *output, uint32_t layer,
-    uint32_t position, uint32_t capacity) {
+    uint32_t position, uint32_t capacity, uint32_t query_head_count) {
     __shared__ float reduction[KIPP_ATTENTION_HEAD_DIM];
     uint32_t query_head = blockIdx.x;
     uint32_t dimension = threadIdx.x;
-    if (query_head >= KIPP_ATTENTION_HEAD_COUNT ||
+    if (query_head >= query_head_count ||
         dimension >= KIPP_ATTENTION_HEAD_DIM) {
         return;
     }
 
     constexpr uint32_t values_per_token =
         KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
-    constexpr uint32_t queries_per_kv =
-        KIPP_ATTENTION_HEAD_COUNT / KIPP_ATTENTION_HEAD_COUNT_KV;
+    uint32_t queries_per_kv =
+        query_head_count / KIPP_ATTENTION_HEAD_COUNT_KV;
     uint32_t kv_head = query_head / queries_per_kv;
     const float *query_values =
         query + static_cast<size_t>(query_head) * KIPP_ATTENTION_HEAD_DIM;
@@ -264,9 +263,10 @@ cudaError_t kipp_cuda_launch_bf16_roundtrip(
 }
 
 cudaError_t kipp_cuda_launch_embed(const uint16_t *embedding, float *output,
-                                   uint32_t token, cudaStream_t stream) {
-    embed_kernel<<<block_count(KIPP_EMBEDDING_LENGTH), kThreads, 0, stream>>>(
-        embedding, output, token);
+                                   uint32_t token, uint32_t length,
+                                   cudaStream_t stream) {
+    embed_kernel<<<block_count(length), kThreads, 0, stream>>>(
+        embedding, output, token, length);
     return cudaGetLastError();
 }
 
@@ -317,10 +317,12 @@ cudaError_t kipp_cuda_launch_kv_write(
 cudaError_t kipp_cuda_launch_cached_gqa(
     const float *query, const uint16_t *key_cache,
     const uint16_t *value_cache, float *scores, float *output, uint32_t layer,
-    uint32_t position, uint32_t capacity, cudaStream_t stream) {
-    cached_gqa_kernel<<<KIPP_ATTENTION_HEAD_COUNT, KIPP_ATTENTION_HEAD_DIM, 0,
+    uint32_t position, uint32_t capacity, uint32_t query_head_count,
+    cudaStream_t stream) {
+    cached_gqa_kernel<<<query_head_count, KIPP_ATTENTION_HEAD_DIM, 0,
                         stream>>>(query, key_cache, value_cache, scores, output,
-                                  layer, position, capacity);
+                                  layer, position, capacity,
+                                  query_head_count);
     return cudaGetLastError();
 }
 

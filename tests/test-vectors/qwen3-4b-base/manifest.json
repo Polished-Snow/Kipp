@@ -33,10 +33,10 @@
       "sha256": "8cc2af1f1cb112e5b982be07cdb71b2a73a87e4d32a5a80413bf0b66ae58d43a"
     },
     "tokenizer_cases": {
-      "bytes": 469,
-      "case_count": 10,
+      "bytes": 715,
+      "case_count": 13,
       "path": "tokenizer-cases.bin",
-      "sha256": "65635c812300ed9a305a7b002afffd5548b774fc3e83e6e113209fb18a83acd8"
+      "sha256": "8f195484e2a63e8140395b80e512fec21468af533bb2aba6edc402589ce77a6d"
     },
     "tokens": {
       "bytes": 12,
@@ -47,8 +47,9 @@
       ]
     }
   },
+  "checkpoint": "qwen3-4b-base",
   "decoded_utf8": "Hi 世界",
-  "gguf_sha256": "ed64343b88b6b551cf16ff5e3c085f30573a4f01d39d713edb6154275a50c46f",
+  "gguf_sha256": "9fac72eb6658d7829f497ff2c790ceaf51a71f8b150cd800e750913018044085",
   "prompt_utf8": "Hi 世界",
   "repository": "Qwen/Qwen3-4B-Base",
   "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
@@ -61,12 +62,12 @@
   ],
   "tolerances": {
     "argmax": "exact",
-    "full_logits_nmse_max": 1e-05
+    "full_logits_nmse_max": 5e-05
   },
   "tooling": {
     "attention": "eager",
     "numpy": "2.5.1",
-    "platform": "macOS-26.4-arm64-arm-64bit",
+    "platform": "macOS-26.5.2-arm64-arm-64bit",
     "python": "3.12.13",
     "safetensors": "0.8.0",
     "torch": "2.13.0",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download and hash Kipp's one pinned upstream model snapshot."""
+"""Download and hash one pinned checkpoint from the supported registry."""
 
 from __future__ import annotations
 
@@ -12,20 +12,19 @@ from typing import Any
 
 from huggingface_hub import snapshot_download
 
-REPOSITORY = "Qwen/Qwen3-4B-Base"
-REVISION = "906bfd4b4dc7f14ee4320094d8b41684abff8539"
-FILES = (
+import checkpoints
+
+ALLOW_PATTERNS = (
     "LICENSE",
     "README.md",
     "config.json",
     "generation_config.json",
-    "model-00001-of-00003.safetensors",
-    "model-00002-of-00003.safetensors",
-    "model-00003-of-00003.safetensors",
+    "*.safetensors",
     "model.safetensors.index.json",
     "tokenizer.json",
     "tokenizer_config.json",
 )
+REQUIRED_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -36,60 +35,74 @@ def sha256(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
-def build_manifest(directory: pathlib.Path) -> dict[str, Any]:
-    files: dict[str, dict[str, Any]] = {}
-    for name in FILES:
-        path = directory / name
-        if not path.is_file():
-            raise FileNotFoundError(f"snapshot is missing {name}")
-        files[name] = {"bytes": path.stat().st_size, "sha256": sha256(path)}
+def build_manifest(spec: checkpoints.CheckpointSpec,
+                   directory: pathlib.Path) -> dict[str, Any]:
+    names = sorted(
+        path.name
+        for path in directory.iterdir()
+        if path.is_file() and path.name != "source-manifest.json"
+        and not path.name.endswith(".tmp")
+    )
+    for required in REQUIRED_FILES:
+        if required not in names:
+            raise FileNotFoundError(f"snapshot is missing {required}")
+    if not any(name.endswith(".safetensors") for name in names):
+        raise FileNotFoundError("snapshot holds no safetensors shards")
+    files = {
+        name: {
+            "bytes": (directory / name).stat().st_size,
+            "sha256": sha256(directory / name),
+        }
+        for name in names
+    }
     return {
         "schema": 1,
-        "repository": REPOSITORY,
-        "revision": REVISION,
+        "repository": spec.repository,
+        "revision": spec.revision,
         "files": files,
     }
 
 
-def manifest_matches(directory: pathlib.Path, manifest_path: pathlib.Path) -> bool:
+def manifest_matches(spec: checkpoints.CheckpointSpec,
+                     directory: pathlib.Path,
+                     manifest_path: pathlib.Path) -> bool:
     if not manifest_path.is_file():
         return False
     try:
         expected = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return expected == build_manifest(directory)
+        return expected == build_manifest(spec, directory)
     except (OSError, ValueError):
         return False
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--output",
-        type=pathlib.Path,
-        default=pathlib.Path("models/qwen3-4b-base/source"),
-    )
+    parser.add_argument("--checkpoint", default="qwen3-4b-base")
+    parser.add_argument("--output", type=pathlib.Path, default=None)
     args = parser.parse_args()
-    output = args.output.resolve()
+    spec = checkpoints.get(args.checkpoint)
+    output = args.output or pathlib.Path("models") / spec.id / "source"
+    output = output.resolve()
     manifest_path = output / "source-manifest.json"
 
-    if manifest_matches(output, manifest_path):
+    if output.is_dir() and manifest_matches(spec, output, manifest_path):
         print(f"Verified existing snapshot: {output}")
         return
 
     output.mkdir(parents=True, exist_ok=True)
     snapshot_download(
-        repo_id=REPOSITORY,
-        revision=REVISION,
+        repo_id=spec.repository,
+        revision=spec.revision,
         local_dir=output,
-        allow_patterns=list(FILES),
+        allow_patterns=list(ALLOW_PATTERNS),
     )
-    manifest = build_manifest(output)
+    manifest = build_manifest(spec, output)
     temporary = manifest_path.with_suffix(".json.tmp")
     temporary.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     temporary.replace(manifest_path)
-    print(f"Downloaded and verified {REPOSITORY}@{REVISION}")
+    print(f"Downloaded and verified {spec.repository}@{spec.revision}")
     print(f"Manifest: {manifest_path}")
 
 

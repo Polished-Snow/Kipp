@@ -21,6 +21,7 @@
 #endif
 
 #include "kipp.h"
+#include "kipp_chat.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -40,7 +41,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SERVER_MODEL_ID "qwen3-4b-base"
 #define SERVER_HEADER_LIMIT (64u * 1024u)
 #define SERVER_BODY_LIMIT (8u * 1024u * 1024u)
 #define SERVER_DEFAULT_PORT 8080u
@@ -54,6 +54,17 @@
 #define SERVER_OUTPUT_LIMIT (4u * 1024u * 1024u)
 
 static volatile sig_atomic_t server_running = 1;
+
+/* Identity and limits of the one loaded model, set once before serving. */
+static kipp_model_info server_info;
+
+/* Process-lifetime serving counters, exposed at GET /metrics. */
+static struct {
+    uint64_t requests_total;
+    uint64_t requests_failed_total;
+    uint64_t prompt_tokens_total;
+    uint64_t generation_tokens_total;
+} server_metrics;
 
 static void handle_stop_signal(int signal_number) {
     (void)signal_number;
@@ -511,14 +522,28 @@ static bool json_parse(const char *text, size_t length, json_value *value) {
 
 /* ------------------------------------------------------------ completions */
 
+#define SERVER_LOGIT_BIAS_LIMIT 64u
+
 typedef struct {
     char *prompt;
     uint32_t max_tokens;
     uint32_t choice_count;
     float temperature;
     float top_p;
+    uint32_t top_k;
+    float min_p;
+    float frequency_penalty;
+    float presence_penalty;
+    float repetition_penalty;
+    uint32_t bias_tokens[SERVER_LOGIT_BIAS_LIMIT];
+    float bias_values[SERVER_LOGIT_BIAS_LIMIT];
+    size_t bias_count;
     uint64_t seed;
     bool stream;
+    bool is_chat; /* chat completions: response uses message/delta shape */
+    bool logprobs_enabled;
+    uint32_t logprobs_top; /* number of top alternatives per token to report */
+    bool include_usage;    /* stream_options.include_usage */
     char *stops[SERVER_STOP_LIMIT];
     size_t stop_count;
 } completion_request;
@@ -542,6 +567,128 @@ static bool json_number_as_u32(const json_value *value, uint32_t minimum,
 }
 
 /*
+ * Parse the sampling fields shared by text and chat completions. Returns 1
+ * if the key was a recognized sampling field (handled), 0 if not this
+ * parser's key (caller keeps checking), -1 on a validation error (message
+ * written). Keeps both endpoints' sampling surface identical.
+ */
+static int parse_sampling_field(const char *key, const json_value *value,
+                                completion_request *request, char *message,
+                                size_t message_size) {
+    if (strcmp(key, "top_k") == 0) {
+        uint32_t top_k;
+        if (!json_number_as_u32(value, 0, KIPP_VOCAB_SIZE, &top_k)) {
+            (void)snprintf(message, message_size,
+                           "top_k must be an integer between 0 and %u",
+                           KIPP_VOCAB_SIZE);
+            return -1;
+        }
+        request->top_k = top_k;
+        return 1;
+    }
+    if (strcmp(key, "min_p") == 0) {
+        if (value->type != JSON_NUMBER || value->number < 0.0 ||
+            value->number > 1.0) {
+            (void)snprintf(message, message_size,
+                           "min_p must be a number between 0 and 1");
+            return -1;
+        }
+        request->min_p = (float)value->number;
+        return 1;
+    }
+    if (strcmp(key, "frequency_penalty") == 0 ||
+        strcmp(key, "presence_penalty") == 0) {
+        if (value->type != JSON_NUMBER || value->number < -2.0 ||
+            value->number > 2.0) {
+            (void)snprintf(message, message_size,
+                           "%s must be a number between -2 and 2", key);
+            return -1;
+        }
+        if (key[0] == 'f') {
+            request->frequency_penalty = (float)value->number;
+        } else {
+            request->presence_penalty = (float)value->number;
+        }
+        return 1;
+    }
+    if (strcmp(key, "repetition_penalty") == 0) {
+        if (value->type != JSON_NUMBER || value->number <= 0.0 ||
+            value->number > 4.0) {
+            (void)snprintf(message, message_size,
+                           "repetition_penalty must be greater than 0 and at "
+                           "most 4");
+            return -1;
+        }
+        request->repetition_penalty = (float)value->number;
+        return 1;
+    }
+    if (strcmp(key, "logit_bias") == 0) {
+        if (value->type != JSON_OBJECT) {
+            (void)snprintf(message, message_size,
+                           "logit_bias must be an object of token biases");
+            return -1;
+        }
+        if (value->count > SERVER_LOGIT_BIAS_LIMIT) {
+            (void)snprintf(message, message_size,
+                           "logit_bias accepts at most %u entries",
+                           SERVER_LOGIT_BIAS_LIMIT);
+            return -1;
+        }
+        for (size_t index = 0; index < value->count; ++index) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long token = strtoul(value->keys[index], &end, 10);
+            if (errno != 0 || end == value->keys[index] || *end != '\0' ||
+                token >= KIPP_VOCAB_SIZE) {
+                (void)snprintf(message, message_size,
+                               "logit_bias keys must be token ids in [0, %u)",
+                               KIPP_VOCAB_SIZE);
+                return -1;
+            }
+            const json_value *bias = &value->items[index];
+            if (bias->type != JSON_NUMBER || bias->number < -100.0 ||
+                bias->number > 100.0) {
+                (void)snprintf(message, message_size,
+                               "logit_bias values must be between -100 and 100");
+                return -1;
+            }
+            request->bias_tokens[request->bias_count] = (uint32_t)token;
+            request->bias_values[request->bias_count] = (float)bias->number;
+            ++request->bias_count;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* Parse the shared stream_options object. Returns 0 or -1 (message written). */
+static int parse_stream_options(const json_value *value,
+                                completion_request *request, char *message,
+                                size_t message_size) {
+    if (value->type != JSON_OBJECT) {
+        (void)snprintf(message, message_size,
+                       "stream_options must be an object");
+        return -1;
+    }
+    for (size_t index = 0; index < value->count; ++index) {
+        if (strcmp(value->keys[index], "include_usage") == 0) {
+            if (value->items[index].type != JSON_BOOL) {
+                (void)snprintf(message, message_size,
+                               "include_usage must be a boolean");
+                return -1;
+            }
+            request->include_usage = value->items[index].boolean;
+        } else {
+            (void)snprintf(message, message_size,
+                           "unsupported stream_options field \"%s\"",
+                           value->keys[index]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
  * Validate the request body against the supported field set. Returns 0 on
  * success; on failure writes a client-facing message and returns -1.
  */
@@ -553,6 +700,7 @@ static int parse_completion_request(const json_value *body,
     request->choice_count = 1;
     request->temperature = 1.0f;
     request->top_p = 1.0f;
+    request->repetition_penalty = 1.0f;
     request->seed = 0;
 
     if (body->type != JSON_OBJECT) {
@@ -563,11 +711,20 @@ static int parse_completion_request(const json_value *body,
     for (size_t index = 0; index < body->count; ++index) {
         const char *key = body->keys[index];
         const json_value *value = &body->items[index];
+        int sampled = parse_sampling_field(key, value, request, message,
+                                           message_size);
+        if (sampled < 0) {
+            return -1;
+        }
+        if (sampled > 0) {
+            continue;
+        }
         if (strcmp(key, "model") == 0) {
             if (value->type != JSON_STRING ||
-                strcmp(value->string, SERVER_MODEL_ID) != 0) {
+                strcmp(value->string, server_info.checkpoint_id) != 0) {
                 (void)snprintf(message, message_size,
-                               "model must be \"%s\"", SERVER_MODEL_ID);
+                               "model must be \"%s\"",
+                               server_info.checkpoint_id);
                 return -1;
             }
         } else if (strcmp(key, "prompt") == 0) {
@@ -583,12 +740,12 @@ static int parse_completion_request(const json_value *body,
                 return -1;
             }
         } else if (strcmp(key, "max_tokens") == 0) {
-            if (!json_number_as_u32(value, 1, KIPP_CONTEXT_LENGTH,
+            if (!json_number_as_u32(value, 1, server_info.context_length,
                                     &request->max_tokens)) {
                 (void)snprintf(message, message_size,
                                "max_tokens must be an integer between 1 "
                                "and %u",
-                               KIPP_CONTEXT_LENGTH);
+                               server_info.context_length);
                 return -1;
             }
         } else if (strcmp(key, "temperature") == 0) {
@@ -668,6 +825,23 @@ static int parse_completion_request(const json_value *body,
                 }
                 ++request->stop_count;
             }
+        } else if (strcmp(key, "logprobs") == 0) {
+            if (value->type == JSON_NULL) {
+                continue; /* explicit null disables logprobs */
+            }
+            uint32_t top;
+            if (!json_number_as_u32(value, 0, 5, &top)) {
+                (void)snprintf(message, message_size,
+                               "logprobs must be an integer between 0 and 5");
+                return -1;
+            }
+            request->logprobs_enabled = true;
+            request->logprobs_top = top;
+        } else if (strcmp(key, "stream_options") == 0) {
+            if (parse_stream_options(value, request, message, message_size) !=
+                0) {
+                return -1;
+            }
         } else {
             (void)snprintf(message, message_size,
                            "unsupported field \"%s\"", key);
@@ -676,6 +850,266 @@ static int parse_completion_request(const json_value *body,
     }
     if (request->prompt == NULL) {
         (void)snprintf(message, message_size, "prompt is required");
+        return -1;
+    }
+    return 0;
+}
+
+static kipp_chat_role chat_role_from_string(const char *role, bool *ok) {
+    *ok = true;
+    if (strcmp(role, "system") == 0) {
+        return KIPP_ROLE_SYSTEM;
+    }
+    if (strcmp(role, "user") == 0) {
+        return KIPP_ROLE_USER;
+    }
+    if (strcmp(role, "assistant") == 0) {
+        return KIPP_ROLE_ASSISTANT;
+    }
+    *ok = false;
+    return KIPP_ROLE_USER;
+}
+
+/*
+ * Validate a Chat Completions body and lower it to a completion_request by
+ * rendering the messages into a ChatML prompt. Shares every sampling field
+ * with the text-completion parser; the only chat-specific inputs are the
+ * `messages` array and optional `chat_template_kwargs.enable_thinking`.
+ */
+static int parse_chat_request(const json_value *body,
+                              completion_request *request, char *message,
+                              size_t message_size) {
+    memset(request, 0, sizeof(*request));
+    request->max_tokens = SERVER_DEFAULT_MAX_TOKENS;
+    request->choice_count = 1;
+    request->temperature = 1.0f;
+    request->top_p = 1.0f;
+    request->repetition_penalty = 1.0f;
+    request->is_chat = true;
+
+    if (body->type != JSON_OBJECT) {
+        (void)snprintf(message, message_size,
+                       "request body must be a JSON object");
+        return -1;
+    }
+    const json_value *messages = NULL;
+    bool enable_thinking = true;
+    bool saw_top_logprobs = false;
+    for (size_t index = 0; index < body->count; ++index) {
+        const char *key = body->keys[index];
+        const json_value *value = &body->items[index];
+        int sampled = parse_sampling_field(key, value, request, message,
+                                           message_size);
+        if (sampled < 0) {
+            return -1;
+        }
+        if (sampled > 0) {
+            continue;
+        }
+        if (strcmp(key, "messages") == 0) {
+            if (value->type != JSON_ARRAY || value->count == 0) {
+                (void)snprintf(message, message_size,
+                               "messages must be a non-empty array");
+                return -1;
+            }
+            messages = value;
+        } else if (strcmp(key, "model") == 0) {
+            if (value->type != JSON_STRING ||
+                strcmp(value->string, server_info.checkpoint_id) != 0) {
+                (void)snprintf(message, message_size, "model must be \"%s\"",
+                               server_info.checkpoint_id);
+                return -1;
+            }
+        } else if (strcmp(key, "max_tokens") == 0 ||
+                   strcmp(key, "max_completion_tokens") == 0) {
+            if (!json_number_as_u32(value, 1, server_info.context_length,
+                                    &request->max_tokens)) {
+                (void)snprintf(message, message_size,
+                               "%s must be an integer between 1 and %u", key,
+                               server_info.context_length);
+                return -1;
+            }
+        } else if (strcmp(key, "temperature") == 0) {
+            if (value->type != JSON_NUMBER || value->number < 0.0 ||
+                value->number > 2.0) {
+                (void)snprintf(message, message_size,
+                               "temperature must be a number between 0 and 2");
+                return -1;
+            }
+            request->temperature = (float)value->number;
+        } else if (strcmp(key, "top_p") == 0) {
+            if (value->type != JSON_NUMBER || value->number <= 0.0 ||
+                value->number > 1.0) {
+                (void)snprintf(message, message_size,
+                               "top_p must be greater than 0 and at most 1");
+                return -1;
+            }
+            request->top_p = (float)value->number;
+        } else if (strcmp(key, "seed") == 0) {
+            uint32_t seed;
+            if (!json_number_as_u32(value, 1, UINT32_MAX, &seed)) {
+                (void)snprintf(message, message_size,
+                               "seed must be an integer between 1 and %u",
+                               UINT32_MAX);
+                return -1;
+            }
+            request->seed = seed;
+        } else if (strcmp(key, "n") == 0) {
+            if (!json_number_as_u32(value, 1, SERVER_CHOICE_LIMIT,
+                                    &request->choice_count)) {
+                (void)snprintf(message, message_size,
+                               "n must be an integer between 1 and %u",
+                               SERVER_CHOICE_LIMIT);
+                return -1;
+            }
+        } else if (strcmp(key, "stream") == 0) {
+            if (value->type != JSON_BOOL) {
+                (void)snprintf(message, message_size,
+                               "stream must be a boolean");
+                return -1;
+            }
+            request->stream = value->boolean;
+        } else if (strcmp(key, "chat_template_kwargs") == 0) {
+            if (value->type != JSON_OBJECT) {
+                (void)snprintf(message, message_size,
+                               "chat_template_kwargs must be an object");
+                return -1;
+            }
+            for (size_t inner = 0; inner < value->count; ++inner) {
+                if (strcmp(value->keys[inner], "enable_thinking") == 0) {
+                    if (value->items[inner].type != JSON_BOOL) {
+                        (void)snprintf(message, message_size,
+                                       "enable_thinking must be a boolean");
+                        return -1;
+                    }
+                    enable_thinking = value->items[inner].boolean;
+                }
+            }
+        } else if (strcmp(key, "stop") == 0) {
+            const json_value *entries = value;
+            size_t entry_count = 1;
+            if (value->type == JSON_ARRAY) {
+                entries = value->items;
+                entry_count = value->count;
+            } else if (value->type != JSON_STRING) {
+                (void)snprintf(message, message_size,
+                               "stop must be a string or array of up to %u "
+                               "strings",
+                               SERVER_STOP_LIMIT);
+                return -1;
+            }
+            if (entry_count > SERVER_STOP_LIMIT) {
+                (void)snprintf(message, message_size,
+                               "stop accepts at most %u strings",
+                               SERVER_STOP_LIMIT);
+                return -1;
+            }
+            for (size_t stop = 0; stop < entry_count; ++stop) {
+                const json_value *entry =
+                    value->type == JSON_ARRAY ? &entries[stop] : value;
+                if (entry->type != JSON_STRING || entry->string[0] == '\0') {
+                    (void)snprintf(message, message_size,
+                                   "stop strings must be non-empty");
+                    return -1;
+                }
+                request->stops[request->stop_count] = strdup(entry->string);
+                if (request->stops[request->stop_count] == NULL) {
+                    (void)snprintf(message, message_size, "out of memory");
+                    return -1;
+                }
+                ++request->stop_count;
+            }
+        } else if (strcmp(key, "logprobs") == 0) {
+            if (value->type == JSON_NULL) {
+                continue; /* explicit null disables logprobs */
+            }
+            if (value->type != JSON_BOOL) {
+                (void)snprintf(message, message_size,
+                               "logprobs must be a boolean");
+                return -1;
+            }
+            request->logprobs_enabled = value->boolean;
+        } else if (strcmp(key, "top_logprobs") == 0) {
+            uint32_t top;
+            if (!json_number_as_u32(value, 0, 20, &top)) {
+                (void)snprintf(message, message_size,
+                               "top_logprobs must be an integer between 0 "
+                               "and 20");
+                return -1;
+            }
+            request->logprobs_top = top;
+            saw_top_logprobs = true;
+        } else if (strcmp(key, "stream_options") == 0) {
+            if (parse_stream_options(value, request, message, message_size) !=
+                0) {
+                return -1;
+            }
+        } else {
+            (void)snprintf(message, message_size, "unsupported field \"%s\"",
+                           key);
+            return -1;
+        }
+    }
+    if (saw_top_logprobs && !request->logprobs_enabled) {
+        (void)snprintf(message, message_size,
+                       "top_logprobs requires logprobs to be true");
+        return -1;
+    }
+    if (messages == NULL) {
+        (void)snprintf(message, message_size, "messages is required");
+        return -1;
+    }
+
+    kipp_chat_message *rendered = malloc(messages->count * sizeof(*rendered));
+    if (rendered == NULL) {
+        (void)snprintf(message, message_size, "out of memory");
+        return -1;
+    }
+    for (size_t index = 0; index < messages->count; ++index) {
+        const json_value *entry = &messages->items[index];
+        const char *role = NULL;
+        const char *content = NULL;
+        if (entry->type != JSON_OBJECT) {
+            free(rendered);
+            (void)snprintf(message, message_size,
+                           "message %zu must be an object", index);
+            return -1;
+        }
+        for (size_t field = 0; field < entry->count; ++field) {
+            if (strcmp(entry->keys[field], "role") == 0 &&
+                entry->items[field].type == JSON_STRING) {
+                role = entry->items[field].string;
+            } else if (strcmp(entry->keys[field], "content") == 0 &&
+                       entry->items[field].type == JSON_STRING) {
+                content = entry->items[field].string;
+            }
+        }
+        bool role_ok = false;
+        if (role == NULL || content == NULL) {
+            free(rendered);
+            (void)snprintf(message, message_size,
+                           "message %zu needs string role and content", index);
+            return -1;
+        }
+        rendered[index].role = chat_role_from_string(role, &role_ok);
+        rendered[index].content = content;
+        if (!role_ok) {
+            free(rendered);
+            (void)snprintf(message, message_size,
+                           "message %zu has an unsupported role \"%s\"", index,
+                           role);
+            return -1;
+        }
+    }
+
+    kipp_chat_options options = {server_info.variant, true, enable_thinking};
+    kipp_error error = {0};
+    int status =
+        kipp_chat_render(rendered, messages->count, &options,
+                         &request->prompt, &error);
+    free(rendered);
+    if (status != 0) {
+        (void)snprintf(message, message_size, "%s", error.message);
         return -1;
     }
     return 0;
@@ -717,7 +1151,35 @@ static size_t find_stop_match(const completion_request *request,
 
 static uint64_t completion_counter;
 
+/* Monotonic nanoseconds for the timings object (immune to wall-clock jumps). */
+static long long now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+}
+
 /* Generation state for one of a request's n choices. */
+#define SERVER_PENALTY_WINDOW 64u
+
+/* One reported alternative for a generated position (top_logprobs entry). */
+typedef struct {
+    uint32_t token;
+    float logprob;
+    char *piece;      /* detokenized text, owned */
+    size_t piece_len;
+} logprob_alt;
+
+/* Recorded logprobs for one generated token position. */
+typedef struct {
+    uint32_t token;
+    float logprob;    /* log-softmax of the raw model logits */
+    char *piece;      /* detokenized text, owned */
+    size_t piece_len;
+    size_t text_offset; /* byte offset of this token within the completion */
+    logprob_alt *alts;
+    uint32_t alt_count;
+} logprob_step;
+
 typedef struct {
     kipp_session *session;
     float *logits;
@@ -728,7 +1190,155 @@ typedef struct {
     const char *finish_reason;
     uint32_t next_token;
     bool has_next;
+    /* Most-recent generated tokens, oldest first, for penalty sampling. */
+    uint32_t recent[SERVER_PENALTY_WINDOW];
+    size_t recent_count;
+    /* Per-position logprobs, recorded at sample time when requested. */
+    logprob_step *logprobs;
+    size_t logprob_count;
+    size_t logprob_capacity;
+    size_t streamed_logprobs; /* steps already flushed on the SSE stream */
 } server_choice;
+
+static void logprob_step_free(logprob_step *step) {
+    free(step->piece);
+    for (uint32_t index = 0; index < step->alt_count; ++index) {
+        free(step->alts[index].piece);
+    }
+    free(step->alts);
+}
+
+static void choice_free_logprobs(server_choice *state) {
+    for (size_t index = 0; index < state->logprob_count; ++index) {
+        logprob_step_free(&state->logprobs[index]);
+    }
+    free(state->logprobs);
+    state->logprobs = NULL;
+    state->logprob_count = 0;
+    state->logprob_capacity = 0;
+    state->streamed_logprobs = 0;
+}
+
+/* Detokenize one token into an owned copy (kipp_text_free'd internally). */
+static int detok_copy(kipp_model *model, uint32_t token, char **out_piece,
+                      size_t *out_len) {
+    char *piece = NULL;
+    size_t length = 0;
+    kipp_error error = {0};
+    if (kipp_detokenize(model, &token, 1, &piece, &length, &error) != 0) {
+        return -1;
+    }
+    char *copy = malloc(length + 1);
+    if (copy == NULL) {
+        kipp_text_free(piece);
+        return -1;
+    }
+    memcpy(copy, piece, length);
+    copy[length] = '\0';
+    kipp_text_free(piece);
+    *out_piece = copy;
+    *out_len = length;
+    return 0;
+}
+
+/*
+ * Record log-probabilities for one generated position from the raw model
+ * logits still held in state->logits (kipp_sample_ex samples off a copy, so
+ * the buffer is untouched). Captures the chosen token plus the top_n most
+ * likely alternatives. Returns 0, or -1 on allocation/detokenize failure.
+ */
+static int choice_capture_logprobs(server_choice *state, uint32_t chosen,
+                                   uint32_t top_n, size_t text_offset,
+                                   kipp_model *model) {
+    if (state->logprob_count == state->logprob_capacity) {
+        size_t next = state->logprob_capacity ? state->logprob_capacity * 2 : 16;
+        logprob_step *grown =
+            realloc(state->logprobs, next * sizeof(*grown));
+        if (grown == NULL) {
+            return -1;
+        }
+        state->logprobs = grown;
+        state->logprob_capacity = next;
+    }
+    const float *logits = state->logits;
+
+    /* Numerically-stable log-sum-exp over the full vocabulary. */
+    float max_logit = logits[0];
+    for (size_t index = 1; index < KIPP_VOCAB_SIZE; ++index) {
+        if (logits[index] > max_logit) {
+            max_logit = logits[index];
+        }
+    }
+    double sum = 0.0;
+    for (size_t index = 0; index < KIPP_VOCAB_SIZE; ++index) {
+        sum += exp((double)logits[index] - (double)max_logit);
+    }
+    double lse = (double)max_logit + log(sum);
+
+    logprob_step *step = &state->logprobs[state->logprob_count];
+    memset(step, 0, sizeof(*step));
+    step->token = chosen;
+    step->logprob = (float)((double)logits[chosen] - lse);
+    step->text_offset = text_offset;
+    if (detok_copy(model, chosen, &step->piece, &step->piece_len) != 0) {
+        return -1;
+    }
+
+    if (top_n > 0) {
+        step->alts = calloc(top_n, sizeof(*step->alts));
+        if (step->alts == NULL) {
+            free(step->piece);
+            return -1;
+        }
+        /* Partial selection: repeatedly pick the next-highest logit. */
+        float threshold = INFINITY;
+        uint32_t threshold_token = 0;
+        for (uint32_t rank = 0; rank < top_n; ++rank) {
+            float best = -INFINITY;
+            uint32_t best_token = 0;
+            bool found = false;
+            for (size_t index = 0; index < KIPP_VOCAB_SIZE; ++index) {
+                float value = logits[index];
+                bool below = value < threshold ||
+                             (value == threshold && index > threshold_token);
+                if (below && (!found || value > best ||
+                              (value == best && index < best_token))) {
+                    best = value;
+                    best_token = (uint32_t)index;
+                    found = true;
+                }
+            }
+            if (!found) {
+                break;
+            }
+            logprob_alt *alt = &step->alts[step->alt_count];
+            alt->token = best_token;
+            alt->logprob = (float)((double)best - lse);
+            if (detok_copy(model, best_token, &alt->piece, &alt->piece_len) !=
+                0) {
+                logprob_step_free(step);
+                memset(step, 0, sizeof(*step));
+                return -1;
+            }
+            ++step->alt_count;
+            threshold = best;
+            threshold_token = best_token;
+        }
+    }
+    ++state->logprob_count;
+    return 0;
+}
+
+/* Append a generated token to the penalty window, dropping the oldest. */
+static void choice_remember_token(server_choice *state, uint32_t token) {
+    if (state->recent_count < SERVER_PENALTY_WINDOW) {
+        state->recent[state->recent_count++] = token;
+        return;
+    }
+    memmove(state->recent, state->recent + 1,
+            (SERVER_PENALTY_WINDOW - 1) * sizeof(*state->recent));
+    state->recent[SERVER_PENALTY_WINDOW - 1] = token;
+}
 
 /*
  * One cached session and its evaluated token timeline for serial prefix
@@ -774,6 +1384,8 @@ typedef struct {
     bool uses_cache;
     uint64_t id;
     long long created;
+    long long admitted_ns;     /* prompt clock start */
+    long long prefill_done_ns; /* first sample begins here */
     size_t longest_stop;
     uint32_t steps;
     bool in_use;
@@ -864,6 +1476,215 @@ static void connection_error(server_connection *conn, int status,
     sb_free(&body);
 }
 
+/*
+ * Like sb_append_json_string, but a single token's detokenized piece can be
+ * a partial UTF-8 sequence (byte-fallback tokens split multi-byte glyphs).
+ * Invalid sequences become U+FFFD so the JSON string stays valid Unicode;
+ * the exact bytes are still reported in the accompanying `bytes` array.
+ */
+static void sb_append_json_token(string_builder *builder, const char *text,
+                                 size_t length) {
+    sb_append(builder, "\"");
+    size_t index = 0;
+    while (index < length) {
+        unsigned char lead = (unsigned char)text[index];
+        size_t seq = 0;
+        if (lead < 0x80) {
+            seq = 1;
+        } else if ((lead & 0xE0) == 0xC0) {
+            seq = 2;
+        } else if ((lead & 0xF0) == 0xE0) {
+            seq = 3;
+        } else if ((lead & 0xF8) == 0xF0) {
+            seq = 4;
+        }
+        bool valid = seq >= 1 && index + seq <= length;
+        for (size_t k = 1; valid && k < seq; ++k) {
+            if (((unsigned char)text[index + k] & 0xC0) != 0x80) {
+                valid = false;
+            }
+        }
+        if (!valid) {
+            sb_append(builder, "\xEF\xBF\xBD"); /* U+FFFD */
+            ++index;
+            continue;
+        }
+        if (seq == 1) {
+            switch (lead) {
+            case '"':
+                sb_append(builder, "\\\"");
+                break;
+            case '\\':
+                sb_append(builder, "\\\\");
+                break;
+            case '\b':
+                sb_append(builder, "\\b");
+                break;
+            case '\f':
+                sb_append(builder, "\\f");
+                break;
+            case '\n':
+                sb_append(builder, "\\n");
+                break;
+            case '\r':
+                sb_append(builder, "\\r");
+                break;
+            case '\t':
+                sb_append(builder, "\\t");
+                break;
+            default:
+                if (lead < 0x20) {
+                    sb_append_format(builder, "\\u%04x", lead);
+                } else {
+                    sb_append_bytes(builder, &text[index], 1);
+                }
+                break;
+            }
+        } else {
+            sb_append_bytes(builder, &text[index], seq);
+        }
+        index += seq;
+    }
+    sb_append(builder, "\"");
+}
+
+/* JSON number for a logprob; keeps output valid if a value is non-finite. */
+static void sb_append_logprob_number(string_builder *sb, float logprob) {
+    if (isfinite(logprob)) {
+        sb_append_format(sb, "%.10g", (double)logprob);
+    } else {
+        sb_append(sb, "-1e309"); /* client reads this as -Infinity */
+    }
+}
+
+/* The token's raw UTF-8 bytes as a JSON array of integers. */
+static void sb_append_bytes_array(string_builder *sb, const char *piece,
+                                  size_t length) {
+    sb_append(sb, "[");
+    for (size_t index = 0; index < length; ++index) {
+        sb_append_format(sb, "%s%u", index ? "," : "",
+                         (unsigned)(unsigned char)piece[index]);
+    }
+    sb_append(sb, "]");
+}
+
+/* Chat logprobs: the `content` array entries for steps [from, to). */
+static void sb_append_logprobs_chat(string_builder *sb,
+                                    const logprob_step *steps, size_t from,
+                                    size_t to) {
+    for (size_t index = from; index < to; ++index) {
+        const logprob_step *step = &steps[index];
+        if (index > from) {
+            sb_append(sb, ",");
+        }
+        sb_append(sb, "{\"token\":");
+        sb_append_json_token(sb, step->piece, step->piece_len);
+        sb_append(sb, ",\"logprob\":");
+        sb_append_logprob_number(sb, step->logprob);
+        sb_append(sb, ",\"bytes\":");
+        sb_append_bytes_array(sb, step->piece, step->piece_len);
+        sb_append(sb, ",\"top_logprobs\":[");
+        for (uint32_t alt = 0; alt < step->alt_count; ++alt) {
+            if (alt > 0) {
+                sb_append(sb, ",");
+            }
+            sb_append(sb, "{\"token\":");
+            sb_append_json_token(sb, step->alts[alt].piece,
+                                 step->alts[alt].piece_len);
+            sb_append(sb, ",\"logprob\":");
+            sb_append_logprob_number(sb, step->alts[alt].logprob);
+            sb_append(sb, ",\"bytes\":");
+            sb_append_bytes_array(sb, step->alts[alt].piece,
+                                  step->alts[alt].piece_len);
+            sb_append(sb, "}");
+        }
+        sb_append(sb, "]}");
+    }
+}
+
+/* Legacy completions logprobs object for steps [from, to). */
+static void sb_append_logprobs_legacy(string_builder *sb,
+                                      const logprob_step *steps, size_t from,
+                                      size_t to) {
+    sb_append(sb, "{\"tokens\":[");
+    for (size_t index = from; index < to; ++index) {
+        if (index > from) {
+            sb_append(sb, ",");
+        }
+        sb_append_json_token(sb, steps[index].piece, steps[index].piece_len);
+    }
+    sb_append(sb, "],\"token_logprobs\":[");
+    for (size_t index = from; index < to; ++index) {
+        if (index > from) {
+            sb_append(sb, ",");
+        }
+        sb_append_logprob_number(sb, steps[index].logprob);
+    }
+    sb_append(sb, "],\"top_logprobs\":[");
+    for (size_t index = from; index < to; ++index) {
+        const logprob_step *step = &steps[index];
+        if (index > from) {
+            sb_append(sb, ",");
+        }
+        sb_append(sb, "{");
+        for (uint32_t alt = 0; alt < step->alt_count; ++alt) {
+            if (alt > 0) {
+                sb_append(sb, ",");
+            }
+            sb_append_json_token(sb, step->alts[alt].piece,
+                                 step->alts[alt].piece_len);
+            sb_append(sb, ":");
+            sb_append_logprob_number(sb, step->alts[alt].logprob);
+        }
+        sb_append(sb, "}");
+    }
+    sb_append(sb, "],\"text_offset\":[");
+    for (size_t index = from; index < to; ++index) {
+        if (index > from) {
+            sb_append(sb, ",");
+        }
+        sb_append_format(sb, "%zu", steps[index].text_offset);
+    }
+    sb_append(sb, "]}");
+}
+
+/* Emit the logprobs value for steps [from, to) per the endpoint's shape. */
+static void sb_append_logprobs_value(string_builder *sb, bool is_chat,
+                                     const logprob_step *steps, size_t from,
+                                     size_t to) {
+    if (is_chat) {
+        sb_append(sb, "{\"content\":[");
+        sb_append_logprobs_chat(sb, steps, from, to);
+        sb_append(sb, "]}");
+    } else {
+        sb_append_logprobs_legacy(sb, steps, from, to);
+    }
+}
+
+/* The llama.cpp-style timings object for a finished generation. */
+static void sb_append_timings(string_builder *sb, long long admitted_ns,
+                              long long prefill_done_ns, long long finish_ns,
+                              size_t prompt_n, uint32_t predicted_n) {
+    double prompt_ms = (double)(prefill_done_ns - admitted_ns) / 1e6;
+    double predicted_ms = (double)(finish_ns - prefill_done_ns) / 1e6;
+    if (prompt_ms < 0.0) {
+        prompt_ms = 0.0;
+    }
+    if (predicted_ms < 0.0) {
+        predicted_ms = 0.0;
+    }
+    double prompt_per_second =
+        prompt_ms > 0.0 ? (double)prompt_n * 1000.0 / prompt_ms : 0.0;
+    double predicted_per_second =
+        predicted_ms > 0.0 ? (double)predicted_n * 1000.0 / predicted_ms : 0.0;
+    sb_append_format(sb,
+                     "{\"prompt_n\":%zu,\"prompt_ms\":%.3f,"
+                     "\"prompt_per_second\":%.3f,\"predicted_n\":%u,"
+                     "\"predicted_ms\":%.3f,\"predicted_per_second\":%.3f}",
+                     prompt_n, prompt_ms, prompt_per_second, predicted_n,
+                     predicted_ms, predicted_per_second);
+}
+
 /* Queue one SSE event on a generating connection. */
 static void connection_send_sse(server_connection *conn, const char *payload,
                                 size_t payload_length) {
@@ -872,28 +1693,64 @@ static void connection_send_sse(server_connection *conn, const char *payload,
     connection_send(conn, "\n\n", 2);
 }
 
+/*
+ * Queue one streaming chunk. `logprobs_json`, when non-NULL, is the
+ * pre-rendered value for this chunk's `logprobs` field; NULL emits null.
+ */
 static void connection_send_chunk(server_connection *conn, uint64_t id,
                                   long long created, uint32_t choice,
                                   const char *delta, size_t delta_length,
-                                  const char *finish_reason) {
+                                  const char *finish_reason, bool is_chat,
+                                  const char *logprobs_json) {
     string_builder chunk = {0};
     sb_append_format(&chunk,
-                     "{\"id\":\"cmpl-%llu\",\"object\":\"text_completion\","
-                     "\"created\":%lld,\"model\":\"%s\",\"choices\":[{"
-                     "\"text\":",
-                     (unsigned long long)id, created, SERVER_MODEL_ID);
-    sb_append_json_string(&chunk, delta, delta_length);
-    if (finish_reason != NULL) {
-        sb_append_format(&chunk,
-                         ",\"index\":%u,\"logprobs\":null,"
-                         "\"finish_reason\":\"%s\"}]}",
-                         choice, finish_reason);
+                     "{\"id\":\"cmpl-%llu\",\"object\":\"%s\",\"created\":%lld,"
+                     "\"model\":\"%s\",\"choices\":[{\"%s\":",
+                     (unsigned long long)id,
+                     is_chat ? "chat.completion.chunk" : "text_completion",
+                     created, server_info.checkpoint_id,
+                     is_chat ? "delta" : "text");
+    if (is_chat) {
+        sb_append(&chunk, "{\"role\":\"assistant\",\"content\":");
+        sb_append_json_string(&chunk, delta, delta_length);
+        sb_append(&chunk, "}");
     } else {
-        sb_append_format(&chunk,
-                         ",\"index\":%u,\"logprobs\":null,"
-                         "\"finish_reason\":null}]}",
-                         choice);
+        sb_append_json_string(&chunk, delta, delta_length);
     }
+    sb_append_format(&chunk, ",\"index\":%u,\"logprobs\":%s,\"finish_reason\":",
+                     choice, logprobs_json != NULL ? logprobs_json : "null");
+    if (finish_reason != NULL) {
+        sb_append_format(&chunk, "\"%s\"}]}", finish_reason);
+    } else {
+        sb_append(&chunk, "null}]}");
+    }
+    if (!chunk.failed) {
+        connection_send_sse(conn, chunk.data, chunk.length);
+    }
+    sb_free(&chunk);
+}
+
+/*
+ * The final usage-only chunk for stream_options.include_usage: an empty
+ * choices array plus usage and timings, sent just before [DONE].
+ */
+static void connection_send_usage_chunk(server_connection *conn,
+                                        generation *gen,
+                                        uint32_t total_completion,
+                                        long long finish_ns) {
+    string_builder chunk = {0};
+    sb_append_format(
+        &chunk,
+        "{\"id\":\"cmpl-%llu\",\"object\":\"%s\",\"created\":%lld,"
+        "\"model\":\"%s\",\"choices\":[],\"usage\":{\"prompt_tokens\":%zu,"
+        "\"completion_tokens\":%u,\"total_tokens\":%zu},\"timings\":",
+        (unsigned long long)gen->id,
+        gen->request.is_chat ? "chat.completion.chunk" : "text_completion",
+        gen->created, server_info.checkpoint_id, gen->tokens.count,
+        total_completion, gen->tokens.count + total_completion);
+    sb_append_timings(&chunk, gen->admitted_ns, gen->prefill_done_ns, finish_ns,
+                      gen->tokens.count, total_completion);
+    sb_append(&chunk, "}");
     if (!chunk.failed) {
         connection_send_sse(conn, chunk.data, chunk.length);
     }
@@ -910,6 +1767,7 @@ static void connection_send_chunk(server_connection *conn, uint64_t id,
 static void generation_release(generation *gen) {
     for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
         sb_free(&gen->choices[choice].text);
+        choice_free_logprobs(&gen->choices[choice]);
         if (!gen->uses_cache) {
             kipp_session_destroy(gen->choices[choice].session);
         }
@@ -927,6 +1785,7 @@ static void generation_release(generation *gen) {
 }
 
 static void generation_fail(generation *gen, const char *detail) {
+    ++server_metrics.requests_failed_total;
     if (gen->uses_cache) {
         cache.busy = false;
         session_cache_drop();
@@ -948,6 +1807,8 @@ static void generation_fail(generation *gen, const char *detail) {
 /* Build and queue the final response, then retire the generation. */
 static void generation_finish(generation *gen) {
     server_connection *conn = gen->conn;
+    long long finish_ns = now_ns();
+    bool want_logprobs = gen->request.logprobs_enabled;
     for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
         if (gen->choices[choice].finish_reason == NULL) {
             gen->choices[choice].finish_reason = "length";
@@ -957,17 +1818,36 @@ static void generation_finish(generation *gen) {
         generation_release(gen);
         return;
     }
+    bool is_chat = gen->request.is_chat;
     if (gen->request.stream) {
+        uint32_t total_completion = 0;
         for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
             server_choice *state = &gen->choices[choice];
+            total_completion += state->completion_tokens;
+            /* Any logprob steps not yet streamed ride the final chunks. */
+            string_builder trailing = {0};
+            const char *trailing_json = NULL;
+            if (want_logprobs &&
+                state->logprob_count > state->streamed_logprobs) {
+                sb_append_logprobs_value(&trailing, is_chat, state->logprobs,
+                                         state->streamed_logprobs,
+                                         state->logprob_count);
+                state->streamed_logprobs = state->logprob_count;
+                trailing_json = trailing.failed ? NULL : trailing.data;
+            }
             if (state->text.length > state->emitted) {
                 connection_send_chunk(conn, gen->id, gen->created, choice,
                                       state->text.data + state->emitted,
                                       state->text.length - state->emitted,
-                                      NULL);
+                                      NULL, is_chat, trailing_json);
+                trailing_json = NULL; /* attached to the content chunk */
             }
             connection_send_chunk(conn, gen->id, gen->created, choice, "", 0,
-                                  state->finish_reason);
+                                  state->finish_reason, is_chat, trailing_json);
+            sb_free(&trailing);
+        }
+        if (gen->request.include_usage) {
+            connection_send_usage_chunk(conn, gen, total_completion, finish_ns);
         }
         connection_send_sse(conn, "[DONE]", 6);
         conn->phase = CONNECTION_DRAINING;
@@ -976,31 +1856,48 @@ static void generation_finish(generation *gen) {
         uint32_t total_completion = 0;
         sb_append_format(&response,
                          "{\"id\":\"cmpl-%llu\","
-                         "\"object\":\"text_completion\","
+                         "\"object\":\"%s\","
                          "\"created\":%lld,\"model\":\"%s\","
                          "\"choices\":[",
-                         (unsigned long long)gen->id, gen->created,
-                         SERVER_MODEL_ID);
+                         (unsigned long long)gen->id,
+                         is_chat ? "chat.completion" : "text_completion",
+                         gen->created, server_info.checkpoint_id);
         for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
             server_choice *state = &gen->choices[choice];
             total_completion += state->completion_tokens;
-            sb_append_format(&response, "%s{\"text\":",
-                             choice == 0 ? "" : ",");
-            sb_append_json_string(&response,
-                                  state->text.data != NULL ? state->text.data
-                                                           : "",
-                                  state->text.length);
-            sb_append_format(&response,
-                             ",\"index\":%u,\"logprobs\":null,"
-                             "\"finish_reason\":\"%s\"}",
-                             choice, state->finish_reason);
+            const char *body_text =
+                state->text.data != NULL ? state->text.data : "";
+            if (is_chat) {
+                sb_append_format(&response,
+                                 "%s{\"message\":{\"role\":\"assistant\","
+                                 "\"content\":",
+                                 choice == 0 ? "" : ",");
+                sb_append_json_string(&response, body_text, state->text.length);
+                sb_append(&response, "}");
+            } else {
+                sb_append_format(&response, "%s{\"text\":",
+                                 choice == 0 ? "" : ",");
+                sb_append_json_string(&response, body_text, state->text.length);
+            }
+            sb_append_format(&response, ",\"index\":%u,\"logprobs\":", choice);
+            if (want_logprobs) {
+                sb_append_logprobs_value(&response, is_chat, state->logprobs, 0,
+                                         state->logprob_count);
+            } else {
+                sb_append(&response, "null");
+            }
+            sb_append_format(&response, ",\"finish_reason\":\"%s\"}",
+                             state->finish_reason);
         }
         sb_append_format(&response,
                          "],\"usage\":{\"prompt_tokens\":%zu,"
                          "\"completion_tokens\":%u,"
-                         "\"total_tokens\":%zu}}",
+                         "\"total_tokens\":%zu},\"timings\":",
                          gen->tokens.count, total_completion,
                          gen->tokens.count + total_completion);
+        sb_append_timings(&response, gen->admitted_ns, gen->prefill_done_ns,
+                          finish_ns, gen->tokens.count, total_completion);
+        sb_append(&response, "}");
         if (response.failed) {
             connection_error(conn, 500, "Internal Server Error",
                              "server_error", "response allocation failed");
@@ -1039,8 +1936,12 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
                          "request body is not valid JSON");
         return -1;
     }
-    if (parse_completion_request(&body, &request, message,
-                                 sizeof(message)) != 0) {
+    bool is_chat = strcmp(conn->path, "/v1/chat/completions") == 0;
+    int parse_status =
+        is_chat ? parse_chat_request(&body, &request, message, sizeof(message))
+                : parse_completion_request(&body, &request, message,
+                                           sizeof(message));
+    if (parse_status != 0) {
         json_free_value(&body);
         completion_request_free(&request);
         connection_error(conn, 400, "Bad Request", "invalid_request_error",
@@ -1076,12 +1977,13 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
                          "prompt produced no tokens");
         goto reject;
     }
-    if (gen->tokens.count + gen->request.max_tokens > KIPP_CONTEXT_LENGTH) {
+    if (gen->tokens.count + gen->request.max_tokens >
+        server_info.context_length) {
         connection_error(conn, 400, "Bad Request", "invalid_request_error",
                          "prompt (%zu tokens) plus max_tokens (%u) exceeds "
                          "the %u-token context",
                          gen->tokens.count, gen->request.max_tokens,
-                         KIPP_CONTEXT_LENGTH);
+                         server_info.context_length);
         goto reject;
     }
     gen->logits = malloc((size_t)gen->choice_count * KIPP_VOCAB_SIZE *
@@ -1118,8 +2020,8 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
         /* Build a fresh cache entry, rounded up for future reuse. */
         session_cache_drop();
         uint32_t capacity = (uint32_t)((needed + 1023) / 1024 * 1024);
-        if (capacity > KIPP_CONTEXT_LENGTH) {
-            capacity = KIPP_CONTEXT_LENGTH;
+        if (capacity > server_info.context_length) {
+            capacity = server_info.context_length;
         }
         cache.tokens = malloc((size_t)capacity * sizeof(*cache.tokens));
         if (cache.tokens != NULL &&
@@ -1157,6 +2059,7 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
 
     gen->id = ++completion_counter;
     gen->created = (long long)time(NULL);
+    gen->admitted_ns = now_ns();
     uint64_t seed_base = gen->request.seed != 0
                              ? gen->request.seed
                              : (uint64_t)time(NULL) * 2654435761u + gen->id;
@@ -1185,6 +2088,8 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
     }
     gen->conn = conn;
     gen->in_use = true;
+    ++server_metrics.requests_total;
+    server_metrics.prompt_tokens_total += gen->tokens.count;
     conn->gen = gen;
     conn->phase = CONNECTION_GENERATING;
     return 0;
@@ -1217,13 +2122,30 @@ static void step_sample(kipp_model *model) {
                 continue;
             }
             uint32_t token;
-            if (kipp_sample(state->logits, KIPP_VOCAB_SIZE,
-                            gen->request.temperature, gen->request.top_p,
-                            &state->rng, &token, &error) != 0) {
+            kipp_sample_params sp = {0};
+            sp.temperature = gen->request.temperature;
+            sp.top_p = gen->request.top_p;
+            sp.top_k = gen->request.top_k;
+            sp.min_p = gen->request.min_p;
+            sp.frequency_penalty = gen->request.frequency_penalty;
+            sp.presence_penalty = gen->request.presence_penalty;
+            sp.repetition_penalty = gen->request.repetition_penalty;
+            sp.recent_tokens = state->recent;
+            sp.recent_count = state->recent_count;
+            sp.logit_bias_tokens = gen->request.bias_count > 0
+                                       ? gen->request.bias_tokens
+                                       : NULL;
+            sp.logit_bias_values = gen->request.bias_count > 0
+                                       ? gen->request.bias_values
+                                       : NULL;
+            sp.logit_bias_count = gen->request.bias_count;
+            if (kipp_sample_ex(state->logits, KIPP_VOCAB_SIZE, &sp,
+                               &state->rng, &token, &error) != 0) {
                 generation_fail(gen, error.message);
                 break;
             }
-            if (token == KIPP_EOS_TOKEN_ID) {
+            choice_remember_token(state, token);
+            if (kipp_model_is_stop_token(model, token)) {
                 state->finish_reason = "stop";
                 continue;
             }
@@ -1237,6 +2159,7 @@ static void step_sample(kipp_model *model) {
             sb_append_bytes(&state->text, piece, piece_length);
             kipp_text_free(piece);
             ++state->completion_tokens;
+            ++server_metrics.generation_tokens_total;
             if (state->text.failed) {
                 generation_fail(gen, "completion text allocation failed");
                 break;
@@ -1262,6 +2185,22 @@ static void step_sample(kipp_model *model) {
                 state->has_next = true;
                 any_active = true;
             }
+            /*
+             * Record this token's logprobs from the raw logits while they
+             * are still live. Skipped when a stop string truncated the
+             * token's text away, so entries stay aligned with the output.
+             */
+            if (gen->request.logprobs_enabled && !stop_found) {
+                size_t offset = state->text.length >= piece_length
+                                    ? state->text.length - piece_length
+                                    : 0;
+                if (choice_capture_logprobs(state, token,
+                                            gen->request.logprobs_top, offset,
+                                            model) != 0) {
+                    generation_fail(gen, "logprobs allocation failed");
+                    break;
+                }
+            }
             if (gen->request.stream && gen->conn != NULL) {
                 size_t safe = state->text.length;
                 if (state->finish_reason == NULL && gen->longest_stop > 0) {
@@ -1270,11 +2209,31 @@ static void step_sample(kipp_model *model) {
                                : 0;
                 }
                 if (safe > state->emitted) {
+                    string_builder lp = {0};
+                    const char *lp_json = NULL;
+                    if (gen->request.logprobs_enabled) {
+                        size_t upto = state->streamed_logprobs;
+                        while (upto < state->logprob_count &&
+                               state->logprobs[upto].text_offset +
+                                       state->logprobs[upto].piece_len <=
+                                   safe) {
+                            ++upto;
+                        }
+                        if (upto > state->streamed_logprobs) {
+                            sb_append_logprobs_value(
+                                &lp, gen->request.is_chat, state->logprobs,
+                                state->streamed_logprobs, upto);
+                            state->streamed_logprobs = upto;
+                            lp_json = lp.failed ? NULL : lp.data;
+                        }
+                    }
                     connection_send_chunk(gen->conn, gen->id, gen->created,
                                           choice,
                                           state->text.data + state->emitted,
-                                          safe - state->emitted, NULL);
+                                          safe - state->emitted, NULL,
+                                          gen->request.is_chat, lp_json);
                     state->emitted = safe;
+                    sb_free(&lp);
                 }
             }
         }
@@ -1358,6 +2317,7 @@ static void step_eval(kipp_model *model) {
             gen->prefill_progress += chunk;
             if (gen->prefill_progress == gen->tokens.count) {
                 gen->sampling = true;
+                gen->prefill_done_ns = now_ns();
             }
         } else {
             for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
@@ -1406,24 +2366,107 @@ static const char *find_header_value(const char *headers, const char *name) {
     return NULL;
 }
 
+/* Serve GET /metrics as a Prometheus text exposition. */
+static void connection_serve_metrics(server_connection *conn) {
+    uint32_t running = 0;
+    uint32_t running_choices = 0;
+    for (uint32_t slot = 0; slot < SERVER_MAX_GENERATIONS; ++slot) {
+        if (generations[slot].in_use) {
+            ++running;
+            running_choices += generations[slot].choice_count;
+        }
+    }
+    uint32_t waiting = 0;
+    for (uint32_t slot = 0; slot < SERVER_MAX_CONNECTIONS; ++slot) {
+        if (connections[slot].fd >= 0 &&
+            connections[slot].phase == CONNECTION_WAITING) {
+            ++waiting;
+        }
+    }
+    string_builder body = {0};
+    static const struct {
+        const char *name;
+        const char *help;
+        const char *type;
+    } counters[] = {
+        {"kipp_requests_total", "Completion requests admitted", "counter"},
+        {"kipp_requests_failed_total", "Requests that failed mid-generation",
+         "counter"},
+        {"kipp_prompt_tokens_total", "Prompt tokens admitted", "counter"},
+        {"kipp_generation_tokens_total", "Tokens generated", "counter"},
+    };
+    const uint64_t values[] = {
+        server_metrics.requests_total, server_metrics.requests_failed_total,
+        server_metrics.prompt_tokens_total,
+        server_metrics.generation_tokens_total};
+    for (size_t index = 0; index < sizeof(values) / sizeof(values[0]);
+         ++index) {
+        sb_append_format(&body, "# HELP %s %s\n# TYPE %s %s\n%s %llu\n",
+                         counters[index].name, counters[index].help,
+                         counters[index].name, counters[index].type,
+                         counters[index].name,
+                         (unsigned long long)values[index]);
+    }
+    sb_append_format(
+        &body,
+        "# HELP kipp_requests_running Active generations\n"
+        "# TYPE kipp_requests_running gauge\nkipp_requests_running %u\n"
+        "# HELP kipp_batch_choices_running Active choices in the batch\n"
+        "# TYPE kipp_batch_choices_running gauge\n"
+        "kipp_batch_choices_running %u\n"
+        "# HELP kipp_requests_waiting Parsed requests awaiting admission\n"
+        "# TYPE kipp_requests_waiting gauge\nkipp_requests_waiting %u\n",
+        running, running_choices, waiting);
+    if (body.failed) {
+        conn->phase = CONNECTION_DRAINING;
+        sb_free(&body);
+        return;
+    }
+    string_builder head = {0};
+    sb_append_format(&head,
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/plain; version=0.0.4\r\n"
+                     "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                     body.length);
+    if (!head.failed) {
+        connection_send(conn, head.data, head.length);
+        connection_send(conn, body.data, body.length);
+    }
+    conn->phase = CONNECTION_DRAINING;
+    sb_free(&head);
+    sb_free(&body);
+}
+
 /* Route a fully-read request; completions move to WAITING for admission. */
 static void connection_route(server_connection *conn) {
     if (strcmp(conn->method, "GET") == 0 &&
+        strcmp(conn->path, "/metrics") == 0) {
+        connection_serve_metrics(conn);
+    } else if (strcmp(conn->method, "GET") == 0 &&
         strcmp(conn->path, "/healthz") == 0) {
         connection_respond(conn, 200, "OK", "{\"status\":\"ok\"}");
     } else if (strcmp(conn->method, "GET") == 0 &&
                strcmp(conn->path, "/v1/models") == 0) {
-        connection_respond(conn, 200, "OK",
-                           "{\"object\":\"list\",\"data\":[{\"id\":\""
-                           SERVER_MODEL_ID "\",\"object\":\"model\","
-                           "\"owned_by\":\"kipp\"}]}");
+        string_builder body = {0};
+        sb_append_format(&body,
+                         "{\"object\":\"list\",\"data\":[{\"id\":\"%s\","
+                         "\"object\":\"model\",\"owned_by\":\"kipp\"}]}",
+                         server_info.checkpoint_id);
+        if (!body.failed) {
+            connection_respond(conn, 200, "OK", body.data);
+        } else {
+            conn->phase = CONNECTION_DRAINING;
+        }
+        sb_free(&body);
     } else if (strcmp(conn->method, "POST") == 0 &&
-               strcmp(conn->path, "/v1/completions") == 0) {
+               (strcmp(conn->path, "/v1/completions") == 0 ||
+                strcmp(conn->path, "/v1/chat/completions") == 0)) {
         conn->phase = CONNECTION_WAITING;
         conn->arrival = ++arrival_counter;
     } else if (strcmp(conn->path, "/healthz") == 0 ||
                strcmp(conn->path, "/v1/models") == 0 ||
-               strcmp(conn->path, "/v1/completions") == 0) {
+               strcmp(conn->path, "/v1/completions") == 0 ||
+               strcmp(conn->path, "/v1/chat/completions") == 0) {
         connection_error(conn, 405, "Method Not Allowed",
                          "invalid_request_error",
                          "method %s is not supported on %s", conn->method,
@@ -1658,7 +2701,8 @@ static void server_usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --model MODEL.gguf [--backend cpu|metal|cuda] "
             "[--port N]\n"
-            "Serves GET /healthz, GET /v1/models, and POST /v1/completions "
+            "Serves GET /healthz, GET /metrics, GET /v1/models, "
+            "POST /v1/completions, and POST /v1/chat/completions "
             "on 127.0.0.1.\n"
             "Concurrent requests decode together through batched "
             "evaluation.\n",
@@ -1722,6 +2766,11 @@ int main(int argc, char **argv) {
                 kipp_error_code_name(error.code), error.message);
         return 1;
     }
+    if (kipp_model_get_info(model, &server_info) != 0) {
+        fprintf(stderr, "kipp-server: unable to read model info\n");
+        (void)kipp_model_close(model, NULL);
+        return 1;
+    }
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {
@@ -1746,7 +2795,8 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "kipp-server %s: serving %s on http://127.0.0.1:%lu "
             "(backend %s)\n",
-            KIPP_VERSION, SERVER_MODEL_ID, port, kipp_backend_name(backend));
+            KIPP_VERSION, server_info.checkpoint_id, port,
+            kipp_backend_name(backend));
 
     serve(model, listener);
     exit_code = 0;

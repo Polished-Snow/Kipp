@@ -1,6 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "kipp.h"
+#include "kipp_chat.h"
+#include "kipp_kv_pool.h"
+#include "kipp_spec.h"
 #ifdef KIPP_ENABLE_METAL
 #include "metal/kipp_metal.h"
 #endif
@@ -67,8 +70,10 @@ static void test_checked_arithmetic(void) {
 }
 
 static void test_kv_layout(void) {
-    CHECK(kipp_test_kv_cache_bytes(1) == UINT64_C(147456));
-    CHECK(kipp_test_kv_cache_bytes(8192) == UINT64_C(1207959552));
+    CHECK(kipp_test_kv_cache_bytes(36, 1) == UINT64_C(147456));
+    CHECK(kipp_test_kv_cache_bytes(36, 8192) == UINT64_C(1207959552));
+    CHECK(kipp_test_kv_cache_bytes(28, 1) == UINT64_C(114688));
+    CHECK(kipp_test_kv_cache_bytes(64, 1) == UINT64_C(262144));
     CHECK(kipp_test_kv_cache_offset(4, 0, 0, 0, 0) == 0);
     CHECK(kipp_test_kv_cache_offset(4, 0, 0, 1, 0) == 128);
     CHECK(kipp_test_kv_cache_offset(4, 0, 1, 0, 0) == 1024);
@@ -126,8 +131,9 @@ static void test_softmax_and_swiglu(void) {
 
 static void test_causal_gqa(void) {
     const size_t token_count = 2;
+    const size_t query_head_count = 32; /* the 4B/8B layout */
     const size_t query_values =
-        token_count * KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM;
+        token_count * query_head_count * KIPP_ATTENTION_HEAD_DIM;
     const size_t kv_values =
         token_count * KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
     float *query = calloc(query_values, sizeof(*query));
@@ -148,13 +154,13 @@ static void test_causal_gqa(void) {
         value[(KIPP_ATTENTION_HEAD_COUNT_KV + head) *
               KIPP_ATTENTION_HEAD_DIM] = 3.0f;
     }
-    kipp_test_causal_gqa(query, key, value, output, scores, token_count);
-    for (size_t head = 0; head < KIPP_ATTENTION_HEAD_COUNT; ++head) {
+    kipp_test_causal_gqa(query, key, value, output, scores, token_count,
+                         query_head_count);
+    for (size_t head = 0; head < query_head_count; ++head) {
         CHECK(nearly_equal(
             output[head * KIPP_ATTENTION_HEAD_DIM], 1.0f, 1.0e-6f));
         CHECK(nearly_equal(
-            output[(KIPP_ATTENTION_HEAD_COUNT + head) *
-                   KIPP_ATTENTION_HEAD_DIM],
+            output[(query_head_count + head) * KIPP_ATTENTION_HEAD_DIM],
             2.0f, 1.0e-6f));
     }
     CHECK(nearly_equal(scores[0], 0.5f, 1.0e-6f));
@@ -383,6 +389,105 @@ static void test_sampler(void) {
     CHECK(error.code == KIPP_ERROR_ARGUMENT);
 }
 
+static void test_quant_matvec(void) {
+    /* fp16 decode: 0.5 = 0x3800, -1.0 = 0xBC00, 0.25 = 0x3400. */
+    CHECK(kipp_test_fp16_to_float(0x3800) == 0.5f);
+    CHECK(kipp_test_fp16_to_float(0xBC00) == -1.0f);
+    CHECK(kipp_test_fp16_to_float(0x3400) == 0.25f);
+    CHECK(kipp_test_fp16_to_float(0x0000) == 0.0f);
+
+    /* Q8_0, one 32-block row: d=0.5, qs=[2,-3,0..], input=[10,4,7,0..].
+     * dot = 2*10 + (-3)*4 = 8; output = 0.5*8 = 4.0. */
+    uint8_t q8[34] = {0};
+    q8[0] = 0x00;
+    q8[1] = 0x38; /* 0x3800 little-endian */
+    q8[2] = 2;
+    q8[3] = (uint8_t)(int8_t)-3;
+    float q8_input[32] = {10.0f, 4.0f, 7.0f};
+    float q8_out = 0.0f;
+    kipp_test_matvec_q8_0(q8, q8_input, &q8_out, 1, 32);
+    CHECK(nearly_equal(q8_out, 4.0f, 1.0e-6f));
+
+    /* AFFINE4_GS32, one 32-group row: scale=0.25, bias=-1.0,
+     * q=[3,12,0..] -> packed[0]=0xC3; input=[8,2,5,0..].
+     * dot=3*8+12*2=48, actsum=15; out=0.25*48 + (-1)*15 = -3.0. */
+    uint8_t a4[20] = {0};
+    a4[0] = 0xC3; /* q0=3 (lo), q1=12 (hi) */
+    a4[16] = 0x00;
+    a4[17] = 0x34; /* scale 0.25 */
+    a4[18] = 0x00;
+    a4[19] = 0xBC; /* bias -1.0 */
+    float a4_input[32] = {8.0f, 2.0f, 5.0f};
+    float a4_out = 0.0f;
+    kipp_test_matvec_affine4_gs32(a4, a4_input, &a4_out, 1, 32);
+    CHECK(nearly_equal(a4_out, -3.0f, 1.0e-6f));
+}
+
+static void test_sample_ex(void) {
+    kipp_error error = {0};
+    float logits[6] = {1.0f, 5.0f, 2.0f, 4.0f, 0.0f, 3.0f};
+    uint32_t token = UINT32_MAX;
+    uint64_t rng = 99;
+
+    /* Greedy over bias-adjusted logits: lift token 4 above the rest. */
+    kipp_sample_params biased = {0};
+    biased.temperature = 0.0f;
+    biased.top_p = 1.0f;
+    biased.repetition_penalty = 1.0f;
+    uint32_t bias_token = 4;
+    float bias_value = 10.0f;
+    biased.logit_bias_tokens = &bias_token;
+    biased.logit_bias_values = &bias_value;
+    biased.logit_bias_count = 1;
+    CHECK(kipp_sample_ex(logits, 6, &biased, NULL, &token, &error) == 0);
+    CHECK(token == 4);
+
+    /* top_k = 1 with temperature always returns the argmax (token 1). */
+    kipp_sample_params topk = {0};
+    topk.temperature = 1.0f;
+    topk.top_p = 1.0f;
+    topk.top_k = 1;
+    topk.repetition_penalty = 1.0f;
+    for (int draw = 0; draw < 20; ++draw) {
+        CHECK(kipp_sample_ex(logits, 6, &topk, &rng, &token, &error) == 0);
+        CHECK(token == 1);
+    }
+
+    /* Repetition penalty pushes a heavily-repeated top token below a rival. */
+    kipp_sample_params penalized = {0};
+    penalized.temperature = 0.0f;
+    penalized.top_p = 1.0f;
+    penalized.repetition_penalty = 2.0f;
+    uint32_t recent[4] = {1, 1, 1, 1};
+    penalized.recent_tokens = recent;
+    penalized.recent_count = 4;
+    CHECK(kipp_sample_ex(logits, 6, &penalized, NULL, &token, &error) == 0);
+    /* logit[1] 5.0/2 = 2.5 now below logit[3] = 4.0 -> argmax is 3. */
+    CHECK(token == 3);
+
+    /* min_p keeps only the dominant token, so sampling is deterministic. */
+    float peaked[4] = {10.0f, 0.0f, 0.0f, 0.0f};
+    kipp_sample_params minp = {0};
+    minp.temperature = 1.0f;
+    minp.top_p = 1.0f;
+    minp.min_p = 0.5f;
+    minp.repetition_penalty = 1.0f;
+    rng = 7;
+    for (int draw = 0; draw < 20; ++draw) {
+        CHECK(kipp_sample_ex(peaked, 4, &minp, &rng, &token, &error) == 0);
+        CHECK(token == 0);
+    }
+
+    /* Invalid min_p is rejected. */
+    kipp_sample_params bad = {0};
+    bad.temperature = 1.0f;
+    bad.top_p = 1.0f;
+    bad.min_p = 1.5f;
+    bad.repetition_penalty = 1.0f;
+    CHECK(kipp_sample_ex(logits, 6, &bad, &rng, &token, &error) != 0);
+    CHECK(error.code == KIPP_ERROR_ARGUMENT);
+}
+
 static void test_public_argument_checks(void) {
     kipp_error error = {0};
     kipp_model *model = (kipp_model *)(uintptr_t)1;
@@ -420,6 +525,182 @@ static void test_public_argument_checks(void) {
     kipp_session_destroy(NULL);
     kipp_tokens_free(NULL);
     CHECK(kipp_model_close(NULL, &error) == 0);
+}
+
+static void append_bytes(uint8_t *buffer, size_t *offset, const void *data,
+                         size_t count) {
+    memcpy(buffer + *offset, data, count);
+    *offset += count;
+}
+
+static void append_u32(uint8_t *buffer, size_t *offset, uint32_t value) {
+    append_bytes(buffer, offset, &value, sizeof(value));
+}
+
+static void append_u64(uint8_t *buffer, size_t *offset, uint64_t value) {
+    append_bytes(buffer, offset, &value, sizeof(value));
+}
+
+static void append_gguf_string(uint8_t *buffer, size_t *offset,
+                               const char *text) {
+    append_u64(buffer, offset, strlen(text));
+    append_bytes(buffer, offset, text, strlen(text));
+}
+
+static void append_string_entry(uint8_t *buffer, size_t *offset,
+                                const char *key, const char *value) {
+    append_gguf_string(buffer, offset, key);
+    append_u32(buffer, offset, 8); /* GGUF string type */
+    append_gguf_string(buffer, offset, value);
+}
+
+/* A structurally valid GGUF whose checkpoint is not in the registry (or
+ * whose dimensions contradict its registry entry) must be rejected as
+ * unsupported before any tensor data is touched. */
+static void test_registry_rejection(void) {
+    static const struct {
+        const char *repository;
+        const char *revision;
+    } cases[] = {
+        /* Unknown repository. */
+        {"Qwen/Qwen3-Unknown", "906bfd4b4dc7f14ee4320094d8b41684abff8539"},
+        /* Known repository at an unpinned revision. */
+        {"Qwen/Qwen3-4B-Base", "0000000000000000000000000000000000000000"},
+        /* Pinned checkpoint whose metadata dims (absent => zero) differ. */
+        {"Qwen/Qwen3-4B-Base", "906bfd4b4dc7f14ee4320094d8b41684abff8539"},
+    };
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]);
+         ++index) {
+        uint8_t buffer[1024];
+        size_t offset = 0;
+        append_bytes(buffer, &offset, "GGUF", 4);
+        append_u32(buffer, &offset, 3);   /* version */
+        append_u64(buffer, &offset, 398); /* tensor count (plausible) */
+        append_u64(buffer, &offset, 3);   /* metadata count */
+        append_string_entry(buffer, &offset, "general.architecture", "qwen3");
+        append_string_entry(buffer, &offset, "kipp.source.repository",
+                            cases[index].repository);
+        append_string_entry(buffer, &offset, "kipp.source.revision",
+                            cases[index].revision);
+
+        char path[] = "/tmp/kipp-registry-XXXXXX";
+        int descriptor = mkstemp(path);
+        CHECK(descriptor >= 0);
+        if (descriptor < 0) {
+            return;
+        }
+        CHECK(write(descriptor, buffer, offset) == (ssize_t)offset);
+        CHECK(close(descriptor) == 0);
+        kipp_model *model = NULL;
+        kipp_error error = {0};
+        CHECK(kipp_model_open(path, &model, &error) != 0);
+        CHECK(model == NULL);
+        CHECK(error.code == KIPP_ERROR_UNSUPPORTED);
+        CHECK(unlink(path) == 0);
+    }
+}
+
+/* Byte-for-byte checks against Hugging Face apply_chat_template output
+ * (captured in tools/generate_chat_vectors.py). The 2507 instruct variant
+ * is non-thinking, so enable_thinking is inert. */
+static void test_prompt_lookup(void) {
+    uint32_t drafts[8];
+    /* Tail 3-gram [1,2,3] recurs at index 0; the 4 tokens after it follow. */
+    uint32_t repeat[] = {1, 2, 3, 4, 1, 2, 3};
+    size_t count =
+        kipp_spec_prompt_lookup(repeat, 7, 3, 1, 4, drafts);
+    CHECK(count == 4);
+    CHECK(drafts[0] == 4 && drafts[1] == 1 && drafts[2] == 2 &&
+          drafts[3] == 3);
+
+    /* max_draft caps the count. */
+    count = kipp_spec_prompt_lookup(repeat, 7, 3, 1, 2, drafts);
+    CHECK(count == 2 && drafts[0] == 4 && drafts[1] == 1);
+
+    /* No recurrence -> no draft. */
+    uint32_t unique[] = {5, 6, 7};
+    CHECK(kipp_spec_prompt_lookup(unique, 3, 3, 1, 4, drafts) == 0);
+
+    /* Falls back to a shorter n-gram: tail [9] recurs at index 0, followed
+     * by 8. */
+    uint32_t single[] = {9, 8, 7, 9};
+    count = kipp_spec_prompt_lookup(single, 4, 3, 1, 4, drafts);
+    CHECK(count == 3 && drafts[0] == 8 && drafts[1] == 7 && drafts[2] == 9);
+
+    /* Degenerate inputs are safe. */
+    CHECK(kipp_spec_prompt_lookup(NULL, 0, 3, 1, 4, drafts) == 0);
+    CHECK(kipp_spec_prompt_lookup(repeat, 7, 3, 1, 0, drafts) == 0);
+}
+
+static void test_chat_render(void) {
+    kipp_error error = {0};
+    char *out = NULL;
+
+    kipp_chat_message user_only[] = {{KIPP_ROLE_USER, "Hi there"}};
+    kipp_chat_options opt = {KIPP_VARIANT_INSTRUCT_2507, true, true};
+    CHECK(kipp_chat_render(user_only, 1, &opt, &out, &error) == 0);
+    CHECK(out != NULL && strcmp(out,
+        "<|im_start|>user\nHi there<|im_end|>\n"
+        "<|im_start|>assistant\n") == 0);
+    kipp_text_free(out);
+    out = NULL;
+
+    kipp_chat_message sys_user[] = {
+        {KIPP_ROLE_SYSTEM, "You are terse."},
+        {KIPP_ROLE_USER, "Say hi"}};
+    CHECK(kipp_chat_render(sys_user, 2, &opt, &out, &error) == 0);
+    CHECK(out != NULL && strcmp(out,
+        "<|im_start|>system\nYou are terse.<|im_end|>\n"
+        "<|im_start|>user\nSay hi<|im_end|>\n"
+        "<|im_start|>assistant\n") == 0);
+    kipp_text_free(out);
+    out = NULL;
+
+    kipp_chat_message multiturn[] = {
+        {KIPP_ROLE_USER, "1+1?"},
+        {KIPP_ROLE_ASSISTANT, "2"},
+        {KIPP_ROLE_USER, "times 3?"}};
+    CHECK(kipp_chat_render(multiturn, 3, &opt, &out, &error) == 0);
+    CHECK(out != NULL && strcmp(out,
+        "<|im_start|>user\n1+1?<|im_end|>\n"
+        "<|im_start|>assistant\n2<|im_end|>\n"
+        "<|im_start|>user\ntimes 3?<|im_end|>\n"
+        "<|im_start|>assistant\n") == 0);
+    kipp_text_free(out);
+    out = NULL;
+
+    /* No generation prompt. */
+    kipp_chat_options no_gen = {KIPP_VARIANT_INSTRUCT_2507, false, true};
+    kipp_chat_message hello[] = {{KIPP_ROLE_USER, "Hello"}};
+    CHECK(kipp_chat_render(hello, 1, &no_gen, &out, &error) == 0);
+    CHECK(out != NULL && strcmp(out,
+        "<|im_start|>user\nHello<|im_end|>\n") == 0);
+    kipp_text_free(out);
+    out = NULL;
+
+    /* Hybrid instruct with thinking off injects the empty think block. */
+    kipp_chat_options hybrid_off = {KIPP_VARIANT_INSTRUCT, true, false};
+    CHECK(kipp_chat_render(hello, 1, &hybrid_off, &out, &error) == 0);
+    CHECK(out != NULL && strcmp(out,
+        "<|im_start|>user\nHello<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n") == 0);
+    kipp_text_free(out);
+    out = NULL;
+
+    /* Thinking-2507 forces an opening <think>. */
+    kipp_chat_options thinking = {KIPP_VARIANT_THINKING_2507, true, true};
+    CHECK(kipp_chat_render(hello, 1, &thinking, &out, &error) == 0);
+    CHECK(out != NULL && strcmp(out,
+        "<|im_start|>user\nHello<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n") == 0);
+    kipp_text_free(out);
+    out = NULL;
+
+    /* Base checkpoints have no chat template. */
+    kipp_chat_options base = {KIPP_VARIANT_BASE, true, true};
+    CHECK(kipp_chat_render(hello, 1, &base, &out, &error) != 0);
+    CHECK(error.code == KIPP_ERROR_UNSUPPORTED);
+    CHECK(out == NULL);
 }
 
 static void test_malformed_gguf(void) {
@@ -668,9 +949,43 @@ static int run_model_test(const char *model_path, const char *vector_directory) 
     double nmse = error_square / reference_square;
     int expected_argmax = argmax(expected_logits, KIPP_VOCAB_SIZE);
     int actual_argmax = argmax(actual_logits, KIPP_VOCAB_SIZE);
-    fprintf(stderr, "MODEL nmse=%.9g expected_argmax=%d actual_argmax=%d\n",
-            nmse, expected_argmax, actual_argmax);
-    if (nmse > 1.0e-5 || expected_argmax != actual_argmax) {
+    /*
+     * The per-vector NMSE bound is recorded next to the reference logits
+     * (nmse-max.txt): 5e-5 for the FP32 CPU reference (dominated by Kipp's
+     * BF16 KV storage contract), looser for a BF16 GPU reference used on
+     * checkpoints too large for an FP32 host reference. Argmax must match
+     * exactly regardless. Missing file falls back to the FP32 default.
+     */
+    double nmse_max = 5.0e-5;
+    char *nmse_path = join_path(vector_directory, "nmse-max.txt");
+    if (nmse_path != NULL) {
+        FILE *nmse_file = fopen(nmse_path, "r");
+        if (nmse_file != NULL) {
+            double parsed;
+            if (fscanf(nmse_file, "%lf", &parsed) == 1 && parsed > 0.0) {
+                nmse_max = parsed;
+            }
+            (void)fclose(nmse_file);
+        }
+        free(nmse_path);
+    }
+    /*
+     * A quantized artifact is gated against the same BF16 reference, so its
+     * full-logit NMSE reflects the quantization loss: Q8_0 is near-lossless
+     * (stays under the BF16 bound), but 4-bit affine needs a Q4-class bound.
+     * Argmax must still match the reference exactly.
+     */
+    kipp_model_info quant_info;
+    if (kipp_model_get_info(model, &quant_info) == 0 &&
+        strcmp(quant_info.quant_scheme, "affine4_gs32") == 0 &&
+        nmse_max < 3.0e-2) {
+        nmse_max = 3.0e-2;
+    }
+    fprintf(stderr,
+            "MODEL nmse=%.9g nmse_max=%.9g expected_argmax=%d "
+            "actual_argmax=%d\n",
+            nmse, nmse_max, expected_argmax, actual_argmax);
+    if (nmse > nmse_max || expected_argmax != actual_argmax) {
         fprintf(stderr, "model output failed the Phase 1 tolerance\n");
         goto cleanup;
     }
@@ -700,6 +1015,261 @@ static int phase2_compare(const char *label, const float *actual,
             label, nmse, reference_argmax, actual_argmax);
     return nmse <= tolerance && actual_argmax == reference_argmax ? 0 : -1;
 }
+
+/*
+ * kipp_session_eval_n must write logits for the last N tokens identical to
+ * evaluating each of those positions on its own. On CPU the two paths do the
+ * same scalar work, so the rows are expected to be bitwise-identical.
+ */
+static int run_multilogit_test(const char *model_path,
+                               const char *vector_directory) {
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *tokens = NULL;
+    size_t token_bytes = 0;
+    size_t token_count;
+    kipp_model *model = NULL;
+    kipp_session *multi = NULL;
+    kipp_session *single = NULL;
+    float *rows = NULL;
+    float *reference = NULL;
+    kipp_error error = {0};
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&tokens, &token_bytes) != 0 ||
+        token_bytes < 2 * sizeof(*tokens) || token_bytes % sizeof(*tokens)) {
+        fprintf(stderr, "unable to read multi-logit token vector\n");
+        goto cleanup;
+    }
+    token_count = token_bytes / sizeof(*tokens);
+    uint32_t n = (uint32_t)token_count; /* logits for every position */
+    rows = malloc((size_t)n * KIPP_VOCAB_SIZE * sizeof(*rows));
+    reference = malloc(KIPP_VOCAB_SIZE * sizeof(*reference));
+    if (rows == NULL || reference == NULL ||
+        kipp_model_open(model_path, &model, &error) != 0) {
+        fprintf(stderr, "multi-logit setup failed: %s\n", error.message);
+        goto cleanup;
+    }
+
+    if (kipp_session_create(model, (uint32_t)token_count, &multi, &error) != 0 ||
+        kipp_session_eval_n(multi, tokens, token_count, rows, n, &error) != 0) {
+        fprintf(stderr, "multi-logit eval failed: %s\n", error.message);
+        goto cleanup;
+    }
+    if (kipp_session_create(model, (uint32_t)token_count, &single, &error) !=
+        0) {
+        fprintf(stderr, "multi-logit single session failed: %s\n",
+                error.message);
+        goto cleanup;
+    }
+    for (uint32_t position = 0; position < n; ++position) {
+        if (kipp_session_eval(single, &tokens[position], 1, reference,
+                              KIPP_VOCAB_SIZE, &error) != 0) {
+            fprintf(stderr, "multi-logit reference eval failed: %s\n",
+                    error.message);
+            goto cleanup;
+        }
+        if (memcmp(rows + (size_t)position * KIPP_VOCAB_SIZE, reference,
+                   KIPP_VOCAB_SIZE * sizeof(*reference)) != 0) {
+            fprintf(stderr, "MULTILOGIT row %u differs from single eval\n",
+                    position);
+            goto cleanup;
+        }
+    }
+    fprintf(stderr, "MULTILOGIT %u rows bitwise-identical to single eval\n", n);
+    result = 0;
+
+cleanup:
+    kipp_session_destroy(single);
+    kipp_session_destroy(multi);
+    if (model != NULL) {
+        (void)kipp_model_close(model, NULL);
+    }
+    free(tokens_path);
+    free(tokens);
+    free(rows);
+    free(reference);
+    return result;
+}
+
+/*
+ * Paged KV gate: a backend addresses its KV through a per-session block
+ * table. Evaluating a prompt with the identity mapping and again with a
+ * scrambled (reversed) block table must produce bitwise-identical logits,
+ * proving the paged indirection is correct for any physical placement. The
+ * identity mapping is itself byte-for-byte the old contiguous path (the
+ * --model / --phase3-metal gates confirm it still matches the reference), so
+ * together they establish paged == contiguous for that backend.
+ */
+static int run_paged_test(const char *model_path, const char *vector_directory,
+                          kipp_backend_kind backend, const char *label) {
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *seed = NULL;
+    uint32_t *tokens = NULL;
+    size_t token_bytes = 0;
+    size_t seed_count;
+    kipp_model *model = NULL;
+    kipp_session *identity = NULL;
+    kipp_session *scrambled = NULL;
+    float *rows_identity = NULL;
+    float *rows_scrambled = NULL;
+    kipp_error error = {0};
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&seed, &token_bytes) != 0 ||
+        token_bytes < sizeof(*seed) || token_bytes % sizeof(*seed)) {
+        fprintf(stderr, "unable to read paged-cpu token vector\n");
+        goto cleanup;
+    }
+    seed_count = token_bytes / sizeof(*seed);
+    /* Synthesize a multi-block sequence (cycling the pinned, valid token ids)
+     * so the final position's attention spans several physically-scrambled
+     * blocks. Compare only the final logits: they already depend on every
+     * cached position, so this stays cheap (one lm_head) yet exercises the
+     * whole paged read/write path. */
+    uint32_t n = 2 * KIPP_KV_BLOCK_TOKENS;
+    uint32_t capacity = n;
+    tokens = malloc((size_t)n * sizeof(*tokens));
+    if (tokens == NULL) {
+        fprintf(stderr, "paged-cpu token synthesis failed\n");
+        goto cleanup;
+    }
+    for (uint32_t index = 0; index < n; ++index) {
+        tokens[index] = seed[index % seed_count];
+    }
+    size_t token_count = n;
+    rows_identity = malloc(KIPP_VOCAB_SIZE * sizeof(float));
+    rows_scrambled = malloc(KIPP_VOCAB_SIZE * sizeof(float));
+    if (rows_identity == NULL || rows_scrambled == NULL ||
+        kipp_model_open_backend(model_path, backend, &model, &error) != 0) {
+        fprintf(stderr, "paged-%s setup failed: %s\n", label, error.message);
+        goto cleanup;
+    }
+    if (kipp_session_create(model, capacity, &identity, &error) != 0 ||
+        kipp_session_eval(identity, tokens, token_count, rows_identity,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "paged-%s identity eval failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (kipp_session_create(model, capacity, &scrambled, &error) != 0) {
+        fprintf(stderr, "paged-%s scrambled session failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (kipp_test_scramble_session_kv(scrambled) != 0) {
+        fprintf(stderr, "paged-%s scramble hook unavailable\n", label);
+        goto cleanup;
+    }
+    if (kipp_session_eval(scrambled, tokens, token_count, rows_scrambled,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "paged-%s scrambled eval failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (memcmp(rows_identity, rows_scrambled,
+               KIPP_VOCAB_SIZE * sizeof(float)) != 0) {
+        fprintf(stderr, "PAGED-%s scrambled block table changed logits\n",
+                label);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "PAGED-%s final logits over %u tokens (%u blocks) bitwise-"
+            "identical under a scrambled block table\n",
+            label, n, n / KIPP_KV_BLOCK_TOKENS);
+    result = 0;
+
+cleanup:
+    kipp_session_destroy(scrambled);
+    kipp_session_destroy(identity);
+    if (model != NULL) {
+        (void)kipp_model_close(model, NULL);
+    }
+    free(tokens_path);
+    free(seed);
+    free(tokens);
+    free(rows_identity);
+    free(rows_scrambled);
+    return result;
+}
+
+#ifdef KIPP_ENABLE_METAL
+/* Metal kipp_session_eval_n rows must match a CPU single-position eval at
+ * each position within the Metal-vs-CPU tolerance (1e-4 NMSE, same argmax). */
+static int run_multilogit_metal_test(const char *model_path,
+                                     const char *vector_directory) {
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *tokens = NULL;
+    size_t token_bytes = 0;
+    size_t token_count;
+    kipp_model *metal_model = NULL;
+    kipp_model *cpu_model = NULL;
+    kipp_session *metal_session = NULL;
+    kipp_session *cpu_session = NULL;
+    float *rows = NULL;
+    float *reference = NULL;
+    kipp_error error = {0};
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&tokens, &token_bytes) != 0 ||
+        token_bytes < 2 * sizeof(*tokens) || token_bytes % sizeof(*tokens)) {
+        fprintf(stderr, "unable to read multi-logit token vector\n");
+        goto cleanup;
+    }
+    token_count = token_bytes / sizeof(*tokens);
+    uint32_t n = (uint32_t)token_count;
+    rows = malloc((size_t)n * KIPP_VOCAB_SIZE * sizeof(*rows));
+    reference = malloc(KIPP_VOCAB_SIZE * sizeof(*reference));
+    if (rows == NULL || reference == NULL ||
+        kipp_model_open_backend(model_path, KIPP_BACKEND_METAL, &metal_model,
+                                &error) != 0 ||
+        kipp_model_open_backend(model_path, KIPP_BACKEND_CPU, &cpu_model,
+                                &error) != 0) {
+        fprintf(stderr, "multi-logit metal setup failed: %s\n", error.message);
+        goto cleanup;
+    }
+    if (kipp_session_create(metal_model, (uint32_t)token_count, &metal_session,
+                            &error) != 0 ||
+        kipp_session_eval_n(metal_session, tokens, token_count, rows, n,
+                            &error) != 0 ||
+        kipp_session_create(cpu_model, (uint32_t)token_count, &cpu_session,
+                            &error) != 0) {
+        fprintf(stderr, "multi-logit metal eval failed: %s\n", error.message);
+        goto cleanup;
+    }
+    for (uint32_t position = 0; position < n; ++position) {
+        if (kipp_session_eval(cpu_session, &tokens[position], 1, reference,
+                              KIPP_VOCAB_SIZE, &error) != 0) {
+            goto cleanup;
+        }
+        char label[40];
+        (void)snprintf(label, sizeof(label), "multilogit-row-%u", position);
+        if (phase2_compare(label, rows + (size_t)position * KIPP_VOCAB_SIZE,
+                           reference, 1.0e-4) != 0) {
+            goto cleanup;
+        }
+    }
+    fprintf(stderr, "MULTILOGIT-METAL %u rows match CPU within 1e-4\n", n);
+    result = 0;
+
+cleanup:
+    kipp_session_destroy(cpu_session);
+    kipp_session_destroy(metal_session);
+    if (cpu_model != NULL) {
+        (void)kipp_model_close(cpu_model, NULL);
+    }
+    if (metal_model != NULL) {
+        (void)kipp_model_close(metal_model, NULL);
+    }
+    free(tokens_path);
+    free(tokens);
+    free(rows);
+    free(reference);
+    return result;
+}
+#endif
 
 static int run_phase2_test(const char *model_path,
                            const char *vector_directory) {
@@ -742,11 +1312,16 @@ static int run_phase2_test(const char *model_path,
         fprintf(stderr, "Phase 2 model open failed: %s\n", error.message);
         goto cleanup;
     }
+    kipp_model_info model_info;
+    if (kipp_model_get_info(model, &model_info) != 0) {
+        fprintf(stderr, "Phase 2 model info failed\n");
+        goto cleanup;
+    }
 
     if (kipp_session_create(model, 0, &invalid, &error) == 0 ||
         error.code != KIPP_ERROR_RANGE || invalid != NULL ||
-        kipp_session_create(model, KIPP_CONTEXT_LENGTH + 1, &invalid, &error) ==
-            0 ||
+        kipp_session_create(model, model_info.context_length + 1, &invalid,
+                            &error) == 0 ||
         error.code != KIPP_ERROR_RANGE || invalid != NULL) {
         fprintf(stderr, "Phase 2 capacity validation failed\n");
         goto cleanup;
@@ -759,7 +1334,9 @@ static int run_phase2_test(const char *model_path,
     kipp_session_info info;
     if (kipp_session_get_info(session, &info) != 0 ||
         info.capacity != token_count || info.length != 0 ||
-        info.cache_bytes != kipp_test_kv_cache_bytes((uint32_t)token_count)) {
+        info.cache_bytes != kipp_test_kv_cache_bytes(
+                                model_info.block_count,
+                                (uint32_t)token_count)) {
         fprintf(stderr, "Phase 2 session metadata is incorrect\n");
         goto cleanup;
     }
@@ -917,7 +1494,8 @@ static int run_phase2_test(const char *model_path,
     }
 
     fprintf(stderr, "PHASE2 lifecycle passed cache_bytes=%llu capacity=%zu\n",
-            (unsigned long long)kipp_test_kv_cache_bytes((uint32_t)token_count),
+            (unsigned long long)kipp_test_kv_cache_bytes(
+                model_info.block_count, (uint32_t)token_count),
             token_count);
     result = 0;
 
@@ -1290,6 +1868,203 @@ cleanup:
 #endif
 }
 
+/* Fill a 32-token block with a distinct, deterministic pattern. */
+static void kv_fill_block(uint32_t *tokens, uint32_t base) {
+    for (uint32_t index = 0; index < KIPP_KV_BLOCK_TOKENS; ++index) {
+        tokens[index] = base + index;
+    }
+}
+
+static void test_kv_pool_reuse(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(8);
+    CHECK(pool != NULL);
+    CHECK(kipp_kv_pool_free_count(pool) == 8);
+    uint32_t a[KIPP_KV_BLOCK_TOKENS];
+    uint32_t b[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(a, 100);
+    kv_fill_block(b, 900);
+    bool reused = true;
+    uint32_t first = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    CHECK(first != KIPP_KV_INVALID_BLOCK);
+    CHECK(reused == false);
+    CHECK(kipp_kv_pool_free_count(pool) == 7);
+    /* Identical tokens hit the cached block and bump its ref count. */
+    uint32_t again = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    CHECK(again == first);
+    CHECK(reused == true);
+    CHECK(kipp_kv_pool_free_count(pool) == 7);
+    /* Different tokens (verify-by-tokens) never alias, even on hash bucket
+     * overlap. */
+    uint32_t other = kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    CHECK(other != first);
+    CHECK(reused == false);
+    CHECK(kipp_kv_pool_free_count(pool) == 6);
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_refcount(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(4);
+    uint32_t tokens[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(tokens, 10);
+    bool reused;
+    uint32_t id = kipp_kv_pool_acquire(pool, 0, tokens, 32, &reused);
+    kipp_kv_pool_acquire(pool, 0, tokens, 32, &reused); /* ref == 2 */
+    CHECK(reused == true);
+    CHECK(kipp_kv_pool_free_count(pool) == 3);
+    kipp_kv_pool_release(pool, id); /* ref == 1, still held */
+    CHECK(kipp_kv_pool_free_count(pool) == 3);
+    kipp_kv_pool_release(pool, id); /* ref == 0, now evictable */
+    CHECK(kipp_kv_pool_free_count(pool) == 4);
+    /* Over-release is a no-op, not an underflow. */
+    kipp_kv_pool_release(pool, id);
+    CHECK(kipp_kv_pool_free_count(pool) == 4);
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_revive(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(4);
+    uint32_t tokens[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(tokens, 42);
+    bool reused;
+    uint32_t id = kipp_kv_pool_acquire(pool, 0, tokens, 32, &reused);
+    kipp_kv_pool_release(pool, id); /* evictable but still indexed */
+    CHECK(kipp_kv_pool_free_count(pool) == 4);
+    /* A matching acquire revives the freed block rather than consuming a new
+     * one. */
+    uint32_t revived = kipp_kv_pool_acquire(pool, 0, tokens, 32, &reused);
+    CHECK(revived == id);
+    CHECK(reused == true);
+    CHECK(kipp_kv_pool_free_count(pool) == 3);
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_evict(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(2);
+    uint32_t a[KIPP_KV_BLOCK_TOKENS];
+    uint32_t b[KIPP_KV_BLOCK_TOKENS];
+    uint32_t c[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(a, 100);
+    kv_fill_block(b, 200);
+    kv_fill_block(c, 300);
+    bool reused;
+    uint32_t id_a = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    kipp_kv_pool_release(pool, id_a); /* released first -> LRU */
+    uint32_t id_b = kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    kipp_kv_pool_release(pool, id_b);
+    CHECK(kipp_kv_pool_free_count(pool) == 2);
+    /* Fresh content under pressure evicts the least-recently-used block (A). */
+    uint32_t id_c = kipp_kv_pool_acquire(pool, 0, c, 32, &reused);
+    CHECK(reused == false);
+    CHECK(id_c == id_a);
+    /* B was not the LRU victim, so it is still revivable. */
+    uint32_t revive_b = kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    CHECK(reused == true);
+    CHECK(revive_b == id_b);
+    /* A was evicted: its content is gone from the index. */
+    kipp_kv_pool_release(pool, id_c);
+    kipp_kv_pool_release(pool, revive_b);
+    uint32_t reacquire_a = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    CHECK(reused == false);
+    (void)reacquire_a;
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_partial_private(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(4);
+    uint32_t tokens[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(tokens, 7);
+    bool reused;
+    /* Partial (< 32 token) blocks are never shared or revived. */
+    uint32_t first = kipp_kv_pool_acquire(pool, 0, tokens, 20, &reused);
+    CHECK(reused == false);
+    uint32_t second = kipp_kv_pool_acquire(pool, 0, tokens, 20, &reused);
+    CHECK(reused == false);
+    CHECK(first != second);
+    CHECK(kipp_kv_pool_free_count(pool) == 2);
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_prefix_match(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(16);
+    uint32_t sequence[4 * KIPP_KV_BLOCK_TOKENS];
+    for (uint32_t index = 0; index < 4 * KIPP_KV_BLOCK_TOKENS; ++index) {
+        sequence[index] = index + 1;
+    }
+    /* Populate three chained full blocks and keep them referenced. */
+    uint64_t parent = 0;
+    uint32_t built[3];
+    for (uint32_t block = 0; block < 3; ++block) {
+        const uint32_t *block_tokens = sequence + block * KIPP_KV_BLOCK_TOKENS;
+        bool reused;
+        built[block] =
+            kipp_kv_pool_acquire(pool, parent, block_tokens, 32, &reused);
+        parent = kipp_kv_pool_hash(parent, block_tokens, 32);
+    }
+
+    uint32_t matched_blocks[4];
+    uint32_t matched_tokens = 0;
+    uint64_t out_parent = 0;
+    /* With one extra token beyond the 3 cached blocks, all three match. */
+    uint32_t matched = kipp_kv_pool_prefix_match(
+        pool, sequence, 3 * KIPP_KV_BLOCK_TOKENS + 1, matched_blocks, 4,
+        &matched_tokens, &out_parent);
+    CHECK(matched == 3);
+    CHECK(matched_tokens == 96);
+    CHECK(matched_blocks[0] == built[0]);
+    CHECK(matched_blocks[2] == built[2]);
+    for (uint32_t block = 0; block < matched; ++block) {
+        kipp_kv_pool_release(pool, matched_blocks[block]);
+    }
+
+    /* An exact multiple must leave a block short (the logits-producing cap). */
+    matched = kipp_kv_pool_prefix_match(pool, sequence,
+                                        3 * KIPP_KV_BLOCK_TOKENS, matched_blocks,
+                                        4, &matched_tokens, &out_parent);
+    CHECK(matched == 2);
+    CHECK(matched_tokens == 64);
+    for (uint32_t block = 0; block < matched; ++block) {
+        kipp_kv_pool_release(pool, matched_blocks[block]);
+    }
+
+    /* A sequence shorter than one block matches nothing. */
+    matched = kipp_kv_pool_prefix_match(pool, sequence, 32, matched_blocks, 4,
+                                        &matched_tokens, &out_parent);
+    CHECK(matched == 0);
+    CHECK(matched_tokens == 0);
+
+    /* A divergent first block short-circuits the walk. */
+    uint32_t divergent[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(divergent, 5000);
+    matched = kipp_kv_pool_prefix_match(pool, divergent, 33, matched_blocks, 4,
+                                        &matched_tokens, &out_parent);
+    CHECK(matched == 0);
+
+    for (uint32_t block = 0; block < 3; ++block) {
+        kipp_kv_pool_release(pool, built[block]);
+    }
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_exhaustion(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(1);
+    uint32_t a[KIPP_KV_BLOCK_TOKENS];
+    uint32_t b[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(a, 1);
+    kv_fill_block(b, 2);
+    bool reused;
+    uint32_t held = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    CHECK(held != KIPP_KV_INVALID_BLOCK);
+    CHECK(kipp_kv_pool_free_count(pool) == 0);
+    /* Nothing is evictable while the only block is referenced. */
+    uint32_t denied = kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    CHECK(denied == KIPP_KV_INVALID_BLOCK);
+    /* Freeing it restores capacity. */
+    kipp_kv_pool_release(pool, held);
+    uint32_t ok = kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    CHECK(ok != KIPP_KV_INVALID_BLOCK);
+    kipp_kv_pool_destroy(pool);
+}
+
 int main(int argc, char **argv) {
     RUN(test_error_names);
     RUN(test_bf16);
@@ -1297,6 +2072,7 @@ int main(int argc, char **argv) {
     RUN(test_kv_layout);
     RUN(test_rms_norm);
     RUN(test_matvec);
+    RUN(test_quant_matvec);
     RUN(test_rope);
     RUN(test_softmax_and_swiglu);
     RUN(test_causal_gqa);
@@ -1306,7 +2082,18 @@ int main(int argc, char **argv) {
     RUN(test_nfc_fuzz);
     RUN(test_gguf_reject_fuzz);
     RUN(test_sampler);
+    RUN(test_sample_ex);
     RUN(test_public_argument_checks);
+    RUN(test_registry_rejection);
+    RUN(test_prompt_lookup);
+    RUN(test_chat_render);
+    RUN(test_kv_pool_reuse);
+    RUN(test_kv_pool_refcount);
+    RUN(test_kv_pool_revive);
+    RUN(test_kv_pool_evict);
+    RUN(test_kv_pool_partial_private);
+    RUN(test_kv_pool_prefix_match);
+    RUN(test_kv_pool_exhaustion);
     RUN(test_malformed_gguf);
 
     if (argc == 2 && strcmp(argv[1], "--metal-operators") == 0) {
@@ -1355,6 +2142,42 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "PASS phase2_integration\n");
         }
+    } else if (argc == 4 && strcmp(argv[1], "--multilogit") == 0) {
+        ++tests_run;
+        if (run_multilogit_test(argv[2], argv[3]) != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL multilogit\n");
+        } else {
+            fprintf(stderr, "PASS multilogit\n");
+        }
+    } else if (argc == 4 && strcmp(argv[1], "--paged-cpu") == 0) {
+        ++tests_run;
+        if (run_paged_test(argv[2], argv[3], KIPP_BACKEND_CPU, "CPU") != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL paged_cpu\n");
+        } else {
+            fprintf(stderr, "PASS paged_cpu\n");
+        }
+#ifdef KIPP_ENABLE_METAL
+    } else if (argc == 4 && strcmp(argv[1], "--paged-metal") == 0) {
+        ++tests_run;
+        if (run_paged_test(argv[2], argv[3], KIPP_BACKEND_METAL, "METAL") != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL paged_metal\n");
+        } else {
+            fprintf(stderr, "PASS paged_metal\n");
+        }
+#endif
+#ifdef KIPP_ENABLE_METAL
+    } else if (argc == 4 && strcmp(argv[1], "--multilogit-metal") == 0) {
+        ++tests_run;
+        if (run_multilogit_metal_test(argv[2], argv[3]) != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL multilogit_metal\n");
+        } else {
+            fprintf(stderr, "PASS multilogit_metal\n");
+        }
+#endif
     } else if (argc == 4 && strcmp(argv[1], "--phase3-metal") == 0) {
         ++tests_run;
         if (run_phase3_test(argv[2], argv[3]) != 0) {
@@ -1374,7 +2197,8 @@ int main(int argc, char **argv) {
     } else if (argc != 1) {
         fprintf(stderr,
                 "Usage: %s [--metal-operators|--cuda-operators] "
-                "[--model|--phase2-model|--phase3-metal|--phase4-cuda "
+                "[--model|--phase2-model|--phase3-metal|--phase4-cuda|"
+                "--multilogit|--paged-cpu "
                 "MODEL.gguf "
                 "VECTOR_DIRECTORY]\n",
                 argv[0]);

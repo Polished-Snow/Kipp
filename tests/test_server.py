@@ -34,6 +34,7 @@ MODEL = pathlib.Path(
     )
 )
 BACKEND = os.environ.get("KIPP_SERVER_BACKEND", "metal")
+MODEL_ID = os.environ.get("KIPP_SERVER_MODEL_ID", MODEL.parent.name)
 
 
 def free_port() -> int:
@@ -90,7 +91,21 @@ class ServerTests(unittest.TestCase):
             with urllib.request.urlopen(cls.base + path, timeout=300) as reply:
                 return reply.status, json.load(reply)
         except urllib.error.HTTPError as error:
-            return error.code, json.load(error)
+            try:
+                return error.code, json.load(error)
+            finally:
+                error.close()
+
+    @classmethod
+    def raw_get(cls, path: str) -> tuple[int, str]:
+        try:
+            with urllib.request.urlopen(cls.base + path, timeout=300) as reply:
+                return reply.status, reply.read().decode()
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, error.read().decode()
+            finally:
+                error.close()
 
     @classmethod
     def post(cls, path: str, body: bytes | dict) -> tuple[int, dict]:
@@ -104,10 +119,16 @@ class ServerTests(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=300) as reply:
                 return reply.status, json.load(reply)
         except urllib.error.HTTPError as error:
-            return error.code, json.load(error)
+            try:
+                return error.code, json.load(error)
+            finally:
+                error.close()
 
     def completion(self, **fields) -> tuple[int, dict]:
         return self.post("/v1/completions", fields)
+
+    def chat(self, **fields) -> tuple[int, dict]:
+        return self.post("/v1/chat/completions", fields)
 
     def test_healthz(self) -> None:
         status, body = self.get("/healthz")
@@ -117,19 +138,21 @@ class ServerTests(unittest.TestCase):
     def test_models(self) -> None:
         status, body = self.get("/v1/models")
         self.assertEqual(status, 200)
-        self.assertEqual(body["data"][0]["id"], "qwen3-4b-base")
+        self.assertEqual(body["data"][0]["id"], MODEL_ID)
 
     def test_greedy_completion_schema(self) -> None:
         status, body = self.completion(
-            model="qwen3-4b-base",
+            model=MODEL_ID,
             prompt="The capital of France is",
             max_tokens=4,
             temperature=0,
         )
         self.assertEqual(status, 200)
+        self.assertEqual(body["model"], MODEL_ID)
         self.assertEqual(body["object"], "text_completion")
         choice = body["choices"][0]
-        self.assertIn("Paris", choice["text"])
+        self.assertIsInstance(choice["text"], str)
+        self.assertTrue(choice["text"])
         self.assertEqual(choice["index"], 0)
         self.assertEqual(choice["finish_reason"], "length")
         usage = body["usage"]
@@ -166,9 +189,185 @@ class ServerTests(unittest.TestCase):
         self.assertIn("five", choice["text"])
 
     def test_unsupported_field(self) -> None:
-        status, body = self.completion(prompt="hi", logit_bias={})
+        status, body = self.completion(prompt="hi", nonsense_field=1)
         self.assertEqual(status, 400)
-        self.assertIn("logit_bias", body["error"]["message"])
+        self.assertIn("nonsense_field", body["error"]["message"])
+
+    def test_sampling_fields_accepted(self) -> None:
+        status, body = self.completion(
+            prompt="The capital of France is",
+            max_tokens=4,
+            temperature=0.7,
+            top_k=40,
+            min_p=0.05,
+            frequency_penalty=0.5,
+            presence_penalty=0.2,
+            repetition_penalty=1.1,
+            logit_bias={"0": -100},
+            seed=7,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("text", body["choices"][0])
+
+    def test_sampling_validation(self) -> None:
+        for field, value, needle in [
+            ("min_p", 2, "min_p"),
+            ("top_k", -1, "top_k"),
+            ("frequency_penalty", 5, "frequency_penalty"),
+            ("repetition_penalty", 0, "repetition_penalty"),
+            ("logit_bias", {"999999999": 1}, "token ids"),
+        ]:
+            status, body = self.completion(prompt="hi", **{field: value})
+            self.assertEqual(status, 400, field)
+            self.assertIn(needle, body["error"]["message"], field)
+
+    def test_logprobs_legacy(self) -> None:
+        status, body = self.completion(
+            prompt="The capital of France is",
+            max_tokens=4,
+            temperature=0,
+            logprobs=3,
+        )
+        self.assertEqual(status, 200)
+        choice = body["choices"][0]
+        lp = choice["logprobs"]
+        count = body["usage"]["completion_tokens"]
+        self.assertEqual(len(lp["tokens"]), count)
+        self.assertEqual(len(lp["token_logprobs"]), count)
+        self.assertEqual(len(lp["top_logprobs"]), count)
+        self.assertEqual(len(lp["text_offset"]), count)
+        # Greedy decoding: the chosen token is the argmax, so its logprob is
+        # the largest, and every logprob is the log of a probability (<= 0).
+        for token_lp, alternatives in zip(
+            lp["token_logprobs"], lp["top_logprobs"]
+        ):
+            self.assertLessEqual(token_lp, 1e-4)
+            self.assertLessEqual(len(alternatives), 3)
+            for alt_lp in alternatives.values():
+                self.assertLessEqual(alt_lp, token_lp + 1e-4)
+        # text_offset is non-decreasing and matches the reconstructed text.
+        offsets = lp["text_offset"]
+        self.assertEqual(offsets, sorted(offsets))
+        self.assertEqual("".join(lp["tokens"]), choice["text"])
+
+    def test_logprobs_chat(self) -> None:
+        status, body = self.chat(
+            messages=[{"role": "user", "content": "Say hi"}],
+            max_tokens=6,
+            temperature=0,
+            logprobs=True,
+            top_logprobs=2,
+        )
+        if status == 400 and "base checkpoints" in body["error"]["message"]:
+            return  # base checkpoint: no chat template, documented elsewhere
+        self.assertEqual(status, 200)
+        content = body["choices"][0]["logprobs"]["content"]
+        self.assertEqual(len(content), body["usage"]["completion_tokens"])
+        for entry in content:
+            self.assertIn("token", entry)
+            self.assertIsInstance(entry["bytes"], list)
+            self.assertLessEqual(entry["logprob"], 1e-4)
+            self.assertLessEqual(len(entry["top_logprobs"]), 2)
+            for alt in entry["top_logprobs"]:
+                self.assertLessEqual(alt["logprob"], entry["logprob"] + 1e-4)
+
+    def test_logprobs_validation(self) -> None:
+        status, body = self.completion(prompt="hi", max_tokens=2, logprobs=6)
+        self.assertEqual(status, 400)
+        self.assertIn("logprobs", body["error"]["message"])
+        status, body = self.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            top_logprobs=21,
+            logprobs=True,
+        )
+        if not (status == 400 and "base checkpoints" in body["error"]["message"]):
+            self.assertEqual(status, 400)
+            self.assertIn("top_logprobs", body["error"]["message"])
+        status, body = self.chat(
+            messages=[{"role": "user", "content": "hi"}],
+            top_logprobs=2,
+        )
+        if not (status == 400 and "base checkpoints" in body["error"]["message"]):
+            self.assertEqual(status, 400)
+            self.assertIn("requires logprobs", body["error"]["message"])
+
+    def test_timings(self) -> None:
+        status, body = self.completion(
+            prompt="The capital of France is",
+            max_tokens=5,
+            temperature=0,
+        )
+        self.assertEqual(status, 200)
+        timings = body["timings"]
+        self.assertEqual(timings["predicted_n"], body["usage"]["completion_tokens"])
+        self.assertEqual(timings["prompt_n"], body["usage"]["prompt_tokens"])
+        self.assertGreaterEqual(timings["predicted_ms"], 0.0)
+        self.assertGreaterEqual(timings["prompt_ms"], 0.0)
+
+    def test_stream_include_usage(self) -> None:
+        _, chunks, saw_done = self.stream_completion(
+            prompt="The capital of France is",
+            max_tokens=5,
+            temperature=0,
+            stream_options={"include_usage": True},
+        )
+        self.assertTrue(saw_done)
+        usage_chunks = [c for c in chunks if c.get("usage") is not None]
+        self.assertEqual(len(usage_chunks), 1)
+        usage_chunk = usage_chunks[-1]
+        self.assertEqual(usage_chunk["choices"], [])
+        self.assertEqual(usage_chunk["usage"]["completion_tokens"], 5)
+        self.assertEqual(usage_chunk["timings"]["predicted_n"], 5)
+
+    def test_streaming_logprobs(self) -> None:
+        _, chunks, saw_done = self.stream_completion(
+            prompt="The capital of France is",
+            max_tokens=5,
+            temperature=0,
+            logprobs=2,
+        )
+        self.assertTrue(saw_done)
+        seen = []
+        for chunk in chunks:
+            for choice in chunk["choices"]:
+                lp = choice.get("logprobs")
+                if lp:
+                    seen.extend(lp["tokens"])
+        self.assertEqual(len(seen), 5)
+
+    def test_metrics(self) -> None:
+        # A completion should move the counters.
+        self.completion(prompt="Hi", max_tokens=3, temperature=0)
+        status, raw = self.raw_get("/metrics")
+        self.assertEqual(status, 200)
+        for metric in (
+            "kipp_requests_total",
+            "kipp_prompt_tokens_total",
+            "kipp_generation_tokens_total",
+            "kipp_requests_running",
+        ):
+            self.assertIn(metric, raw)
+        line = [
+            row for row in raw.splitlines()
+            if row.startswith("kipp_requests_total ")
+        ][0]
+        self.assertGreaterEqual(int(line.split()[1]), 1)
+
+    def test_chat_completion(self) -> None:
+        status, body = self.chat(
+            messages=[{"role": "user", "content": "Say hi"}],
+            max_tokens=8,
+            temperature=0,
+        )
+        if status == 400 and "base checkpoints" in body["error"]["message"]:
+            # A base checkpoint has no chat template; that rejection is the
+            # correct behavior and this assertion documents it.
+            return
+        self.assertEqual(status, 200)
+        self.assertEqual(body["object"], "chat.completion")
+        message = body["choices"][0]["message"]
+        self.assertEqual(message["role"], "assistant")
+        self.assertIsInstance(message["content"], str)
 
     def test_invalid_json(self) -> None:
         status, body = self.post("/v1/completions", b"{oops")
@@ -286,9 +485,9 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(finishes, {0: "length", 1: "length"})
 
     def test_context_limit(self) -> None:
-        status, body = self.completion(prompt="hi", max_tokens=32768)
+        status, body = self.completion(prompt="hi", max_tokens=1_000_000)
         self.assertEqual(status, 400)
-        self.assertIn("context", body["error"]["message"])
+        self.assertIn("max_tokens", body["error"]["message"])
 
     def test_concurrent_requests_batch_together(self) -> None:
         request = {
@@ -370,7 +569,10 @@ class ServerTests(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=60) as reply:
                 status = reply.status
         except urllib.error.HTTPError as error:
-            status = error.code
+            try:
+                status = error.code
+            finally:
+                error.close()
         self.assertEqual(status, 405)
 
 

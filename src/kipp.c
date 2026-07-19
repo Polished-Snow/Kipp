@@ -1,5 +1,7 @@
 #include "kipp.h"
 #include "kipp_backend.h"
+#include "kipp_checkpoints.h"
+#include "kipp_kv_pool.h"
 #ifdef KIPP_ENABLE_METAL
 #include "metal/kipp_metal.h"
 #endif
@@ -22,9 +24,8 @@
 
 #define KIPP_GGUF_VERSION 3u
 #define KIPP_GGUF_ALIGNMENT 32u
-#define KIPP_EXPECTED_TENSOR_COUNT 398u
+#define KIPP_MAX_TENSOR_COUNT 4096u
 #define KIPP_PHASE1_MAX_TOKENS 256u
-#define KIPP_ROPE_THETA 1000000.0f
 #define KIPP_RMS_EPSILON 1.0e-6f
 
 enum gguf_value_type {
@@ -98,7 +99,9 @@ typedef struct {
 
 typedef struct {
     char architecture[32];
+    char source_repository[96];
     char source_revision[64];
+    char quant_scheme[16];
     char tokenizer_model[16];
     char tokenizer_pre[16];
     uint32_t alignment;
@@ -490,10 +493,20 @@ static bool read_metadata_entry(byte_cursor *cursor, gguf_metadata *metadata) {
                copy_metadata_string(cursor, metadata->architecture,
                                     sizeof(metadata->architecture));
     }
+    if (key_is(key, key_length, "kipp.source.repository")) {
+        return type == GGUF_VALUE_STRING &&
+               copy_metadata_string(cursor, metadata->source_repository,
+                                    sizeof(metadata->source_repository));
+    }
     if (key_is(key, key_length, "kipp.source.revision")) {
         return type == GGUF_VALUE_STRING &&
                copy_metadata_string(cursor, metadata->source_revision,
                                     sizeof(metadata->source_revision));
+    }
+    if (key_is(key, key_length, "kipp.quant.scheme")) {
+        return type == GGUF_VALUE_STRING &&
+               copy_metadata_string(cursor, metadata->quant_scheme,
+                                    sizeof(metadata->quant_scheme));
     }
     if (key_is(key, key_length, "tokenizer.ggml.model")) {
         return type == GGUF_VALUE_STRING &&
@@ -707,36 +720,77 @@ static int finish_tokenizer_metadata(gguf_metadata *metadata,
     return build_tokenizer_indexes(&metadata->tokenizer, error);
 }
 
-static int validate_metadata(const gguf_metadata *metadata, kipp_error *error) {
-    if (strcmp(metadata->architecture, "qwen3") != 0) {
-        return fail(error, KIPP_ERROR_UNSUPPORTED,
-                    "expected qwen3 architecture, found '%s'",
-                    metadata->architecture);
+static const kipp_checkpoint_spec *
+find_checkpoint(const char *repository, const char *revision) {
+    for (size_t index = 0; index < KIPP_SUPPORTED_CHECKPOINT_COUNT; ++index) {
+        const kipp_checkpoint_spec *spec = &kipp_supported_checkpoints[index];
+        if (strcmp(spec->repository, repository) == 0 &&
+            strcmp(spec->revision, revision) == 0) {
+            return spec;
+        }
     }
-    if (strcmp(metadata->source_revision, KIPP_MODEL_REVISION) != 0) {
-        return fail(error, KIPP_ERROR_UNSUPPORTED,
-                    "model revision is not the pinned Kipp revision");
+    return NULL;
+}
+
+/*
+ * Match the GGUF against the compiled-in checkpoint registry and require
+ * every metadata field to equal the registry entry exactly. Unknown
+ * checkpoints and mismatched dimensions are rejections, not extension
+ * points.
+ */
+static const kipp_checkpoint_spec *
+validate_metadata(const gguf_metadata *metadata, kipp_error *error) {
+    if (strcmp(metadata->architecture, "qwen3") != 0) {
+        fail(error, KIPP_ERROR_UNSUPPORTED,
+             "expected qwen3 architecture, found '%s'",
+             metadata->architecture);
+        return NULL;
+    }
+    const kipp_checkpoint_spec *spec =
+        find_checkpoint(metadata->source_repository,
+                        metadata->source_revision);
+    if (spec == NULL) {
+        fail(error, KIPP_ERROR_UNSUPPORTED,
+             "checkpoint '%s'@'%.16s' is not in the supported registry",
+             metadata->source_repository, metadata->source_revision);
+        return NULL;
     }
     if (metadata->alignment != KIPP_GGUF_ALIGNMENT ||
-        metadata->block_count != KIPP_BLOCK_COUNT ||
-        metadata->embedding_length != KIPP_EMBEDDING_LENGTH ||
-        metadata->feed_forward_length != KIPP_FEED_FORWARD_LENGTH ||
-        metadata->attention_head_count != KIPP_ATTENTION_HEAD_COUNT ||
+        metadata->block_count != spec->block_count ||
+        metadata->block_count > KIPP_MAX_BLOCK_COUNT ||
+        metadata->embedding_length != spec->embedding_length ||
+        metadata->feed_forward_length != spec->feed_forward_length ||
+        metadata->attention_head_count != spec->attention_head_count ||
         metadata->attention_head_count_kv != KIPP_ATTENTION_HEAD_COUNT_KV ||
         metadata->attention_head_dim != KIPP_ATTENTION_HEAD_DIM ||
-        metadata->context_length != KIPP_CONTEXT_LENGTH ||
+        metadata->context_length != spec->context_length ||
         metadata->vocab_size != KIPP_VOCAB_SIZE ||
-        fabsf(metadata->rope_theta - KIPP_ROPE_THETA) > 0.5f ||
+        fabsf(metadata->rope_theta - spec->rope_theta) > 0.5f ||
         fabsf(metadata->rms_epsilon - KIPP_RMS_EPSILON) > 1.0e-9f ||
-        !metadata->tied_embeddings || metadata->tokenizer.add_bos ||
-        !metadata->saw_add_bos ||
+        metadata->tied_embeddings != spec->tied_embeddings ||
+        metadata->tokenizer.add_bos || !metadata->saw_add_bos ||
         strcmp(metadata->tokenizer_model, "gpt2") != 0 ||
         strcmp(metadata->tokenizer_pre, "qwen2") != 0 ||
-        metadata->tokenizer.eos_token != KIPP_EOS_TOKEN_ID) {
-        return fail(error, KIPP_ERROR_UNSUPPORTED,
-                    "GGUF metadata does not match Qwen3-4B-Base");
+        metadata->tokenizer.eos_token != spec->eos_token_id) {
+        fail(error, KIPP_ERROR_UNSUPPORTED,
+             "GGUF metadata does not match registry entry '%s'", spec->id);
+        return NULL;
     }
-    return 0;
+    return spec;
+}
+
+static void config_from_spec(kipp_model_config *config,
+                             const kipp_checkpoint_spec *spec) {
+    config->spec = spec;
+    config->block_count = spec->block_count;
+    config->embedding_length = spec->embedding_length;
+    config->feed_forward_length = spec->feed_forward_length;
+    config->attention_head_count = spec->attention_head_count;
+    config->attention_width =
+        spec->attention_head_count * KIPP_ATTENTION_HEAD_DIM;
+    config->context_length = spec->context_length;
+    config->rope_theta = spec->rope_theta;
+    config->tied_embeddings = spec->tied_embeddings;
 }
 
 static gguf_tensor_info *find_tensor(gguf_tensor_info *tensors,
@@ -749,8 +803,39 @@ static gguf_tensor_info *find_tensor(gguf_tensor_info *tensors,
     return NULL;
 }
 
+/* Storage bytes for element_count weights at the given tensor type. */
+static bool tensor_type_byte_count(kipp_tensor_type type,
+                                   uint64_t element_count, uint64_t *bytes) {
+    switch (type) {
+    case KIPP_TENSOR_BF16:
+        if (element_count > UINT64_MAX / 2) {
+            return false;
+        }
+        *bytes = element_count * 2;
+        return true;
+    case KIPP_TENSOR_Q8_0:
+        if (element_count % KIPP_QUANT_BLOCK != 0 ||
+            element_count / KIPP_QUANT_BLOCK > UINT64_MAX /
+                                                   KIPP_Q8_0_BLOCK_BYTES) {
+            return false;
+        }
+        *bytes = element_count / KIPP_QUANT_BLOCK * KIPP_Q8_0_BLOCK_BYTES;
+        return true;
+    case KIPP_TENSOR_AFFINE4_GS32:
+        if (element_count % KIPP_QUANT_BLOCK != 0 ||
+            element_count / KIPP_QUANT_BLOCK > UINT64_MAX /
+                                                   KIPP_AFFINE4_GROUP_BYTES) {
+            return false;
+        }
+        *bytes = element_count / KIPP_QUANT_BLOCK * KIPP_AFFINE4_GROUP_BYTES;
+        return true;
+    }
+    return false;
+}
+
 static int bind_tensor(kipp_tensor_view *destination, gguf_tensor_info *tensors,
                        size_t tensor_count, const char *name,
+                       kipp_tensor_type expected_type,
                        uint32_t dimension_count, uint64_t dimension_zero,
                        uint64_t dimension_one, const uint8_t *data_base,
                        size_t data_size, kipp_error *error) {
@@ -763,7 +848,7 @@ static int bind_tensor(kipp_tensor_view *destination, gguf_tensor_info *tensors,
     if (source->bound) {
         return fail(error, KIPP_ERROR_FORMAT, "tensor '%s' was bound twice", name);
     }
-    if (source->type != KIPP_TENSOR_BF16 ||
+    if (source->type != (uint32_t)expected_type ||
         source->dimension_count != dimension_count ||
         source->dimensions[0] != dimension_zero ||
         (dimension_count == 2 && source->dimensions[1] != dimension_one)) {
@@ -777,10 +862,10 @@ static int bind_tensor(kipp_tensor_view *destination, gguf_tensor_info *tensors,
     } else {
         element_count = dimension_zero * dimension_one;
     }
-    if (element_count > UINT64_MAX / 2) {
-        return fail(error, KIPP_ERROR_FORMAT, "tensor '%s' byte size overflows", name);
+    if (!tensor_type_byte_count(expected_type, element_count, &byte_count)) {
+        return fail(error, KIPP_ERROR_FORMAT,
+                    "tensor '%s' byte size overflows or is misaligned", name);
     }
-    byte_count = element_count * 2;
     if (source->offset % KIPP_GGUF_ALIGNMENT != 0 ||
         source->offset > data_size || byte_count > data_size - source->offset) {
         return fail(error, KIPP_ERROR_FORMAT,
@@ -791,7 +876,7 @@ static int bind_tensor(kipp_tensor_view *destination, gguf_tensor_info *tensors,
     destination->dimensions[0] = dimension_zero;
     destination->dimensions[1] = dimension_one;
     destination->dimension_count = dimension_count;
-    destination->type = KIPP_TENSOR_BF16;
+    destination->type = expected_type;
     destination->byte_count = byte_count;
     source->bound = true;
     return 0;
@@ -800,27 +885,52 @@ static int bind_tensor(kipp_tensor_view *destination, gguf_tensor_info *tensors,
 static int bind_model_weights(kipp_model_view *view, gguf_tensor_info *tensors,
                               size_t tensor_count, const uint8_t *data_base,
                               size_t data_size, kipp_error *error) {
+    const kipp_model_config *config = &view->config;
+    /* Projections carry the model's quant scheme; norms, the token
+     * embedding, and lm_head always stay BF16. */
+    kipp_tensor_type projection_type = KIPP_TENSOR_BF16;
+    if (config->quant_scheme == KIPP_QUANT_Q8_0) {
+        projection_type = KIPP_TENSOR_Q8_0;
+    } else if (config->quant_scheme == KIPP_QUANT_AFFINE4_GS32) {
+        projection_type = KIPP_TENSOR_AFFINE4_GS32;
+    }
 #define BIND_VECTOR(target, tensor_name, length)                                  \
     do {                                                                          \
-        if (bind_tensor(&(target), tensors, tensor_count, tensor_name, 1, length, \
-                        0, data_base, data_size, error) != 0) {                    \
+        if (bind_tensor(&(target), tensors, tensor_count, tensor_name,           \
+                        KIPP_TENSOR_BF16, 1, length, 0, data_base, data_size,     \
+                        error) != 0) {                                            \
             return -1;                                                            \
         }                                                                         \
     } while (0)
 #define BIND_MATRIX(target, tensor_name, columns, rows)                           \
     do {                                                                          \
-        if (bind_tensor(&(target), tensors, tensor_count, tensor_name, 2, columns,\
-                        rows, data_base, data_size, error) != 0) {                 \
+        if (bind_tensor(&(target), tensors, tensor_count, tensor_name,           \
+                        KIPP_TENSOR_BF16, 2, columns, rows, data_base,            \
+                        data_size, error) != 0) {                                 \
+            return -1;                                                            \
+        }                                                                         \
+    } while (0)
+#define BIND_PROJECTION(target, tensor_name, columns, rows)                       \
+    do {                                                                          \
+        if (bind_tensor(&(target), tensors, tensor_count, tensor_name,           \
+                        projection_type, 2, columns, rows, data_base,             \
+                        data_size, error) != 0) {                                 \
             return -1;                                                            \
         }                                                                         \
     } while (0)
 
     BIND_MATRIX(view->weights.token_embedding, "model.embed_tokens.weight",
-                KIPP_EMBEDDING_LENGTH, KIPP_VOCAB_SIZE);
+                config->embedding_length, KIPP_VOCAB_SIZE);
     BIND_VECTOR(view->weights.output_norm, "model.norm.weight",
-                KIPP_EMBEDDING_LENGTH);
+                config->embedding_length);
+    if (config->tied_embeddings) {
+        view->weights.lm_head = view->weights.token_embedding;
+    } else {
+        BIND_MATRIX(view->weights.lm_head, "lm_head.weight",
+                    config->embedding_length, KIPP_VOCAB_SIZE);
+    }
 
-    for (uint32_t layer_index = 0; layer_index < KIPP_BLOCK_COUNT;
+    for (uint32_t layer_index = 0; layer_index < config->block_count;
          ++layer_index) {
         char name[128];
         kipp_qwen3_layer_weights *layer = &view->weights.layers[layer_index];
@@ -829,35 +939,34 @@ static int bind_model_weights(kipp_model_view *view, gguf_tensor_info *tensors,
         (void)snprintf(name, sizeof(name), "model.layers.%u.%s", layer_index, suffix)
 
         LAYER_NAME("input_layernorm.weight");
-        BIND_VECTOR(layer->attention_norm, name, KIPP_EMBEDDING_LENGTH);
+        BIND_VECTOR(layer->attention_norm, name, config->embedding_length);
         LAYER_NAME("self_attn.q_proj.weight");
-        BIND_MATRIX(layer->attention_q, name, KIPP_EMBEDDING_LENGTH,
-                    KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM);
+        BIND_PROJECTION(layer->attention_q, name, config->embedding_length,
+                    config->attention_width);
         LAYER_NAME("self_attn.k_proj.weight");
-        BIND_MATRIX(layer->attention_k, name, KIPP_EMBEDDING_LENGTH,
+        BIND_PROJECTION(layer->attention_k, name, config->embedding_length,
                     KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM);
         LAYER_NAME("self_attn.v_proj.weight");
-        BIND_MATRIX(layer->attention_v, name, KIPP_EMBEDDING_LENGTH,
+        BIND_PROJECTION(layer->attention_v, name, config->embedding_length,
                     KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM);
         LAYER_NAME("self_attn.o_proj.weight");
-        BIND_MATRIX(layer->attention_output, name,
-                    KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-                    KIPP_EMBEDDING_LENGTH);
+        BIND_PROJECTION(layer->attention_output, name, config->attention_width,
+                    config->embedding_length);
         LAYER_NAME("self_attn.q_norm.weight");
         BIND_VECTOR(layer->attention_q_norm, name, KIPP_ATTENTION_HEAD_DIM);
         LAYER_NAME("self_attn.k_norm.weight");
         BIND_VECTOR(layer->attention_k_norm, name, KIPP_ATTENTION_HEAD_DIM);
         LAYER_NAME("post_attention_layernorm.weight");
-        BIND_VECTOR(layer->feed_forward_norm, name, KIPP_EMBEDDING_LENGTH);
+        BIND_VECTOR(layer->feed_forward_norm, name, config->embedding_length);
         LAYER_NAME("mlp.gate_proj.weight");
-        BIND_MATRIX(layer->feed_forward_gate, name, KIPP_EMBEDDING_LENGTH,
-                    KIPP_FEED_FORWARD_LENGTH);
+        BIND_PROJECTION(layer->feed_forward_gate, name, config->embedding_length,
+                    config->feed_forward_length);
         LAYER_NAME("mlp.up_proj.weight");
-        BIND_MATRIX(layer->feed_forward_up, name, KIPP_EMBEDDING_LENGTH,
-                    KIPP_FEED_FORWARD_LENGTH);
+        BIND_PROJECTION(layer->feed_forward_up, name, config->embedding_length,
+                    config->feed_forward_length);
         LAYER_NAME("mlp.down_proj.weight");
-        BIND_MATRIX(layer->feed_forward_down, name, KIPP_FEED_FORWARD_LENGTH,
-                    KIPP_EMBEDDING_LENGTH);
+        BIND_PROJECTION(layer->feed_forward_down, name,
+                    config->feed_forward_length, config->embedding_length);
 #undef LAYER_NAME
     }
     for (size_t index = 0; index < tensor_count; ++index) {
@@ -868,6 +977,7 @@ static int bind_model_weights(kipp_model_view *view, gguf_tensor_info *tensors,
     }
 #undef BIND_VECTOR
 #undef BIND_MATRIX
+#undef BIND_PROJECTION
     return 0;
 }
 
@@ -881,36 +991,39 @@ static void free_tensor_infos(gguf_tensor_info *tensors, size_t count) {
     free(tensors);
 }
 
+static bool info_byte_count(const gguf_tensor_info *info, uint64_t *bytes) {
+    uint64_t elements = info->dimensions[0];
+    if (info->dimension_count == 2) {
+        if (info->dimensions[0] != 0 &&
+            info->dimensions[1] > UINT64_MAX / info->dimensions[0]) {
+            return false;
+        }
+        elements *= info->dimensions[1];
+    }
+    return tensor_type_byte_count((kipp_tensor_type)info->type, elements,
+                                  bytes);
+}
+
 static int validate_tensor_ranges(const gguf_tensor_info *tensors, size_t count,
                                   size_t data_size, kipp_error *error) {
     for (size_t first = 0; first < count; ++first) {
-        uint64_t first_elements = tensors[first].dimensions[0];
-        if (tensors[first].dimension_count == 2) {
-            if (tensors[first].dimensions[1] >
-                UINT64_MAX / first_elements) {
-                return fail(error, KIPP_ERROR_FORMAT,
-                            "tensor '%s' element count overflows",
-                            tensors[first].name);
-            }
-            first_elements *= tensors[first].dimensions[1];
-        }
-        if (first_elements > UINT64_MAX / 2) {
+        uint64_t first_bytes;
+        if (!info_byte_count(&tensors[first], &first_bytes)) {
             return fail(error, KIPP_ERROR_FORMAT,
-                        "tensor '%s' byte count overflows", tensors[first].name);
+                        "tensor '%s' has an invalid type or byte count",
+                        tensors[first].name);
         }
-        uint64_t first_bytes = first_elements * 2;
         uint64_t first_end = tensors[first].offset + first_bytes;
         if (first_end < tensors[first].offset || first_end > data_size) {
             return fail(error, KIPP_ERROR_FORMAT,
                         "tensor '%s' range is invalid", tensors[first].name);
         }
         for (size_t second = 0; second < first; ++second) {
-            uint64_t second_elements = tensors[second].dimensions[0];
-            if (tensors[second].dimension_count == 2) {
-                second_elements *= tensors[second].dimensions[1];
+            uint64_t second_bytes;
+            if (!info_byte_count(&tensors[second], &second_bytes)) {
+                continue;
             }
-            uint64_t second_end =
-                tensors[second].offset + second_elements * 2;
+            uint64_t second_end = tensors[second].offset + second_bytes;
             if (tensors[first].offset < second_end &&
                 tensors[second].offset < first_end) {
                 return fail(error, KIPP_ERROR_FORMAT,
@@ -936,7 +1049,7 @@ static int parse_model_mapping(kipp_model *model, kipp_error *error) {
     if (!cursor_take(&cursor, 4, &magic) || memcmp(magic, "GGUF", 4) != 0 ||
         !cursor_u32(&cursor, &version) || version != KIPP_GGUF_VERSION ||
         !cursor_u64(&cursor, &tensor_count_wire) ||
-        tensor_count_wire != KIPP_EXPECTED_TENSOR_COUNT ||
+        tensor_count_wire == 0 || tensor_count_wire > KIPP_MAX_TENSOR_COUNT ||
         !cursor_u64(&cursor, &metadata_count) || metadata_count > 100000) {
         return fail(error, KIPP_ERROR_FORMAT, "invalid or unsupported GGUF header");
     }
@@ -948,8 +1061,32 @@ static int parse_model_mapping(kipp_model *model, kipp_error *error) {
             goto cleanup;
         }
     }
-    if (validate_metadata(&metadata, error) != 0 ||
-        finish_tokenizer_metadata(&metadata, error) != 0) {
+    const kipp_checkpoint_spec *spec = validate_metadata(&metadata, error);
+    if (spec == NULL || finish_tokenizer_metadata(&metadata, error) != 0) {
+        goto cleanup;
+    }
+    config_from_spec(&model->view.config, spec);
+    if (metadata.quant_scheme[0] == '\0' ||
+        strcmp(metadata.quant_scheme, "bf16") == 0) {
+        model->view.config.quant_scheme = KIPP_QUANT_BF16;
+    } else if (strcmp(metadata.quant_scheme, "q8_0") == 0) {
+        model->view.config.quant_scheme = KIPP_QUANT_Q8_0;
+    } else if (strcmp(metadata.quant_scheme, "affine4_gs32") == 0) {
+        model->view.config.quant_scheme = KIPP_QUANT_AFFINE4_GS32;
+    } else {
+        fail(error, KIPP_ERROR_UNSUPPORTED,
+             "unknown quantization scheme '%s'", metadata.quant_scheme);
+        goto cleanup;
+    }
+    /* embeddings + final norm + 11 tensors per layer + untied lm_head */
+    uint64_t expected_tensors =
+        2u + (uint64_t)spec->block_count * 11u +
+        (spec->tied_embeddings ? 0u : 1u);
+    if (tensor_count_wire != expected_tensors) {
+        fail(error, KIPP_ERROR_FORMAT,
+             "GGUF holds %llu tensors but registry entry '%s' requires %llu",
+             (unsigned long long)tensor_count_wire, spec->id,
+             (unsigned long long)expected_tensors);
         goto cleanup;
     }
 
@@ -1129,20 +1266,46 @@ int kipp_model_get_info(const kipp_model *model, kipp_model_info *out_info) {
     if (model == NULL || out_info == NULL) {
         return -1;
     }
-    *out_info = (kipp_model_info){
-        KIPP_MODEL_REPOSITORY,
-        KIPP_MODEL_REVISION,
-        model->backend_kind,
-        KIPP_BLOCK_COUNT,
-        KIPP_EMBEDDING_LENGTH,
-        KIPP_FEED_FORWARD_LENGTH,
-        KIPP_ATTENTION_HEAD_COUNT,
-        KIPP_ATTENTION_HEAD_COUNT_KV,
-        KIPP_ATTENTION_HEAD_DIM,
-        KIPP_VOCAB_SIZE,
-        KIPP_CONTEXT_LENGTH,
-        model->mapping_size
-    };
+    const kipp_model_config *config = &model->view.config;
+    const kipp_checkpoint_spec *spec = config->spec;
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->checkpoint_id = spec->id;
+    out_info->repository = spec->repository;
+    out_info->revision = spec->revision;
+    out_info->variant = spec->variant;
+    out_info->backend = model->backend_kind;
+    out_info->block_count = config->block_count;
+    out_info->embedding_length = config->embedding_length;
+    out_info->feed_forward_length = config->feed_forward_length;
+    out_info->attention_head_count = config->attention_head_count;
+    out_info->attention_head_count_kv = KIPP_ATTENTION_HEAD_COUNT_KV;
+    out_info->attention_head_dim = KIPP_ATTENTION_HEAD_DIM;
+    out_info->vocab_size = KIPP_VOCAB_SIZE;
+    out_info->context_length = config->context_length;
+    out_info->rope_theta = config->rope_theta;
+    out_info->tied_embeddings = config->tied_embeddings ? 1 : 0;
+    out_info->quant_scheme =
+        config->quant_scheme == KIPP_QUANT_Q8_0        ? "q8_0"
+        : config->quant_scheme == KIPP_QUANT_AFFINE4_GS32 ? "affine4_gs32"
+                                                          : "bf16";
+    for (uint32_t index = 0; index < spec->stop_token_count; ++index) {
+        out_info->stop_tokens[index] = spec->stop_tokens[index];
+    }
+    out_info->stop_token_count = spec->stop_token_count;
+    out_info->mapped_bytes = model->mapping_size;
+    return 0;
+}
+
+int kipp_model_is_stop_token(const kipp_model *model, uint32_t token) {
+    if (model == NULL) {
+        return 0;
+    }
+    const kipp_checkpoint_spec *spec = model->view.config.spec;
+    for (uint32_t index = 0; index < spec->stop_token_count; ++index) {
+        if (spec->stop_tokens[index] == token) {
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -1937,6 +2100,35 @@ static uint16_t float_to_bf16(float value) {
     return (uint16_t)((bits + rounding) >> 16);
 }
 
+/* IEEE binary16 -> float, handling subnormals, inf, and NaN. */
+static float fp16_to_float(uint16_t value) {
+    uint32_t sign = (uint32_t)(value & 0x8000u) << 16;
+    uint32_t exponent = (value >> 10) & 0x1fu;
+    uint32_t mantissa = value & 0x3ffu;
+    uint32_t bits;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            /* Subnormal: normalize into a float. */
+            exponent = 127 - 15 + 1;
+            while ((mantissa & 0x400u) == 0) {
+                mantissa <<= 1;
+                --exponent;
+            }
+            mantissa &= 0x3ffu;
+            bits = sign | (exponent << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1fu) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + (127 - 15)) << 23) | (mantissa << 13);
+    }
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
 static const uint16_t *tensor_bf16(const kipp_tensor_view *tensor) {
     return (const uint16_t *)(const void *)tensor->data;
 }
@@ -1962,6 +2154,90 @@ static void matvec_bf16(const uint16_t *weight, const float *input,
             sum += bf16_to_float(weight_row[column]) * input[column];
         }
         output[row] = (float)sum;
+    }
+}
+
+/*
+ * Q8_0: each 32-weight block is a little-endian fp16 scale followed by 32
+ * int8 quants (34 bytes). w = scale * q. Row r begins at block r*(cols/32).
+ */
+static void matvec_q8_0(const uint8_t *weight, const float *input,
+                        float *output, size_t rows, size_t columns) {
+    const size_t blocks = columns / KIPP_QUANT_BLOCK;
+    for (size_t row = 0; row < rows; ++row) {
+        const uint8_t *block =
+            weight + row * blocks * KIPP_Q8_0_BLOCK_BYTES;
+        float sum = 0.0f;
+        for (size_t b = 0; b < blocks; ++b) {
+            uint16_t scale_bits;
+            memcpy(&scale_bits, block, sizeof(scale_bits));
+            float scale = fp16_to_float(scale_bits);
+            const int8_t *qs = (const int8_t *)(block + 2);
+            const float *in = input + b * KIPP_QUANT_BLOCK;
+            float dot = 0.0f;
+            for (size_t i = 0; i < KIPP_QUANT_BLOCK; ++i) {
+                dot += (float)qs[i] * in[i];
+            }
+            sum += scale * dot;
+            block += KIPP_Q8_0_BLOCK_BYTES;
+        }
+        output[row] = sum;
+    }
+}
+
+/*
+ * AFFINE4_GS32: each 32-weight group is 16 packed nibbles (q[2k]=lo,
+ * q[2k+1]=hi) then a little-endian fp16 scale and fp16 bias (20 bytes).
+ * w = scale*q + bias, so the group contributes scale*sum(q_i*in_i) +
+ * bias*sum(in_i) (the activation-sum fold).
+ */
+static void matvec_affine4_gs32(const uint8_t *weight, const float *input,
+                                float *output, size_t rows, size_t columns) {
+    const size_t groups = columns / KIPP_QUANT_BLOCK;
+    for (size_t row = 0; row < rows; ++row) {
+        const uint8_t *group =
+            weight + row * groups * KIPP_AFFINE4_GROUP_BYTES;
+        float sum = 0.0f;
+        for (size_t g = 0; g < groups; ++g) {
+            const uint8_t *packed = group;
+            uint16_t scale_bits;
+            uint16_t bias_bits;
+            memcpy(&scale_bits, group + 16, sizeof(scale_bits));
+            memcpy(&bias_bits, group + 18, sizeof(bias_bits));
+            float scale = fp16_to_float(scale_bits);
+            float bias = fp16_to_float(bias_bits);
+            const float *in = input + g * KIPP_QUANT_BLOCK;
+            float dot = 0.0f;
+            float activation_sum = 0.0f;
+            for (size_t k = 0; k < 16; ++k) {
+                uint8_t byte = packed[k];
+                float lo = (float)(byte & 0x0fu);
+                float hi = (float)(byte >> 4);
+                dot += lo * in[2 * k] + hi * in[2 * k + 1];
+                activation_sum += in[2 * k] + in[2 * k + 1];
+            }
+            sum += scale * dot + bias * activation_sum;
+            group += KIPP_AFFINE4_GROUP_BYTES;
+        }
+        output[row] = sum;
+    }
+}
+
+/* Dispatch a projection matvec on the weight tensor's quantization type. */
+static void matvec_tensor(const kipp_tensor_view *weight, const float *input,
+                          float *output, size_t rows, size_t columns) {
+    switch (weight->type) {
+    case KIPP_TENSOR_Q8_0:
+        matvec_q8_0(weight->data, input, output, rows, columns);
+        break;
+    case KIPP_TENSOR_AFFINE4_GS32:
+        matvec_affine4_gs32(weight->data, input, output, rows, columns);
+        break;
+    case KIPP_TENSOR_BF16:
+    default:
+        matvec_bf16((const uint16_t *)(const void *)weight->data, input,
+                    output, rows, columns);
+        break;
     }
 }
 
@@ -2045,16 +2321,17 @@ static int allocate_floats(float **pointer, size_t first, size_t second,
     return 0;
 }
 
-static int allocate_workspace(cpu_workspace *workspace, size_t token_count,
-                              size_t score_count, kipp_error *error) {
+static int allocate_workspace(cpu_workspace *workspace,
+                              const kipp_model_config *config,
+                              size_t token_count, size_t score_count,
+                              kipp_error *error) {
     memset(workspace, 0, sizeof(*workspace));
-    if (allocate_floats(&workspace->x, token_count, KIPP_EMBEDDING_LENGTH,
+    if (allocate_floats(&workspace->x, token_count, config->embedding_length,
                         error) != 0 ||
         allocate_floats(&workspace->normalized, token_count,
-                        KIPP_EMBEDDING_LENGTH, error) != 0 ||
+                        config->embedding_length, error) != 0 ||
         allocate_floats(&workspace->query, token_count,
-                        KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-                        error) != 0 ||
+                        config->attention_width, error) != 0 ||
         allocate_floats(&workspace->key, token_count,
                         KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
                         error) != 0 ||
@@ -2062,14 +2339,13 @@ static int allocate_workspace(cpu_workspace *workspace, size_t token_count,
                         KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
                         error) != 0 ||
         allocate_floats(&workspace->attention, token_count,
-                        KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-                        error) != 0 ||
+                        config->attention_width, error) != 0 ||
         allocate_floats(&workspace->projection, token_count,
-                        KIPP_EMBEDDING_LENGTH, error) != 0 ||
+                        config->embedding_length, error) != 0 ||
         allocate_floats(&workspace->gate, token_count,
-                        KIPP_FEED_FORWARD_LENGTH, error) != 0 ||
+                        config->feed_forward_length, error) != 0 ||
         allocate_floats(&workspace->up, token_count,
-                        KIPP_FEED_FORWARD_LENGTH, error) != 0 ||
+                        config->feed_forward_length, error) != 0 ||
         allocate_floats(&workspace->scores, 1, score_count, error) != 0) {
         free_workspace(workspace);
         return -1;
@@ -2100,14 +2376,13 @@ static void normalize_heads(float *states, size_t token_count,
 }
 
 static void apply_rope(float *states, size_t token_count, size_t head_count,
-                       uint32_t start_position) {
+                       uint32_t start_position, float theta) {
     for (size_t token = 0; token < token_count; ++token) {
         for (size_t head = 0; head < head_count; ++head) {
             rope_head(states + (token * head_count + head) *
                                    KIPP_ATTENTION_HEAD_DIM,
                       KIPP_ATTENTION_HEAD_DIM,
-                      start_position + (uint32_t)token,
-                      KIPP_ROPE_THETA);
+                      start_position + (uint32_t)token, theta);
         }
     }
 }
@@ -2119,18 +2394,19 @@ static void round_trip_bf16(float *values, size_t count) {
 }
 
 static void causal_gqa(const float *query, const float *key, const float *value,
-                       float *output, float *scores, size_t token_count) {
+                       float *output, float *scores, size_t token_count,
+                       size_t query_head_count) {
     const float scale = 1.0f / sqrtf((float)KIPP_ATTENTION_HEAD_DIM);
     const size_t queries_per_kv =
-        KIPP_ATTENTION_HEAD_COUNT / KIPP_ATTENTION_HEAD_COUNT_KV;
-    memset(output, 0, token_count * KIPP_ATTENTION_HEAD_COUNT *
+        query_head_count / KIPP_ATTENTION_HEAD_COUNT_KV;
+    memset(output, 0, token_count * query_head_count *
                               KIPP_ATTENTION_HEAD_DIM * sizeof(*output));
     for (size_t token = 0; token < token_count; ++token) {
-        for (size_t query_head = 0; query_head < KIPP_ATTENTION_HEAD_COUNT;
+        for (size_t query_head = 0; query_head < query_head_count;
              ++query_head) {
             size_t kv_head = query_head / queries_per_kv;
             const float *query_values =
-                query + (token * KIPP_ATTENTION_HEAD_COUNT + query_head) *
+                query + (token * query_head_count + query_head) *
                             KIPP_ATTENTION_HEAD_DIM;
             for (size_t source = 0; source <= token; ++source) {
                 const float *key_values =
@@ -2145,7 +2421,7 @@ static void causal_gqa(const float *query, const float *key, const float *value,
             }
             softmax(scores, token + 1);
             float *destination =
-                output + (token * KIPP_ATTENTION_HEAD_COUNT + query_head) *
+                output + (token * query_head_count + query_head) *
                              KIPP_ATTENTION_HEAD_DIM;
             for (size_t source = 0; source <= token; ++source) {
                 const float *value_values =
@@ -2164,124 +2440,101 @@ static void causal_gqa(const float *query, const float *key, const float *value,
 static int cpu_forward(const kipp_model_view *view, const uint32_t *tokens,
                        size_t token_count, float *logits, kipp_error *error) {
     cpu_workspace workspace;
+    const kipp_model_config *config = &view->config;
+    const size_t embed = config->embedding_length;
+    const size_t attention_width = config->attention_width;
+    const size_t feed_forward = config->feed_forward_length;
+    const size_t kv_width =
+        KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
     const uint16_t *embedding =
         tensor_bf16(&view->weights.token_embedding);
-    if (allocate_workspace(&workspace, token_count, token_count, error) != 0) {
+    if (allocate_workspace(&workspace, config, token_count, token_count,
+                           error) != 0) {
         return -1;
     }
     for (size_t token = 0; token < token_count; ++token) {
-        const uint16_t *row =
-            embedding + (size_t)tokens[token] * KIPP_EMBEDDING_LENGTH;
-        for (size_t dimension = 0; dimension < KIPP_EMBEDDING_LENGTH;
-             ++dimension) {
-            workspace.x[token * KIPP_EMBEDDING_LENGTH + dimension] =
+        const uint16_t *row = embedding + (size_t)tokens[token] * embed;
+        for (size_t dimension = 0; dimension < embed; ++dimension) {
+            workspace.x[token * embed + dimension] =
                 bf16_to_float(row[dimension]);
         }
     }
 
-    for (size_t layer_index = 0; layer_index < KIPP_BLOCK_COUNT;
+    for (size_t layer_index = 0; layer_index < config->block_count;
          ++layer_index) {
         const kipp_qwen3_layer_weights *layer =
             &view->weights.layers[layer_index];
         for (size_t token = 0; token < token_count; ++token) {
-            float *x = workspace.x + token * KIPP_EMBEDDING_LENGTH;
-            float *normalized =
-                workspace.normalized + token * KIPP_EMBEDDING_LENGTH;
+            float *x = workspace.x + token * embed;
+            float *normalized = workspace.normalized + token * embed;
             rms_norm(x, tensor_bf16(&layer->attention_norm), normalized,
-                     KIPP_EMBEDDING_LENGTH, KIPP_RMS_EPSILON);
-            matvec_bf16(tensor_bf16(&layer->attention_q), normalized,
-                        workspace.query +
-                            token * KIPP_ATTENTION_HEAD_COUNT *
-                                KIPP_ATTENTION_HEAD_DIM,
-                        KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-                        KIPP_EMBEDDING_LENGTH);
-            matvec_bf16(tensor_bf16(&layer->attention_k), normalized,
-                        workspace.key +
-                            token * KIPP_ATTENTION_HEAD_COUNT_KV *
-                                KIPP_ATTENTION_HEAD_DIM,
-                        KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-                        KIPP_EMBEDDING_LENGTH);
-            matvec_bf16(tensor_bf16(&layer->attention_v), normalized,
-                        workspace.value +
-                            token * KIPP_ATTENTION_HEAD_COUNT_KV *
-                                KIPP_ATTENTION_HEAD_DIM,
-                        KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-                        KIPP_EMBEDDING_LENGTH);
+                     embed, KIPP_RMS_EPSILON);
+            matvec_tensor(&layer->attention_q, normalized,
+                        workspace.query + token * attention_width,
+                        attention_width, embed);
+            matvec_tensor(&layer->attention_k, normalized,
+                        workspace.key + token * kv_width, kv_width, embed);
+            matvec_tensor(&layer->attention_v, normalized,
+                        workspace.value + token * kv_width, kv_width, embed);
         }
         normalize_heads(workspace.query, token_count,
-                        KIPP_ATTENTION_HEAD_COUNT,
+                        config->attention_head_count,
                         tensor_bf16(&layer->attention_q_norm));
         normalize_heads(workspace.key, token_count,
                         KIPP_ATTENTION_HEAD_COUNT_KV,
                         tensor_bf16(&layer->attention_k_norm));
-        apply_rope(workspace.query, token_count, KIPP_ATTENTION_HEAD_COUNT, 0);
-        apply_rope(workspace.key, token_count, KIPP_ATTENTION_HEAD_COUNT_KV, 0);
-        round_trip_bf16(
-            workspace.key,
-            token_count * KIPP_ATTENTION_HEAD_COUNT_KV *
-                KIPP_ATTENTION_HEAD_DIM);
-        round_trip_bf16(
-            workspace.value,
-            token_count * KIPP_ATTENTION_HEAD_COUNT_KV *
-                KIPP_ATTENTION_HEAD_DIM);
+        apply_rope(workspace.query, token_count,
+                   config->attention_head_count, 0, config->rope_theta);
+        apply_rope(workspace.key, token_count, KIPP_ATTENTION_HEAD_COUNT_KV,
+                   0, config->rope_theta);
+        round_trip_bf16(workspace.key, token_count * kv_width);
+        round_trip_bf16(workspace.value, token_count * kv_width);
         causal_gqa(workspace.query, workspace.key, workspace.value,
-                   workspace.attention, workspace.scores, token_count);
+                   workspace.attention, workspace.scores, token_count,
+                   config->attention_head_count);
 
         for (size_t token = 0; token < token_count; ++token) {
-            float *x = workspace.x + token * KIPP_EMBEDDING_LENGTH;
-            matvec_bf16(
-                tensor_bf16(&layer->attention_output),
-                workspace.attention +
-                    token * KIPP_ATTENTION_HEAD_COUNT *
-                        KIPP_ATTENTION_HEAD_DIM,
-                workspace.projection + token * KIPP_EMBEDDING_LENGTH,
-                KIPP_EMBEDDING_LENGTH,
-                KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM);
-            for (size_t dimension = 0; dimension < KIPP_EMBEDDING_LENGTH;
-                 ++dimension) {
+            float *x = workspace.x + token * embed;
+            matvec_tensor(&layer->attention_output,
+                        workspace.attention + token * attention_width,
+                        workspace.projection + token * embed, embed,
+                        attention_width);
+            for (size_t dimension = 0; dimension < embed; ++dimension) {
                 x[dimension] +=
-                    workspace.projection[token * KIPP_EMBEDDING_LENGTH +
-                                         dimension];
+                    workspace.projection[token * embed + dimension];
             }
             rms_norm(x, tensor_bf16(&layer->feed_forward_norm),
-                     workspace.normalized + token * KIPP_EMBEDDING_LENGTH,
-                     KIPP_EMBEDDING_LENGTH, KIPP_RMS_EPSILON);
-            matvec_bf16(
-                tensor_bf16(&layer->feed_forward_gate),
-                workspace.normalized + token * KIPP_EMBEDDING_LENGTH,
-                workspace.gate + token * KIPP_FEED_FORWARD_LENGTH,
-                KIPP_FEED_FORWARD_LENGTH, KIPP_EMBEDDING_LENGTH);
-            matvec_bf16(
-                tensor_bf16(&layer->feed_forward_up),
-                workspace.normalized + token * KIPP_EMBEDDING_LENGTH,
-                workspace.up + token * KIPP_FEED_FORWARD_LENGTH,
-                KIPP_FEED_FORWARD_LENGTH, KIPP_EMBEDDING_LENGTH);
-            for (size_t hidden = 0; hidden < KIPP_FEED_FORWARD_LENGTH;
-                 ++hidden) {
-                size_t index = token * KIPP_FEED_FORWARD_LENGTH + hidden;
+                     workspace.normalized + token * embed, embed,
+                     KIPP_RMS_EPSILON);
+            matvec_tensor(&layer->feed_forward_gate,
+                        workspace.normalized + token * embed,
+                        workspace.gate + token * feed_forward, feed_forward,
+                        embed);
+            matvec_tensor(&layer->feed_forward_up,
+                        workspace.normalized + token * embed,
+                        workspace.up + token * feed_forward, feed_forward,
+                        embed);
+            for (size_t hidden = 0; hidden < feed_forward; ++hidden) {
+                size_t index = token * feed_forward + hidden;
                 workspace.gate[index] =
                     silu(workspace.gate[index]) * workspace.up[index];
             }
-            matvec_bf16(
-                tensor_bf16(&layer->feed_forward_down),
-                workspace.gate + token * KIPP_FEED_FORWARD_LENGTH,
-                workspace.projection + token * KIPP_EMBEDDING_LENGTH,
-                KIPP_EMBEDDING_LENGTH, KIPP_FEED_FORWARD_LENGTH);
-            for (size_t dimension = 0; dimension < KIPP_EMBEDDING_LENGTH;
-                 ++dimension) {
+            matvec_tensor(&layer->feed_forward_down,
+                        workspace.gate + token * feed_forward,
+                        workspace.projection + token * embed, embed,
+                        feed_forward);
+            for (size_t dimension = 0; dimension < embed; ++dimension) {
                 x[dimension] +=
-                    workspace.projection[token * KIPP_EMBEDDING_LENGTH +
-                                         dimension];
+                    workspace.projection[token * embed + dimension];
             }
         }
     }
 
-    float *last =
-        workspace.x + (token_count - 1) * KIPP_EMBEDDING_LENGTH;
+    float *last = workspace.x + (token_count - 1) * embed;
     rms_norm(last, tensor_bf16(&view->weights.output_norm),
-             workspace.normalized, KIPP_EMBEDDING_LENGTH, KIPP_RMS_EPSILON);
-    matvec_bf16(embedding, workspace.normalized, logits, KIPP_VOCAB_SIZE,
-                KIPP_EMBEDDING_LENGTH);
+             workspace.normalized, embed, KIPP_RMS_EPSILON);
+    matvec_bf16(tensor_bf16(&view->weights.lm_head), workspace.normalized,
+                logits, KIPP_VOCAB_SIZE, embed);
     free_workspace(&workspace);
     return 0;
 }
@@ -2290,17 +2543,32 @@ typedef struct {
     const kipp_model_view *view;
 } cpu_backend_model;
 
+/*
+ * The KV store is paged: physical storage is a run of fixed-size blocks
+ * (KIPP_KV_BLOCK_TOKENS positions each) and `block_table` maps a logical
+ * block index (position >> 5) to the physical block that holds it. With the
+ * identity table this is byte-for-byte the old contiguous layout; a
+ * non-identity table (e.g. shared prefix blocks, or the scramble the paged
+ * gate uses) relocates positions without changing any computed value. The
+ * per-layer stride is `slab_positions` (capacity rounded up to a whole
+ * number of blocks) so physical block ids address cleanly.
+ */
 typedef struct {
     uint32_t capacity;
     uint32_t length;
+    uint32_t block_count;    /* transformer layers */
+    uint32_t block_capacity; /* physical blocks allocated */
+    uint32_t slab_positions; /* block_capacity * KIPP_KV_BLOCK_TOKENS */
+    uint32_t *block_table;    /* logical block -> physical block */
     size_t slab_elements;
     uint16_t *key_cache;
     uint16_t *value_cache;
     cpu_workspace workspace;
 } cpu_backend_session;
 
-static uint64_t kv_cache_bytes_for_capacity(uint32_t capacity) {
-    return (uint64_t)capacity * KIPP_BLOCK_COUNT *
+static uint64_t kv_cache_bytes_for_capacity(uint32_t block_count,
+                                            uint32_t capacity) {
+    return (uint64_t)capacity * block_count *
            KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM *
            sizeof(uint16_t) * 2u;
 }
@@ -2318,19 +2586,23 @@ static size_t kv_cache_offset_for_capacity(uint32_t capacity, uint32_t layer,
 static size_t kv_cache_offset(const cpu_backend_session *session,
                               uint32_t layer, uint32_t position,
                               uint32_t head, uint32_t dimension) {
-    return kv_cache_offset_for_capacity(session->capacity, layer, position,
-                                        head, dimension);
+    uint32_t logical_block = position / KIPP_KV_BLOCK_TOKENS;
+    uint32_t slot = position % KIPP_KV_BLOCK_TOKENS;
+    uint32_t physical = session->block_table[logical_block];
+    uint32_t physical_position = physical * KIPP_KV_BLOCK_TOKENS + slot;
+    return kv_cache_offset_for_capacity(session->slab_positions, layer,
+                                        physical_position, head, dimension);
 }
 
 static void cached_gqa(const cpu_backend_session *session, uint32_t layer,
                        uint32_t position, const float *query, float *output,
-                       float *scores) {
+                       float *scores, uint32_t query_head_count) {
     const float scale = 1.0f / sqrtf((float)KIPP_ATTENTION_HEAD_DIM);
     const uint32_t queries_per_kv =
-        KIPP_ATTENTION_HEAD_COUNT / KIPP_ATTENTION_HEAD_COUNT_KV;
-    memset(output, 0, KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM *
+        query_head_count / KIPP_ATTENTION_HEAD_COUNT_KV;
+    memset(output, 0, (size_t)query_head_count * KIPP_ATTENTION_HEAD_DIM *
                           sizeof(*output));
-    for (uint32_t query_head = 0; query_head < KIPP_ATTENTION_HEAD_COUNT;
+    for (uint32_t query_head = 0; query_head < query_head_count;
          ++query_head) {
         uint32_t kv_head = query_head / queries_per_kv;
         const float *query_values =
@@ -2368,43 +2640,43 @@ static int cpu_cached_token(const kipp_model_view *view,
                             uint32_t position, float *logits,
                             kipp_error *error) {
     cpu_workspace *workspace = &session->workspace;
+    const kipp_model_config *config = &view->config;
+    const size_t embed = config->embedding_length;
+    const size_t attention_width = config->attention_width;
+    const size_t feed_forward = config->feed_forward_length;
+    const size_t kv_width =
+        KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
     const uint16_t *embedding =
         tensor_bf16(&view->weights.token_embedding);
-    const uint16_t *embedding_row =
-        embedding + (size_t)token * KIPP_EMBEDDING_LENGTH;
+    const uint16_t *embedding_row = embedding + (size_t)token * embed;
     (void)error;
 
-    for (size_t dimension = 0; dimension < KIPP_EMBEDDING_LENGTH;
-         ++dimension) {
+    for (size_t dimension = 0; dimension < embed; ++dimension) {
         workspace->x[dimension] = bf16_to_float(embedding_row[dimension]);
     }
 
-    for (uint32_t layer_index = 0; layer_index < KIPP_BLOCK_COUNT;
+    for (uint32_t layer_index = 0; layer_index < config->block_count;
          ++layer_index) {
         const kipp_qwen3_layer_weights *layer =
             &view->weights.layers[layer_index];
         rms_norm(workspace->x, tensor_bf16(&layer->attention_norm),
-                 workspace->normalized, KIPP_EMBEDDING_LENGTH,
-                 KIPP_RMS_EPSILON);
-        matvec_bf16(tensor_bf16(&layer->attention_q),
+                 workspace->normalized, embed, KIPP_RMS_EPSILON);
+        matvec_tensor(&layer->attention_q,
                     workspace->normalized, workspace->query,
-                    KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-                    KIPP_EMBEDDING_LENGTH);
-        matvec_bf16(tensor_bf16(&layer->attention_k),
-                    workspace->normalized, workspace->key,
-                    KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-                    KIPP_EMBEDDING_LENGTH);
-        matvec_bf16(tensor_bf16(&layer->attention_v),
-                    workspace->normalized, workspace->value,
-                    KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-                    KIPP_EMBEDDING_LENGTH);
+                    attention_width, embed);
+        matvec_tensor(&layer->attention_k,
+                    workspace->normalized, workspace->key, kv_width, embed);
+        matvec_tensor(&layer->attention_v,
+                    workspace->normalized, workspace->value, kv_width, embed);
 
-        normalize_heads(workspace->query, 1, KIPP_ATTENTION_HEAD_COUNT,
+        normalize_heads(workspace->query, 1, config->attention_head_count,
                         tensor_bf16(&layer->attention_q_norm));
         normalize_heads(workspace->key, 1, KIPP_ATTENTION_HEAD_COUNT_KV,
                         tensor_bf16(&layer->attention_k_norm));
-        apply_rope(workspace->query, 1, KIPP_ATTENTION_HEAD_COUNT, position);
-        apply_rope(workspace->key, 1, KIPP_ATTENTION_HEAD_COUNT_KV, position);
+        apply_rope(workspace->query, 1, config->attention_head_count,
+                   position, config->rope_theta);
+        apply_rope(workspace->key, 1, KIPP_ATTENTION_HEAD_COUNT_KV, position,
+                   config->rope_theta);
 
         for (uint32_t head = 0; head < KIPP_ATTENTION_HEAD_COUNT_KV; ++head) {
             size_t cache_base =
@@ -2419,44 +2691,39 @@ static int cpu_cached_token(const kipp_model_view *view,
             }
         }
         cached_gqa(session, layer_index, position, workspace->query,
-                   workspace->attention, workspace->scores);
+                   workspace->attention, workspace->scores,
+                   config->attention_head_count);
 
-        matvec_bf16(
-            tensor_bf16(&layer->attention_output), workspace->attention,
-            workspace->projection, KIPP_EMBEDDING_LENGTH,
-            KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM);
-        for (size_t dimension = 0; dimension < KIPP_EMBEDDING_LENGTH;
-             ++dimension) {
+        matvec_tensor(&layer->attention_output,
+                    workspace->attention, workspace->projection, embed,
+                    attention_width);
+        for (size_t dimension = 0; dimension < embed; ++dimension) {
             workspace->x[dimension] += workspace->projection[dimension];
         }
         rms_norm(workspace->x, tensor_bf16(&layer->feed_forward_norm),
-                 workspace->normalized, KIPP_EMBEDDING_LENGTH,
-                 KIPP_RMS_EPSILON);
-        matvec_bf16(tensor_bf16(&layer->feed_forward_gate),
-                    workspace->normalized, workspace->gate,
-                    KIPP_FEED_FORWARD_LENGTH, KIPP_EMBEDDING_LENGTH);
-        matvec_bf16(tensor_bf16(&layer->feed_forward_up),
-                    workspace->normalized, workspace->up,
-                    KIPP_FEED_FORWARD_LENGTH, KIPP_EMBEDDING_LENGTH);
-        for (size_t hidden = 0; hidden < KIPP_FEED_FORWARD_LENGTH; ++hidden) {
+                 workspace->normalized, embed, KIPP_RMS_EPSILON);
+        matvec_tensor(&layer->feed_forward_gate,
+                    workspace->normalized, workspace->gate, feed_forward,
+                    embed);
+        matvec_tensor(&layer->feed_forward_up,
+                    workspace->normalized, workspace->up, feed_forward,
+                    embed);
+        for (size_t hidden = 0; hidden < feed_forward; ++hidden) {
             workspace->gate[hidden] =
                 silu(workspace->gate[hidden]) * workspace->up[hidden];
         }
-        matvec_bf16(tensor_bf16(&layer->feed_forward_down), workspace->gate,
-                    workspace->projection, KIPP_EMBEDDING_LENGTH,
-                    KIPP_FEED_FORWARD_LENGTH);
-        for (size_t dimension = 0; dimension < KIPP_EMBEDDING_LENGTH;
-             ++dimension) {
+        matvec_tensor(&layer->feed_forward_down, workspace->gate,
+                    workspace->projection, embed, feed_forward);
+        for (size_t dimension = 0; dimension < embed; ++dimension) {
             workspace->x[dimension] += workspace->projection[dimension];
         }
     }
 
     if (logits != NULL) {
         rms_norm(workspace->x, tensor_bf16(&view->weights.output_norm),
-                 workspace->normalized, KIPP_EMBEDDING_LENGTH,
-                 KIPP_RMS_EPSILON);
-        matvec_bf16(embedding, workspace->normalized, logits, KIPP_VOCAB_SIZE,
-                    KIPP_EMBEDDING_LENGTH);
+                 workspace->normalized, embed, KIPP_RMS_EPSILON);
+        matvec_bf16(tensor_bf16(&view->weights.lm_head),
+                    workspace->normalized, logits, KIPP_VOCAB_SIZE, embed);
     }
     return 0;
 }
@@ -2492,13 +2759,21 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "CPU backend session arguments are required");
     }
+    const kipp_model_config *config =
+        &((cpu_backend_model *)backend_model)->view->config;
     *backend_session = NULL;
-    if (capacity == 0 || capacity > KIPP_CONTEXT_LENGTH) {
+    if (capacity == 0 || capacity > config->context_length) {
         return fail(error, KIPP_ERROR_RANGE,
                     "session capacity must be between 1 and %u",
-                    KIPP_CONTEXT_LENGTH);
+                    config->context_length);
     }
-    if (!checked_multiply_size(KIPP_BLOCK_COUNT, capacity, &elements) ||
+    /* Round the physical store up to whole blocks so paged addressing is
+     * always in bounds; the reported logical cache size is unchanged. */
+    uint32_t block_capacity =
+        (capacity + KIPP_KV_BLOCK_TOKENS - 1) / KIPP_KV_BLOCK_TOKENS;
+    size_t slab_positions = (size_t)block_capacity * KIPP_KV_BLOCK_TOKENS;
+    if (!checked_multiply_size(config->block_count, slab_positions,
+                               &elements) ||
         !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_COUNT_KV,
                                &elements) ||
         !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_DIM, &elements) ||
@@ -2511,11 +2786,19 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
                     "unable to allocate CPU session");
     }
     session->capacity = capacity;
+    session->block_count = config->block_count;
+    session->block_capacity = block_capacity;
+    session->slab_positions = (uint32_t)slab_positions;
     session->slab_elements = elements;
+    session->block_table = malloc((size_t)block_capacity *
+                                  sizeof(*session->block_table));
     session->key_cache = malloc(bytes);
     session->value_cache = malloc(bytes);
-    if (session->key_cache == NULL || session->value_cache == NULL ||
-        allocate_workspace(&session->workspace, 1, capacity, error) != 0) {
+    if (session->block_table == NULL || session->key_cache == NULL ||
+        session->value_cache == NULL ||
+        allocate_workspace(&session->workspace, config, 1, capacity,
+                           error) != 0) {
+        free(session->block_table);
         free(session->key_cache);
         free(session->value_cache);
         free_workspace(&session->workspace);
@@ -2526,6 +2809,10 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
         }
         return -1;
     }
+    /* Identity mapping: logical block i lives in physical block i. */
+    for (uint32_t block = 0; block < block_capacity; ++block) {
+        session->block_table[block] = block;
+    }
     *backend_session = session;
     return 0;
 }
@@ -2535,6 +2822,7 @@ static void cpu_backend_session_destroy(void *backend_session) {
     if (session == NULL) {
         return;
     }
+    free(session->block_table);
     free(session->key_cache);
     free(session->value_cache);
     free_workspace(&session->workspace);
@@ -2581,10 +2869,20 @@ static int cpu_backend_eval(void *backend_model, kipp_eval_item *items,
             return fail(error, KIPP_ERROR_ARGUMENT,
                         "CPU evaluation item is incomplete");
         }
+        uint32_t rows = item->logits_count == 0 ? 1 : item->logits_count;
+        if (rows > item->token_count) {
+            return fail(error, KIPP_ERROR_RANGE,
+                        "logits_count %u exceeds token_count %u", rows,
+                        item->token_count);
+        }
         if (item->session == NULL) {
             if (item->start_position != 0) {
                 return fail(error, KIPP_ERROR_ARGUMENT,
                             "stateless evaluation must start at position zero");
+            }
+            if (rows != 1) {
+                return fail(error, KIPP_ERROR_UNSUPPORTED,
+                            "stateless evaluation writes only the final logits");
             }
             if (cpu_forward(state->view, item->tokens, item->token_count,
                             item->logits, error) != 0) {
@@ -2604,10 +2902,16 @@ static int cpu_backend_eval(void *backend_model, kipp_eval_item *items,
                         "CPU session append exceeds capacity %u",
                         session->capacity);
         }
+        /* Logits are written for the last `rows` tokens, row-major. */
+        uint32_t first_logit_token = item->token_count - rows;
         for (uint32_t token_index = 0; token_index < item->token_count;
              ++token_index) {
             float *token_logits =
-                token_index + 1 == item->token_count ? item->logits : NULL;
+                token_index >= first_logit_token
+                    ? item->logits +
+                          (size_t)(token_index - first_logit_token) *
+                              KIPP_VOCAB_SIZE
+                    : NULL;
             if (cpu_cached_token(state->view, session,
                                  item->tokens[token_index],
                                  item->start_position + token_index,
@@ -2663,29 +2967,99 @@ static double uniform_unit(uint64_t *state) {
     return (double)(xorshift64_star(state) >> 11) / 9007199254740992.0;
 }
 
-int kipp_sample(const float *logits, size_t logits_count, float temperature,
-                float top_p, uint64_t *rng_state, uint32_t *out_token,
-                kipp_error *error) {
-    clear_error(error);
-    if (logits == NULL || logits_count == 0 || out_token == NULL) {
-        return fail(error, KIPP_ERROR_ARGUMENT,
-                    "logits and an output token are required");
+/*
+ * Apply logit_bias and the recent-token penalties in place on a working
+ * copy of the logits. Penalties look back over params->recent_tokens.
+ */
+static void apply_bias_and_penalties(float *logits, size_t logits_count,
+                                     const kipp_sample_params *params) {
+    for (size_t index = 0; index < params->logit_bias_count; ++index) {
+        uint32_t token = params->logit_bias_tokens[index];
+        if (token < logits_count) {
+            logits[token] += params->logit_bias_values[index];
+        }
     }
+    bool has_penalty = params->frequency_penalty != 0.0f ||
+                       params->presence_penalty != 0.0f ||
+                       (params->repetition_penalty != 0.0f &&
+                        params->repetition_penalty != 1.0f);
+    if (!has_penalty || params->recent_count == 0) {
+        return;
+    }
+    /* Count occurrences of each recent token once, then adjust its logit. */
+    for (size_t position = 0; position < params->recent_count; ++position) {
+        uint32_t token = params->recent_tokens[position];
+        if (token >= logits_count) {
+            continue;
+        }
+        /* Skip tokens already handled earlier in the window. */
+        bool seen = false;
+        for (size_t earlier = 0; earlier < position; ++earlier) {
+            if (params->recent_tokens[earlier] == token) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        uint32_t count = 0;
+        for (size_t other = 0; other < params->recent_count; ++other) {
+            count += params->recent_tokens[other] == token;
+        }
+        if (params->repetition_penalty != 0.0f &&
+            params->repetition_penalty != 1.0f) {
+            logits[token] = logits[token] > 0.0f
+                                ? logits[token] / params->repetition_penalty
+                                : logits[token] * params->repetition_penalty;
+        }
+        logits[token] -= params->presence_penalty;
+        logits[token] -= params->frequency_penalty * (float)count;
+    }
+}
+
+int kipp_sample_ex(const float *logits, size_t logits_count,
+                   const kipp_sample_params *params, uint64_t *rng_state,
+                   uint32_t *out_token, kipp_error *error) {
+    clear_error(error);
+    if (logits == NULL || logits_count == 0 || params == NULL ||
+        out_token == NULL) {
+        return fail(error, KIPP_ERROR_ARGUMENT,
+                    "logits, params, and an output token are required");
+    }
+
+    /* Bias and penalties can reorder logits, so work on a copy. */
+    float *working = malloc(logits_count * sizeof(*working));
+    if (working == NULL) {
+        return fail(error, KIPP_ERROR_MEMORY,
+                    "unable to allocate sampling logits");
+    }
+    memcpy(working, logits, logits_count * sizeof(*working));
+    apply_bias_and_penalties(working, logits_count, params);
+
     size_t argmax = 0;
     for (size_t index = 1; index < logits_count; ++index) {
-        if (logits[index] > logits[argmax]) {
+        if (working[index] > working[argmax]) {
             argmax = index;
         }
     }
-    if (temperature <= 0.0f) {
+    if (params->temperature <= 0.0f) {
         *out_token = (uint32_t)argmax;
+        free(working);
         return 0;
     }
-    if (!(top_p > 0.0f && top_p <= 1.0f)) {
+    if (!(params->top_p > 0.0f && params->top_p <= 1.0f)) {
+        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "top_p must be greater than 0 and at most 1");
     }
+    if (params->min_p < 0.0f || params->min_p > 1.0f) {
+        free(working);
+        return fail(error, KIPP_ERROR_ARGUMENT,
+                    "min_p must be between 0 and 1");
+    }
     if (rng_state == NULL || *rng_state == 0) {
+        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "sampling requires a nonzero RNG state");
     }
@@ -2695,26 +3069,33 @@ int kipp_sample(const float *logits, size_t logits_count, float temperature,
      * exp(-20) each, which is negligible even across the whole vocabulary;
      * skipping them keeps the sort small during ordinary decoding.
      */
-    float inverse_temperature = 1.0f / temperature;
-    float scaled_maximum = logits[argmax] * inverse_temperature;
+    float inverse_temperature = 1.0f / params->temperature;
+    float scaled_maximum = working[argmax] * inverse_temperature;
     float cutoff = scaled_maximum - 20.0f;
     sample_candidate *candidates =
         malloc(logits_count * sizeof(*candidates));
     if (candidates == NULL) {
+        free(working);
         return fail(error, KIPP_ERROR_MEMORY,
                     "unable to allocate sampling candidates");
     }
     size_t candidate_count = 0;
     for (size_t index = 0; index < logits_count; ++index) {
-        float scaled = logits[index] * inverse_temperature;
+        float scaled = working[index] * inverse_temperature;
         if (scaled >= cutoff) {
             candidates[candidate_count].token = (uint32_t)index;
             candidates[candidate_count].logit = scaled;
             ++candidate_count;
         }
     }
+    free(working);
     qsort(candidates, candidate_count, sizeof(*candidates),
           compare_sample_candidates);
+
+    /* top_k caps the candidate set to the k highest. */
+    if (params->top_k != 0 && params->top_k < candidate_count) {
+        candidate_count = params->top_k;
+    }
 
     double total = 0.0;
     for (size_t index = 0; index < candidate_count; ++index) {
@@ -2722,12 +3103,34 @@ int kipp_sample(const float *logits, size_t logits_count, float temperature,
             expf(candidates[index].logit - scaled_maximum);
         total += candidates[index].logit;
     }
-    double target = (double)top_p * total;
+
+    /* min_p drops the low tail relative to the top probability. */
+    if (params->min_p > 0.0f && candidate_count > 0) {
+        double threshold = (double)params->min_p * candidates[0].logit;
+        size_t kept_min_p = candidate_count;
+        for (size_t index = 1; index < candidate_count; ++index) {
+            if (candidates[index].logit < threshold) {
+                kept_min_p = index;
+                break;
+            }
+        }
+        candidate_count = kept_min_p;
+        total = 0.0;
+        for (size_t index = 0; index < candidate_count; ++index) {
+            total += candidates[index].logit;
+        }
+    }
+
+    double target = (double)params->top_p * total;
     double kept = 0.0;
     size_t nucleus_count = 0;
     while (nucleus_count < candidate_count && kept < target) {
         kept += candidates[nucleus_count].logit;
         ++nucleus_count;
+    }
+    if (nucleus_count == 0) {
+        nucleus_count = 1;
+        kept = candidates[0].logit;
     }
 
     double draw = uniform_unit(rng_state) * kept;
@@ -2743,6 +3146,17 @@ int kipp_sample(const float *logits, size_t logits_count, float temperature,
     free(candidates);
     *out_token = token;
     return 0;
+}
+
+int kipp_sample(const float *logits, size_t logits_count, float temperature,
+                float top_p, uint64_t *rng_state, uint32_t *out_token,
+                kipp_error *error) {
+    kipp_sample_params params = {0};
+    params.temperature = temperature;
+    params.top_p = top_p;
+    params.repetition_penalty = 1.0f;
+    return kipp_sample_ex(logits, logits_count, &params, rng_state, out_token,
+                          error);
 }
 
 int kipp_model_eval(const kipp_model *model, const uint32_t *tokens,
@@ -2769,11 +3183,7 @@ int kipp_model_eval(const kipp_model *model, const uint32_t *tokens,
         }
     }
     kipp_eval_item item = {
-        NULL,
-        tokens,
-        (uint32_t)token_count,
-        0,
-        logits,
+        NULL, tokens, (uint32_t)token_count, 0, logits, 1,
     };
     return model->backend_ops->eval(model->backend_model, &item, 1, error);
 }
@@ -2787,10 +3197,10 @@ int kipp_session_create(kipp_model *model, uint32_t capacity,
                     "model and session output are required");
     }
     *out_session = NULL;
-    if (capacity == 0 || capacity > KIPP_CONTEXT_LENGTH) {
+    if (capacity == 0 || capacity > model->view.config.context_length) {
         return fail(error, KIPP_ERROR_RANGE,
                     "session capacity must be between 1 and %u",
-                    KIPP_CONTEXT_LENGTH);
+                    model->view.config.context_length);
     }
     if (model->active_session_count == SIZE_MAX) {
         return fail(error, KIPP_ERROR_RANGE, "active session count overflows");
@@ -2807,7 +3217,8 @@ int kipp_session_create(kipp_model *model, uint32_t capacity,
     }
     session->model = model;
     session->capacity = capacity;
-    session->cache_bytes = kv_cache_bytes_for_capacity(capacity);
+    session->cache_bytes = kv_cache_bytes_for_capacity(
+        model->view.config.block_count, capacity);
     ++model->active_session_count;
     *out_session = session;
     return 0;
@@ -2902,11 +3313,47 @@ int kipp_session_eval(kipp_session *session, const uint32_t *tokens,
         }
     }
     kipp_eval_item item = {
-        session->backend_session,
-        tokens,
-        (uint32_t)token_count,
-        session->length,
-        logits,
+        session->backend_session, tokens, (uint32_t)token_count,
+        session->length,         logits, 1,
+    };
+    if (session->model->backend_ops->eval(session->model->backend_model,
+                                          &item, 1, error) != 0) {
+        return -1;
+    }
+    session->length += (uint32_t)token_count;
+    return 0;
+}
+
+int kipp_session_eval_n(kipp_session *session, const uint32_t *tokens,
+                        size_t token_count, float *logits, uint32_t rows,
+                        kipp_error *error) {
+    clear_error(error);
+    if (session == NULL || tokens == NULL || logits == NULL) {
+        return fail(error, KIPP_ERROR_ARGUMENT,
+                    "session, tokens, and logits are required");
+    }
+    if (token_count == 0 || token_count > UINT32_MAX) {
+        return fail(error, KIPP_ERROR_RANGE,
+                    "session evaluation requires at least one token");
+    }
+    if (rows == 0 || rows > token_count) {
+        return fail(error, KIPP_ERROR_RANGE,
+                    "rows must be between 1 and the token count");
+    }
+    if (token_count > session->capacity - session->length) {
+        return fail(error, KIPP_ERROR_RANGE,
+                    "append of %zu token(s) exceeds session capacity %u",
+                    token_count, session->capacity);
+    }
+    for (size_t index = 0; index < token_count; ++index) {
+        if (tokens[index] >= KIPP_VOCAB_SIZE) {
+            return fail(error, KIPP_ERROR_RANGE, "token %zu is out of range",
+                        index);
+        }
+    }
+    kipp_eval_item item = {
+        session->backend_session, tokens, (uint32_t)token_count,
+        session->length,          logits, rows,
     };
     if (session->model->backend_ops->eval(session->model->backend_model,
                                           &item, 1, error) != 0) {
@@ -2968,6 +3415,7 @@ int kipp_eval_batch(kipp_model *model, kipp_batch_item *items,
             (uint32_t)item->token_count,
             session->length,
             item->logits,
+            1,
         };
     }
     if (model->backend_ops->eval(model->backend_model, backend_items,
@@ -2989,6 +3437,20 @@ uint16_t kipp_test_float_to_bf16(float value) {
     return float_to_bf16(value);
 }
 
+float kipp_test_fp16_to_float(uint16_t value) {
+    return fp16_to_float(value);
+}
+
+void kipp_test_matvec_q8_0(const uint8_t *weight, const float *input,
+                           float *output, size_t rows, size_t columns) {
+    matvec_q8_0(weight, input, output, rows, columns);
+}
+
+void kipp_test_matvec_affine4_gs32(const uint8_t *weight, const float *input,
+                                   float *output, size_t rows, size_t columns) {
+    matvec_affine4_gs32(weight, input, output, rows, columns);
+}
+
 int kipp_test_checked_add_size(size_t left, size_t right, size_t *result) {
     return checked_add_size(left, right, result) ? 0 : -1;
 }
@@ -2997,8 +3459,8 @@ int kipp_test_checked_multiply_size(size_t left, size_t right, size_t *result) {
     return checked_multiply_size(left, right, result) ? 0 : -1;
 }
 
-uint64_t kipp_test_kv_cache_bytes(uint32_t capacity) {
-    return kv_cache_bytes_for_capacity(capacity);
+uint64_t kipp_test_kv_cache_bytes(uint32_t block_count, uint32_t capacity) {
+    return kv_cache_bytes_for_capacity(block_count, capacity);
 }
 
 size_t kipp_test_kv_cache_offset(uint32_t capacity, uint32_t layer,
@@ -3006,6 +3468,35 @@ size_t kipp_test_kv_cache_offset(uint32_t capacity, uint32_t layer,
                                  uint32_t dimension) {
     return kv_cache_offset_for_capacity(capacity, layer, position, head,
                                         dimension);
+}
+
+int kipp_test_scramble_session_kv(kipp_session *session) {
+    if (session == NULL || session->backend_session == NULL ||
+        session->model == NULL) {
+        return -1;
+    }
+    /* Reverse the block table so every logical block resolves to a different
+     * physical block; a correct paged read/write path yields identical
+     * results regardless of physical placement. Must precede any eval. */
+    if (session->model->backend_ops == cpu_backend_operations()) {
+        cpu_backend_session *cpu = session->backend_session;
+        uint32_t low = 0;
+        uint32_t high = cpu->block_capacity;
+        while (low + 1 < high) {
+            --high;
+            uint32_t swap = cpu->block_table[low];
+            cpu->block_table[low] = cpu->block_table[high];
+            cpu->block_table[high] = swap;
+            ++low;
+        }
+        return 0;
+    }
+#ifdef KIPP_ENABLE_METAL
+    if (session->model->backend_ops == kipp_metal_backend_operations()) {
+        return kipp_metal_test_scramble_session(session->backend_session);
+    }
+#endif
+    return -1;
 }
 
 void kipp_test_rms_norm(const float *input, const uint16_t *weight,
@@ -3033,8 +3524,9 @@ float kipp_test_silu(float value) {
 
 void kipp_test_causal_gqa(const float *query, const float *key,
                           const float *value, float *output, float *scores,
-                          size_t token_count) {
-    causal_gqa(query, key, value, output, scores, token_count);
+                          size_t token_count, size_t query_head_count) {
+    causal_gqa(query, key, value, output, scores, token_count,
+               query_head_count);
 }
 
 int kipp_test_pretokenize(const char *text, size_t **offsets,

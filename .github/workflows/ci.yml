@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux CPU and tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Unit and generated-file checks
+        run: make test
+      - name: Sanitizers
+        run: make test-sanitize
+      - name: CPU binaries
+        run: make cpu server
+      - name: Whitespace
+        run: git diff --check
+
+  macos:
+    name: macOS compile
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: CPU and Metal binaries
+        run: make cpu server metal server-metal
