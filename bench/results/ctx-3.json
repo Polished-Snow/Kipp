@@ -1,0 +1,72 @@
+{
+  "configuration": {
+    "batch_size": 1,
+    "concurrency": 1,
+    "decode_tokens": 32,
+    "measured_runs": 3,
+    "prompt": "word word word",
+    "sampling": "greedy",
+    "warmup_runs": 1
+  },
+  "decode_tokens_per_second": {
+    "maximum": 22.040874802320904,
+    "median": 21.848491634758766,
+    "median_absolute_deviation": 0.12776184538875412,
+    "minimum": 21.72072978937001
+  },
+  "engine": {
+    "backend": "metal",
+    "binary": "/Users/david/Desktop/kipp/build/kipp-metal",
+    "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
+    "commit": "7d127224d583be6862e1163693beff19045a293c",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "dirty": true
+  },
+  "hardware": {
+    "gpu_cores": 10,
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "processor": "Apple M5",
+    "unified_memory_bytes": 25769803776
+  },
+  "model": {
+    "artifact_bytes": 4642894144,
+    "format": "BF16 Kipp GGUF-v3",
+    "repository": "Qwen/Qwen3-4B-Base",
+    "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539"
+  },
+  "peak_resident_bytes": {
+    "maximum": 41254912.0,
+    "median": 41238528.0,
+    "median_absolute_deviation": 16384.0,
+    "minimum": 41123840.0
+  },
+  "prefill_tokens_per_second": {
+    "maximum": 21.708769619300543,
+    "median": 21.662683139933712,
+    "median_absolute_deviation": 0.04608647936683141,
+    "minimum": 21.432245527804767
+  },
+  "runs": [
+    {
+      "decode_seconds": 1.473247,
+      "decode_tokens_per_second": 21.72072978937001,
+      "peak_resident_bytes": 41254912,
+      "prefill_seconds": 0.139976,
+      "prefill_tokens_per_second": 21.432245527804767
+    },
+    {
+      "decode_seconds": 1.451848,
+      "decode_tokens_per_second": 22.040874802320904,
+      "peak_resident_bytes": 41238528,
+      "prefill_seconds": 0.138487,
+      "prefill_tokens_per_second": 21.662683139933712
+    },
+    {
+      "decode_seconds": 1.464632,
+      "decode_tokens_per_second": 21.848491634758766,
+      "peak_resident_bytes": 41123840,
+      "prefill_seconds": 0.138193,
+      "prefill_tokens_per_second": 21.708769619300543
+    }
+  ]
+}

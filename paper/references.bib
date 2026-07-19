@@ -1,0 +1,139 @@
+% ============================================================
+% Kipp — references.bib  (verified titles/authors/IDs; see paper notes)
+% ============================================================
+
+% ---------- Paged attention & KV cache management ----------
+@inproceedings{kwon2023pagedattention,
+  title     = {Efficient Memory Management for Large Language Model Serving with {PagedAttention}},
+  author    = {Kwon, Woosuk and Li, Zhuohan and Zhuang, Siyuan and Sheng, Ying and Zheng, Lianmin and Yu, Cody Hao and Gonzalez, Joseph E. and Zhang, Hao and Stoica, Ion},
+  booktitle = {Proceedings of the 29th Symposium on Operating Systems Principles (SOSP)},
+  year      = {2023},
+  url       = {https://arxiv.org/abs/2309.06180}
+}
+
+@inproceedings{zheng2024sglang,
+  title     = {{SGLang}: Efficient Execution of Structured Language Model Programs},
+  author    = {Zheng, Lianmin and Yin, Liangsheng and Xie, Zhiqiang and Sun, Chuyue and Huang, Jeff and Yu, Cody Hao and Cao, Shiyi and Kozyrakis, Christos and Stoica, Ion and Gonzalez, Joseph E. and Barrett, Clark and Sheng, Ying},
+  booktitle = {Advances in Neural Information Processing Systems 37 (NeurIPS)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2312.07104}
+}
+
+% ---------- FlashAttention family ----------
+@inproceedings{dao2022flashattention,
+  title     = {{FlashAttention}: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+  author    = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  booktitle = {Advances in Neural Information Processing Systems 35 (NeurIPS)},
+  year      = {2022},
+  url       = {https://arxiv.org/abs/2205.14135}
+}
+
+@inproceedings{dao2024flashattention2,
+  title     = {{FlashAttention-2}: Faster Attention with Better Parallelism and Work Partitioning},
+  author    = {Dao, Tri},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2307.08691}
+}
+
+@inproceedings{shah2024flashattention3,
+  title     = {{FlashAttention-3}: Fast and Accurate Attention with Asynchrony and Low-precision},
+  author    = {Shah, Jay and Bikshandi, Ganesh and Zhang, Ying and Thakkar, Vijay and Ramani, Pradeep and Dao, Tri},
+  booktitle = {Advances in Neural Information Processing Systems 37 (NeurIPS)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2407.08608}
+}
+
+% ---------- Speculative decoding ----------
+@inproceedings{leviathan2023speculative,
+  title     = {Fast Inference from Transformers via Speculative Decoding},
+  author    = {Leviathan, Yaniv and Kalman, Matan and Matias, Yossi},
+  booktitle = {Proceedings of the 40th International Conference on Machine Learning (ICML)},
+  year      = {2023},
+  url       = {https://arxiv.org/abs/2211.17192}
+}
+
+@article{chen2023speculativesampling,
+  title   = {Accelerating Large Language Model Decoding with Speculative Sampling},
+  author  = {Chen, Charlie and Borgeaud, Sebastian and Irving, Geoffrey and Lespiau, Jean-Baptiste and Sifre, Laurent and Jumper, John},
+  journal = {arXiv preprint arXiv:2302.01318},
+  year    = {2023},
+  url     = {https://arxiv.org/abs/2302.01318}
+}
+
+@inproceedings{cai2024medusa,
+  title     = {{Medusa}: Simple {LLM} Inference Acceleration Framework with Multiple Decoding Heads},
+  author    = {Cai, Tianle and Li, Yuhong and Geng, Zhengyang and Peng, Hongwu and Lee, Jason D. and Chen, Deming and Dao, Tri},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning (ICML)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2401.10774}
+}
+
+@inproceedings{li2024eagle,
+  title     = {{EAGLE}: Speculative Sampling Requires Rethinking Feature Uncertainty},
+  author    = {Li, Yuhui and Wei, Fangyun and Zhang, Chao and Zhang, Hongyang},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning (ICML)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2401.15077}
+}
+
+@inproceedings{li2024eagle2,
+  title     = {{EAGLE-2}: Faster Inference of Language Models with Dynamic Draft Trees},
+  author    = {Li, Yuhui and Wei, Fangyun and Zhang, Chao and Zhang, Hongyang},
+  booktitle = {Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2406.16858}
+}
+
+@misc{saxena2023promptlookup,
+  title        = {Prompt Lookup Decoding},
+  author       = {Saxena, Apoorv},
+  year         = {2023},
+  howpublished = {\url{https://github.com/apoorvumang/prompt-lookup-decoding}},
+  note         = {n-gram-based draft-model-free speculative decoding}
+}
+
+% ---------- Continuous batching ----------
+@inproceedings{yu2022orca,
+  title     = {{Orca}: A Distributed Serving System for {Transformer}-Based Generative Models},
+  author    = {Yu, Gyeong-In and Jeong, Joo Seong and Kim, Geon-Woo and Kim, Soojeong and Chun, Byung-Gon},
+  booktitle = {16th USENIX Symposium on Operating Systems Design and Implementation (OSDI)},
+  year      = {2022},
+  pages     = {521--538},
+  publisher = {USENIX Association},
+  url       = {https://www.usenix.org/conference/osdi22/presentation/yu}
+}
+
+% ---------- Quantization ----------
+@inproceedings{frantar2023gptq,
+  title     = {{GPTQ}: Accurate Post-Training Quantization for Generative Pre-trained Transformers},
+  author    = {Frantar, Elias and Ashkboos, Saleh and Hoefler, Torsten and Alistarh, Dan},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2023},
+  url       = {https://arxiv.org/abs/2210.17323}
+}
+
+@inproceedings{lin2024awq,
+  title     = {{AWQ}: Activation-aware Weight Quantization for {LLM} Compression and Acceleration},
+  author    = {Lin, Ji and Tang, Jiaming and Tang, Haotian and Yang, Shang and Chen, Wei-Ming and Wang, Wei-Chen and Xiao, Guangxuan and Dang, Xingyu and Gan, Chuang and Han, Song},
+  booktitle = {Proceedings of Machine Learning and Systems (MLSys)},
+  year      = {2024},
+  url       = {https://arxiv.org/abs/2306.00978}
+}
+
+@misc{llamacpp2023gguf,
+  title        = {{llama.cpp}: {LLM} Inference in {C/C++} ({GGUF} format and k-quants)},
+  author       = {Gerganov, Georgi and {llama.cpp contributors}},
+  year         = {2023},
+  howpublished = {\url{https://github.com/ggml-org/llama.cpp}},
+  note         = {GGUF container and k-quant mixed-bit quantization; no associated paper}
+}
+
+% ---------- Determinism / batch-invariant kernels ----------
+@misc{he2025defeating,
+  title        = {Defeating Nondeterminism in {LLM} Inference},
+  author       = {He, Horace and {Thinking Machines Lab}},
+  year         = {2025},
+  howpublished = {Thinking Machines Lab: Connectionism (blog)},
+  note         = {\url{https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/}}
+}

@@ -1,0 +1,42 @@
+{
+  "decode": 64,
+  "runs": 3,
+  "workloads": {
+    "repetitive": {
+      "baseline_decode_tps": 20.17,
+      "spec_decode_tps": 17.96,
+      "speedup": 0.89,
+      "accept_rate": 1.0,
+      "block_efficiency": 4.0,
+      "drafted": 48,
+      "accepted": 48
+    },
+    "code": {
+      "baseline_decode_tps": 15.03,
+      "spec_decode_tps": 14.72,
+      "speedup": 0.979,
+      "accept_rate": 0.167,
+      "block_efficiency": 1.391,
+      "drafted": 108,
+      "accepted": 18
+    },
+    "grounded": {
+      "baseline_decode_tps": 21.38,
+      "spec_decode_tps": 11.5,
+      "speedup": 0.538,
+      "accept_rate": 0.043,
+      "block_efficiency": 1.103,
+      "drafted": 139,
+      "accepted": 6
+    },
+    "chat": {
+      "baseline_decode_tps": 21.33,
+      "spec_decode_tps": 12.53,
+      "speedup": 0.587,
+      "accept_rate": 0.037,
+      "block_efficiency": 1.069,
+      "drafted": 54,
+      "accepted": 2
+    }
+  }
+}

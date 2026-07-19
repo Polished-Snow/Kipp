@@ -300,10 +300,19 @@ int main(int argc, char **argv) {
         fprintf(stderr, "kipp: prompt produced no tokens\n");
         goto cleanup;
     }
+    /* Speculation transiently appends up to KIPP_CLI_MAX_DRAFT draft tokens
+     * beyond the logical length before rolling them back, so the KV cache
+     * needs that much headroom (clamped to the context length). */
+    size_t session_capacity = tokens.count + decode_count;
+    if (spec) {
+        session_capacity += KIPP_CLI_MAX_DRAFT + 1;
+        if (session_capacity > info.context_length) {
+            session_capacity = info.context_length;
+        }
+    }
     if (tokens.count > info.context_length ||
         decode_count > info.context_length - tokens.count ||
-        kipp_session_create(model, (uint32_t)(tokens.count + decode_count),
-                            &session,
+        kipp_session_create(model, (uint32_t)session_capacity, &session,
                             &error) != 0) {
         fprintf(stderr, "kipp: session: %s\n", error.message);
         goto cleanup;
