@@ -4,9 +4,7 @@
 using namespace metal;
 
 constant float KIPP_FLT_LOWEST = -3.402823466e+38f;
-constant uint KIPP_EMBED = 2560;
 constant uint KIPP_HEAD_DIM = 128;
-constant uint KIPP_Q_HEADS = 32;
 constant uint KIPP_KV_HEADS = 8;
 constant uint KIPP_NORM_THREADS = 256;
 constant uint KIPP_NORM_GROUPS = KIPP_NORM_THREADS / 32;
@@ -15,6 +13,11 @@ constant uint KIPP_MV_MAX_TILE = 8;
 /* Specialized at pipeline-creation time: 1 for decode, KIPP_MV_MAX_TILE for
  * batched prefill. */
 constant uint KIPP_MV_TOKEN_TILE [[function_constant(0)]];
+/* Per-model dimensions, set when the model compiles its pipelines. The
+ * hidden width and query-head count are the only dims that vary across the
+ * Qwen3 dense family; head_dim and KV heads are family constants above. */
+constant uint KIPP_EMBED [[function_constant(1)]];
+constant uint KIPP_Q_HEADS [[function_constant(2)]];
 constant uint KIPP_HALF_HEAD_DIM = KIPP_HEAD_DIM / 2;
 constant uint KIPP_GQA_GROUPS = 8;
 constant uint KIPP_KV_VALUES_PER_TOKEN = KIPP_KV_HEADS * KIPP_HEAD_DIM;
@@ -228,12 +231,129 @@ kernel void kipp_matvec_bf16(device const ushort *weight [[buffer(0)]],
     }
 }
 
+/* Little-endian IEEE fp16 from two device bytes -> float. */
+inline float kipp_fp16_bytes(device const uchar *p) {
+    ushort bits = ushort(p[0]) | (ushort(p[1]) << 8);
+    return float(as_type<half>(bits));
+}
+
+/*
+ * Q8_0 matvec, token-tiled exactly like kipp_matvec_bf16 (function constant
+ * KIPP_MV_TOKEN_TILE = 1 for decode, KIPP_MV_MAX_TILE for prefill). Weight
+ * is rows * (columns/32) blocks of 34 bytes: fp16 scale then int8 qs[32].
+ * One simdgroup owns one output row; the 32 lanes stride whole blocks.
+ */
+kernel void kipp_matvec_q8_0(device const uchar *weight [[buffer(0)]],
+                             device const float *input [[buffer(1)]],
+                             device float *output [[buffer(2)]],
+                             constant MatvecParams &params [[buffer(3)]],
+                             uint2 group_id [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint group [[simdgroup_index_in_threadgroup]]) {
+    uint row = group_id.x * KIPP_MV_ROWS_PER_GROUP + group;
+    if (row >= params.rows) {
+        return;
+    }
+    uint token_base = group_id.y * KIPP_MV_TOKEN_TILE;
+    uint tile = min(KIPP_MV_TOKEN_TILE, params.token_count - token_base);
+    uint blocks = params.columns / 32u;
+    device const uchar *weight_row = weight + ulong(row) * blocks * 34ul;
+    float accumulators[KIPP_MV_MAX_TILE] = {0.0f};
+    for (uint b = lane; b < blocks; b += 32u) {
+        device const uchar *blk = weight_row + ulong(b) * 34ul;
+        float d = kipp_fp16_bytes(blk);
+        device const char *qs = (device const char *)(blk + 2);
+        for (uint t = 0; t < KIPP_MV_TOKEN_TILE; ++t) {
+            if (t < tile) {
+                device const float *in =
+                    input + ulong(token_base + t) * params.columns + b * 32u;
+                float dot = 0.0f;
+                for (uint j = 0; j < 32u; ++j) {
+                    dot += float(qs[j]) * in[j];
+                }
+                accumulators[t] += d * dot;
+            }
+        }
+    }
+    for (uint t = 0; t < KIPP_MV_TOKEN_TILE; ++t) {
+        if (t < tile) {
+            float total = simd_sum(accumulators[t]);
+            if (lane == 0) {
+                output[ulong(token_base + t) * params.rows + row] = total;
+            }
+        }
+    }
+}
+
+/*
+ * AFFINE4_GS32 matvec, token-tiled. Weight is rows * (columns/32) groups of
+ * 20 bytes: 16 packed nibbles (q[2k]=lo, q[2k+1]=hi) then fp16 scale, fp16
+ * bias. w = scale*q + bias, folded per group as scale*dot + bias*actsum.
+ */
+kernel void kipp_matvec_affine4(device const uchar *weight [[buffer(0)]],
+                                device const float *input [[buffer(1)]],
+                                device float *output [[buffer(2)]],
+                                constant MatvecParams &params [[buffer(3)]],
+                                uint2 group_id [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint group [[simdgroup_index_in_threadgroup]]) {
+    uint row = group_id.x * KIPP_MV_ROWS_PER_GROUP + group;
+    if (row >= params.rows) {
+        return;
+    }
+    uint token_base = group_id.y * KIPP_MV_TOKEN_TILE;
+    uint tile = min(KIPP_MV_TOKEN_TILE, params.token_count - token_base);
+    uint groups = params.columns / 32u;
+    device const uchar *weight_row = weight + ulong(row) * groups * 20ul;
+    float accumulators[KIPP_MV_MAX_TILE] = {0.0f};
+    for (uint g = lane; g < groups; g += 32u) {
+        device const uchar *grp = weight_row + ulong(g) * 20ul;
+        float scale = kipp_fp16_bytes(grp + 16);
+        float bias = kipp_fp16_bytes(grp + 18);
+        for (uint t = 0; t < KIPP_MV_TOKEN_TILE; ++t) {
+            if (t < tile) {
+                device const float *in =
+                    input + ulong(token_base + t) * params.columns + g * 32u;
+                float dot = 0.0f;
+                float actsum = 0.0f;
+                for (uint k = 0; k < 16u; ++k) {
+                    uchar p = grp[k];
+                    float a0 = in[2 * k];
+                    float a1 = in[2 * k + 1];
+                    dot += float(p & 0x0fu) * a0 + float(p >> 4) * a1;
+                    actsum += a0 + a1;
+                }
+                accumulators[t] += scale * dot + bias * actsum;
+            }
+        }
+    }
+    for (uint t = 0; t < KIPP_MV_TOKEN_TILE; ++t) {
+        if (t < tile) {
+            float total = simd_sum(accumulators[t]);
+            if (lane == 0) {
+                output[ulong(token_base + t) * params.rows + row] = total;
+            }
+        }
+    }
+}
+
 /* One thread per (KV value, token). */
+/* Logical position -> physical KV slot through the session's page table:
+ * block_table[pos >> 5] selects the 32-slot physical block, (pos & 31) the
+ * slot within it. `params.capacity` is the physical stride (a whole number
+ * of blocks). The identity table reproduces the contiguous layout exactly. */
+inline ulong kipp_kv_slot(constant KvParams &params,
+                          device const uint *block_table, uint position) {
+    uint physical = block_table[position >> 5u] * 32u + (position & 31u);
+    return ulong(params.layer) * params.capacity + ulong(physical);
+}
+
 kernel void kipp_kv_write(device const float *key [[buffer(0)]],
                           device const float *value [[buffer(1)]],
                           device ushort *key_cache [[buffer(2)]],
                           device ushort *value_cache [[buffer(3)]],
                           constant KvParams &params [[buffer(4)]],
+                          device const uint *block_table [[buffer(5)]],
                           uint2 gid [[thread_position_in_grid]]) {
     uint index = gid.x;
     uint token = gid.y;
@@ -242,8 +362,7 @@ kernel void kipp_kv_write(device const float *key [[buffer(0)]],
     }
     uint position = params.start_position + token;
     ulong cache_index =
-        (ulong(params.layer) * params.capacity + position) *
-            KIPP_KV_VALUES_PER_TOKEN +
+        kipp_kv_slot(params, block_table, position) * KIPP_KV_VALUES_PER_TOKEN +
         index;
     ulong state_index = ulong(token) * KIPP_KV_VALUES_PER_TOKEN + index;
     key_cache[cache_index] = kipp_float_to_bf16(key[state_index]);
@@ -263,6 +382,7 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
                            device const ushort *value_cache [[buffer(2)]],
                            device float *output [[buffer(3)]],
                            constant KvParams &params [[buffer(4)]],
+                           device const uint *block_table [[buffer(5)]],
                            uint2 group_id [[threadgroup_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]],
                            uint group [[simdgroup_index_in_threadgroup]]) {
@@ -280,8 +400,7 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
     float4 q = query4[lane];
     const float scale = rsqrt(float(KIPP_HEAD_DIM));
     uint last_source = params.start_position + token;
-    ulong base = ulong(params.layer) * params.capacity * KIPP_KV_VALUES_PER_TOKEN +
-                 ulong(kv_head) * KIPP_HEAD_DIM;
+    ulong head_offset = ulong(kv_head) * KIPP_HEAD_DIM;
 
     float maximum = 0.0f;
     float denominator = 0.0f;
@@ -289,7 +408,10 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
     uint count = 0;
     for (uint source = group; source <= last_source;
          source += KIPP_GQA_GROUPS) {
-        ulong offset = base + ulong(source) * KIPP_KV_VALUES_PER_TOKEN;
+        ulong offset =
+            kipp_kv_slot(params, block_table, source) *
+                KIPP_KV_VALUES_PER_TOKEN +
+            head_offset;
         float4 k = kipp_bf16x4_to_float4(
             ((device const ushort4 *)(key_cache + offset))[lane]);
         float score = simd_sum(dot(q, k)) * scale;

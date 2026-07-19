@@ -12,4 +12,7 @@ const kipp_backend_ops *kipp_metal_backend_operations(void);
 int kipp_metal_run_operator_tests(kipp_error *error);
 const char *kipp_metal_device_name(void);
 
+/* Test hook: reverse a Metal backend session's KV page table before eval. */
+int kipp_metal_test_scramble_session(void *backendSession);
+
 #endif

@@ -1,137 +1,512 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Architecture — Kipp</title>
-<meta name="description" content="Kipp's design constraints, planned components, backends, and correctness boundaries.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9889;</text></svg>">
-<style>
-:root{
-  --bg:#0b0e14; --panel:#11151f; --panel2:#151a26; --border:#232a3a;
-  --text:#e6e9ef; --muted:#9aa3b2; --faint:#7c8698;
-  --accent:#6366f1; --accent2:#22d3ee;
-  --code-bg:#0d1118; --good:#34d399; --warn:#fbbf24;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
-a{color:var(--accent2);text-decoration:none}
-a:hover{text-decoration:underline}
-code,pre{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:.9em}
-code{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:.12em .4em}
-pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto;line-height:1.55}
-pre code{background:none;border:none;padding:0}
-.wrap{max-width:960px;margin:0 auto;padding:0 24px}
-header.site{position:sticky;top:0;z-index:10;background:rgba(11,14,20,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
-header.site .wrap{display:flex;align-items:center;gap:22px;height:60px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--text)}
-.brand:hover{text-decoration:none}
-.brand .mark{display:inline-block;width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
-nav.top{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
-nav.top a{color:var(--muted);padding:6px 11px;border-radius:8px;font-size:14px}
-nav.top a:hover{color:var(--text);background:var(--panel2);text-decoration:none}
-nav.top a.active{color:var(--text);background:var(--panel2);border:1px solid var(--border)}
-main{padding:48px 0 24px}
-.hero{text-align:center;padding:56px 0 8px}
-.hero img{max-width:420px;width:90%}
-.hero p.tag{margin:18px auto 0;max-width:640px;font-size:19px;color:var(--muted)}
-.hero .cta{margin-top:28px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
-.btn{display:inline-block;padding:10px 20px;border-radius:10px;font-weight:600;font-size:15px;border:1px solid var(--border);color:var(--text);background:var(--panel2)}
-.btn:hover{text-decoration:none;border-color:var(--accent)}
-.btn.primary{background:linear-gradient(135deg,var(--accent),#4f46e5);border-color:transparent}
-.btn.primary:hover{filter:brightness(1.12)}
-.notice{margin:36px 0;padding:14px 18px;border:1px solid var(--warn);border-left-width:4px;border-radius:10px;background:rgba(251,191,36,.06);color:var(--text);font-size:15px}
-h1{font-size:34px;letter-spacing:-.5px;margin-bottom:8px}
-h2{font-size:24px;margin:44px 0 14px;letter-spacing:-.3px}
-h2 .h-mark{color:var(--accent2);margin-right:8px}
-h3{font-size:18px;margin:28px 0 10px}
-p{margin:12px 0;color:var(--text)}
-p.lead{color:var(--muted);font-size:17px}
-ul,ol{margin:12px 0 12px 24px;color:var(--text)}
-li{margin:6px 0}
-li::marker{color:var(--accent2)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin:24px 0}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px 22px}
-.card h3{margin:0 0 8px;font-size:16px}
-.card p{margin:0;color:var(--muted);font-size:14.5px}
-table{width:100%;border-collapse:collapse;margin:18px 0;font-size:15px}
-th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border)}
-th{color:var(--faint);font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:1px}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid var(--border)}
-.pill.todo{color:var(--warn);border-color:rgba(251,191,36,.4)}
-.pill.ref{color:var(--good);border-color:rgba(52,211,153,.4)}
-.tree{color:var(--muted)}
-.tree b{color:var(--text)}
-footer.site{margin-top:72px;border-top:1px solid var(--border);padding:28px 0 40px;color:var(--faint);font-size:14px}
-footer.site .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
-footer.site a{color:var(--muted)}
-blockquote{border-left:3px solid var(--accent);padding:4px 18px;margin:16px 0;color:var(--muted)}
-@media (max-width:640px){header.site .wrap{height:auto;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Architecture — Kipp</title>
+  <meta name="description" content="Model, memory, backend, serving, and correctness contracts.">
+  <link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
-<header class="site"><div class="wrap">
-  <a class="brand" href="index.html"><span class="mark"></span>Kipp</a>
-  <nav class="top"><a href="index.html">Home</a><a href="architecture.html" class="active">Architecture</a><a href="roadmap.html">Roadmap</a><a href="model-support.html">Model Support</a><a href="benchmarks.html">Benchmarks</a><a href="contributing.html">Contributing</a><a href="https://github.com/Polished-Snow/Kipp">GitHub &#8599;</a></nav>
-</div></header>
-<main><div class="wrap">
-
-<h1>Architecture</h1>
-<p class="lead">This document is intentionally model-agnostic until Kipp's first target model family is selected.</p>
-
-<h2><span class="h-mark">#</span>Design constraints</h2>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="index.html">Home</a>
+        <a href="architecture.html" aria-current="page">Architecture</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="model-support.html">Models</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Kipp Architecture</h1>
+<p>This document is the implementation contract for the Kipp v2 architecture
+generation. Changes to the supported-model registry, model format, backend
+boundary, KV layout, or API surface require an explicit architecture review
+before code is changed.</p>
+<p>Revision note: the v1 contract (release v0.0.1) supported exactly one
+checkpoint, <code>Qwen/Qwen3-4B-Base</code>. On 2026-07-16 an approved architecture
+review expanded scope to the pinned Qwen3 dense family below. Everything
+else in the v1 contract — strict validation, correctness gating, backend
+isolation — carries forward unchanged.</p>
+<h2>Scope and invariants</h2>
+<p>Kipp v2 is a hand-written inference engine for a fixed registry of pinned
+Qwen3 dense checkpoints. It is not a general Qwen runner, a generic GGUF
+runner, or a tensor framework: a checkpoint outside the registry is a
+rejection, not an extension point.</p>
 <ul>
-  <li>Implement <strong>one model family deeply</strong> rather than building a generic runner.</li>
-  <li>Keep the inference path native and readable, with C as the center of gravity.</li>
-  <li>Use <strong>mmap-backed model loading</strong> where the selected format permits it.</li>
-  <li>Keep CPU, Metal, and CUDA behavior behind explicit boundaries.</li>
-  <li>Establish correctness on the CPU reference path <em>before</em> optimizing kernels.</li>
-  <li>Keep Python and shell outside the inference process.</li>
+<li>C11 owns model validation, tokenization, lifecycle, sampling, and the CPU
+reference path.</li>
+<li>Objective-C is confined to the Metal bridge. Metal kernels and CUDA kernels
+remain isolated from one another.</li>
+<li>Python and shell are tooling only. They may download, convert, and generate
+reference vectors, but they are never part of the inference process.</li>
+<li>Correctness is established on CPU before a GPU backend is optimized.</li>
+<li>A backend is not called working until it has run on that backend's hardware.</li>
+<li>No backend silently falls back to another backend.</li>
 </ul>
-
-<h2><span class="h-mark">#</span>Planned components</h2>
-<h3>Model and weights</h3>
-<p><code>src/kipp.c</code> will parse the selected model's metadata and tensor layout, validate supported variants, and map weights without unnecessary copies. Exact formats, quantization schemes, and tokenizer behavior remain undecided.</p>
-
-<h3>Forward pass</h3>
-<p>The reference forward pass will remain linear and model-specific so a reader can follow one token from embeddings through logits. Backend dispatch must not obscure the model's computation graph.</p>
-
-<h3>Backends</h3>
-<table>
-  <tr><th>Backend</th><th>Role</th><th>Location</th><th>Status</th></tr>
-  <tr><td><strong>CPU</strong></td><td>Correctness &amp; debugging reference, portable C11. Never optimized at the GPU paths' expense.</td><td><code>src/kipp.c</code></td><td><span class="pill todo">planned</span></td></tr>
-  <tr><td><strong>Metal</strong></td><td>Apple Silicon kernels; Objective-C confined to the bridge file.</td><td><code>src/metal/kipp_metal.m</code></td><td><span class="pill todo">planned</span></td></tr>
-  <tr><td><strong>CUDA</strong></td><td>NVIDIA kernels and launch code, isolated so CUDA changes can't silently alter other paths.</td><td><code>src/cuda/kipp_cuda.cu</code></td><td><span class="pill todo">planned</span></td></tr>
-  <tr><td><strong>ROCm / HIP</strong></td><td>Explicitly deferred to a separate, community-maintained branch.</td><td>&mdash;</td><td><span class="pill todo">deferred</span></td></tr>
-</table>
-<p>Backend interfaces, supported hardware, and kernel placement will be fixed after model selection.</p>
-
-<h3>Runtime and serving</h3>
-<p><code>src/kipp_server.c</code> serves the small OpenAI Completions subset on loopback — non-streaming or SSE-streamed — one request at a time, with serial prefix reuse via session truncation. Continuous batching and the scheduler remain Phase 5 design work.</p>
-
-<h2><span class="h-mark">#</span>Correctness boundaries</h2>
-<p>Reference test vectors will be generated by tooling and stored or reproduced under <code>tests/test-vectors/</code>. Backend outputs must be compared against the CPU reference path with tolerances documented per numeric format.</p>
-<blockquote>A backend is not considered working until it has been run on its actual hardware.</blockquote>
-
-<h2><span class="h-mark">#</span>Open decisions</h2>
+<h2>Supported checkpoints</h2>
+<h3>The registry</h3>
+<p><code>src/kipp_checkpoints.h</code> compiles in the full list of supported checkpoints,
+each pinned to one immutable Hugging Face revision with its exact
+dimensions, context length, RoPE theta, embedding tying, variant, and stop
+tokens. <code>tools/checkpoints.py</code> mirrors the table for the tooling, and
+<code>tests/test_tooling.py</code> cross-checks the two copies. Adding a checkpoint
+means adding one registry entry (both copies), converting, generating
+vectors, and running the gates — never changing engine code.</p>
+<p>The registry currently holds the Qwen3 dense family (all Apache-2.0):
+base and instruct 0.6B, 1.7B, 4B, 8B, and 14B; instruct-only 32B
+(Qwen3-32B-Base was never released); and the 4B Instruct/Thinking 2507
+refreshes. The exact pinned revisions live only in the registry sources.</p>
+<p>Family-invariant dimensions, validated for every entry:</p>
 <ul>
-  <li>First model family and exact supported checkpoints</li>
-  <li>Weight container and quantization formats</li>
-  <li>Tokenizer ownership and chat-template behavior</li>
-  <li>KV-cache representation and capacity policy</li>
-  <li>Initial API surface and concurrency model</li>
-  <li>Minimum supported Apple and NVIDIA hardware</li>
+<li>Key/value heads: 8</li>
+<li>Head width: 128</li>
+<li>Vocabulary: 151,936</li>
+<li>Activation: SwiGLU using SiLU</li>
+<li>Normalization: RMSNorm with epsilon <code>1e-6</code>, plus per-head Q/K RMSNorm</li>
+<li>Position encoding: standard NEOX-style RoPE; no YaRN or other RoPE scaling</li>
+<li>Attention: causal grouped-query attention, without sliding-window attention</li>
+<li>Weight dtype: BF16; linear layers have no biases</li>
 </ul>
+<p>Per-checkpoint dimensions, validated against the matching registry entry:</p>
+<ul>
+<li>Layers (28–64), hidden width (1,024–5,120), feed-forward width
+(3,072–25,600), and query-head count (16–64)</li>
+<li>Context length: 32,768 (base), 40,960 (instruct), or 262,144 (4B-2507)</li>
+<li>RoPE theta: <code>1,000,000</code>, or <code>5,000,000</code> for the 2507 checkpoints</li>
+<li>Embedding tying: 0.6B/1.7B/4B tie the output head to the token embedding;
+8B/14B/32B carry a separate <code>lm_head.weight</code> tensor</li>
+<li>Stop tokens: base checkpoints stop on <code>&lt;|endoftext|&gt;</code> (151643); instruct
+checkpoints stop on <code>&lt;|im_end|&gt;</code> (151645) and <code>&lt;|endoftext|&gt;</code></li>
+</ul>
+<p>Two derived facts the code must never conflate: the attention width is
+<code>query_heads * 128</code> and is NOT the hidden width (they differ at 0.6B and
+32B), and the forward pass is otherwise identical at every size.</p>
+<p>Qwen3 MoE, Qwen3-Next, Qwen3-VL, and Qwen3.5 remain separate model-support
+decisions requiring a new architecture review.</p>
+<p>Each layer performs these operations in order:</p>
+<ol>
+<li>RMSNorm the residual stream.</li>
+<li>Project Q, K, and V.</li>
+<li>Reshape into heads and apply per-head RMSNorm to Q and K.</li>
+<li>Apply RoPE to Q and K.</li>
+<li>Run causal grouped-query attention, with <code>query_heads / 8</code> query heads
+sharing each KV head.</li>
+<li>Apply the attention output projection and add the residual.</li>
+<li>RMSNorm the new residual stream.</li>
+<li>Compute <code>down_proj(SiLU(gate_proj(x)) * up_proj(x))</code>.</li>
+<li>Add the feed-forward residual.</li>
+</ol>
+<p>After the final layer, Kipp applies the final RMSNorm and multiplies by the
+output head — the transposed token embedding when tied, the checkpoint's
+<code>lm_head.weight</code> otherwise — to produce 151,936 FP32 logits.</p>
+<h3>Tokenizer</h3>
+<p>Kipp owns a native, Qwen-specific implementation of the
+<code>Qwen2Tokenizer</code> byte-level BPE used by every supported checkpoint. It loads
+the vocabulary, merge ranks, special tokens, and pre-tokenization data
+embedded in Kipp's GGUF file. The vocabulary, merges, pre-tokenizer, and
+NFC normalization are byte-identical across the whole family, and so is the
+special-token set: every checkpoint — base included — declares the
+think/tool tokens (<code>&lt;tool_response&gt;</code> 151665, <code>&lt;/tool_response&gt;</code> 151666,
+<code>&lt;think&gt;</code> 151667, <code>&lt;/think&gt;</code> 151668) in <code>tokenizer_config.json</code>'s
+<code>added_tokens_decoder</code>, which upstream merges over <code>tokenizer.json</code>. The
+converter performs the same merge; skipping it would silently mis-tokenize
+those strings, which the golden tokenizer cases now cover explicitly.</p>
+<ul>
+<li>No BOS token is inserted automatically.</li>
+<li>Token 151643 (<code>&lt;|endoftext|&gt;</code>) is EOS and padding for base checkpoints;
+instruct checkpoints emit <code>&lt;|im_end|&gt;</code> (151645) at end of turn, and both
+belong to their stop set.</li>
+<li>Token 151644 is <code>&lt;|im_start|&gt;</code> and token 151645 is <code>&lt;|im_end|&gt;</code>.</li>
+<li>UTF-8, byte fallback, special-token recognition, and multilingual
+pre-tokenization require deterministic native tests.</li>
+<li>Chat-template rendering is server-side work; the engine API stays
+token/text-based.</li>
+</ul>
+<p>The tokenizer is model-specific. Kipp will not implement a registry of
+tokenizer types.</p>
+<h2>Model artifact and loader</h2>
+<h3>Conversion boundary</h3>
+<p><code>tools/download_model.sh --checkpoint ID</code> downloads the registry entry's
+pinned Hugging Face revision and verifies recorded checksums.
+<code>tools/convert_to_gguf.py --checkpoint ID</code> converts the BF16 safetensors
+(sharded or single-file) into one mmap-friendly GGUF artifact per
+checkpoint. Tooling may use Python ML packages to generate independent
+reference data, but the converter must not make the native runtime depend on
+them.</p>
+<p>The converter writes only the metadata and tensor types required by the
+registry entry. It records:</p>
+<ul>
+<li>source repository and immutable revision;</li>
+<li>source-file and output-file SHA-256 hashes;</li>
+<li>exact model dimensions and tokenizer metadata;</li>
+<li>BF16 tensor offsets, dimensions, and aligned byte lengths; and</li>
+<li>the embedding-tying relationship — no duplicate output tensor when tied,
+the checkpoint's own <code>lm_head.weight</code> when untied.</li>
+</ul>
+<h3>Strict GGUF subset</h3>
+<p>The native loader parses the GGUF header, metadata, tensor directory, and
+tokenizer data. It matches <code>(kipp.source.repository, kipp.source.revision)</code>
+against the compiled-in registry, requires every metadata field to equal the
+matched entry, and then binds an explicit <code>kipp_qwen3_weights</code> structure:</p>
+<ul>
+<li>token embedding, final RMSNorm, and the output head (an alias of the
+token embedding when tied, a bound <code>lm_head.weight</code> otherwise);</li>
+<li>for each of the entry's layers, attention RMSNorm, Q/K/V/output
+projections, Q/K per-head RMSNorm, feed-forward RMSNorm, and gate/up/down
+projections.</li>
+</ul>
+<p>The loader rejects the file before inference if the checkpoint is not in the
+registry or if the dimensions, dtype, tensor names, tensor shapes, tensor
+count, alignment, offsets, or required metadata differ from the matched
+entry. Unknown tensors and architectures are errors, not extension points.</p>
+<p>No code from llama.cpp or ggml is vendored. GGUF is implemented from its
+published format and Kipp's deliberately small required subset.</p>
+<h3>Weight quantization</h3>
+<p>An artifact may quantize the seven per-layer projection tensors while
+keeping the token embedding, lm_head, and all norms in BF16. A
+<code>kipp.quant.scheme</code> metadata string (<code>bf16</code>, <code>q8_0</code>, or <code>affine4_gs32</code>)
+records the scheme, and the tensor directory carries the per-tensor type;
+the loader validates both. Two formats, both operating on 32-weight blocks
+with <code>columns % 32 == 0</code> (true for every family dimension):</p>
+<ul>
+<li><strong>Q8_0</strong> — <code>{fp16 scale; int8 qs[32]}</code>, 34 bytes/block (8.5 bpw),
+<code>w = scale·q</code>. Near-lossless (full-logit NMSE under the BF16 gate bound).</li>
+<li><strong>AFFINE4_GS32</strong> — <code>{16 packed nibbles; fp16 scale; fp16 bias}</code>, 20
+bytes/group (5.0 bpw), <code>w = scale·q + bias</code>, <code>q ∈ [0,15]</code>. Q4-class.</li>
+</ul>
+<p>The CPU reference dequantizes per block inside a type-dispatched matvec;
+Metal adds token-tiled <code>kipp_matvec_q8_0</code>/<code>kipp_matvec_affine4</code> decode and
+prefill kernels selected by the weight tensor's type. Quantized artifacts
+gate as ordinary artifacts: argmax must match the BF16 reference exactly,
+with a format-appropriate full-logit NMSE bound (Q8_0 near-lossless; 4-bit
+Q4-class), and Metal must match CPU within the standard <code>1e-4</code>. The
+converter quantizes against the fp16-rounded scale so encoder and decoder
+agree exactly.</p>
+<h2>Memory model</h2>
+<h3>Weights</h3>
+<p>Each opened model has one read-only file mapping. Tensor views are validated
+offsets into that mapping; the C loader does not eagerly copy weights.</p>
+<ul>
+<li><strong>CPU:</strong> uses a private read-only mapping and converts BF16 values while
+computing, with FP32 activations and accumulation.</li>
+<li><strong>Metal:</strong> uses a shared read-only mapping and wraps the complete mapping in
+no-copy Metal storage. Tensor offsets remain offsets into that one buffer.</li>
+<li><strong>CUDA:</strong> validates the host mapping first, then copies all required tensors
+to VRAM during model creation. If weights, session state, and scratch space
+do not fit, model creation fails explicitly.</li>
+</ul>
+<p>Partial GPU offload, automatic placement, and backend fallback are out of
+scope.</p>
+<h3>Activations and logits</h3>
+<p>Backends own reusable activation and scratch storage. Allocation occurs when a
+backend model or session is created, not inside the layer loop. Intermediate
+activations use FP32 for the CPU reference path. GPU storage and accumulation
+precision may differ only when tests establish the documented tolerance.</p>
+<p>Only final FP32 logits cross from a GPU backend to host memory during normal
+evaluation.</p>
+<h3>KV cache</h3>
+<p>A session owns separate K and V BF16 stores with logical layout:</p>
+<pre><code class="language-text">[layer][position][kv_head][head_dim]
+</code></pre>
+<p>KV heads (8) and head width (128) are family constants; the layer count is
+the checkpoint's. Each cached token therefore costs
+<code>layers * 2(K,V) * 8 * 128 * 2(BF16)</code> bytes across all layers — 147,456
+bytes for the 36-layer 4B, 114,688 for 28-layer sizes, 262,144 for the
+64-layer 32B. That per-token figure is the reported logical KV size and is
+unchanged by paging.</p>
+<p>The caller selects session capacity at creation, up to the checkpoint's
+context length. For the 4B an 8,192-token cache is 1.125 GiB and a full
+32,768-token cache is 4.5 GiB. Capacity is allocated once, checked on every
+append, and released with the session. Reset zeroes logical length; it need
+not clear unreachable bytes.</p>
+<p>Both the CPU oracle and the Metal backend address their KV through a page
+table (Phase 5). Physical storage is a run of fixed 32-position blocks, and
+a per-session <code>block_table</code> maps each logical block (<code>position &gt;&gt; 5</code>) to the
+physical block that holds it; the physical store is rounded up to a whole
+number of blocks. On CPU this is a table indexed inside <code>kv_cache_offset</code>;
+on Metal the <code>kipp_kv_write</code> and <code>kipp_flash_gqa</code> kernels take the block
+table as a buffer and resolve <code>block_table[pos &gt;&gt; 5] * 32 + (pos &amp; 31)</code> per
+access. With the identity table this is byte-for-byte the original
+contiguous layout — the <code>--model</code> and <code>--phase3-metal</code> gates still reproduce
+the reference — and a non-identity table relocates positions without
+changing any computed value. The <code>--paged-cpu</code> and <code>--paged-metal</code> gates
+prove this per backend by evaluating a multi-block prompt under a
+deliberately scrambled block table and asserting the final logits are
+bitwise-identical to the identity mapping; <code>--phase3-metal</code> further confirms
+paged Metal matches the paged CPU oracle within the 1e-4 tolerance. CUDA
+remains contiguous for now. The shared cross-request block pool
+(<code>src/kipp_kv_pool.c</code>) and the eval-item <code>block_table</code> contract that lets
+the core drive both backends are the next Phase 5 steps.</p>
+<p>Sessions support truncation back to a prefix of their timeline
+(<code>kipp_session_truncate</code>), which is the primitive behind the server's
+serial prefix reuse. Cross-session prefix sharing, persistence, and
+eviction through the block pool remain future Phase 5 work and do not change
+the backend contract.</p>
+<h3>SSD streaming</h3>
+<p>SSD streaming is not part of Kipp v1.</p>
+<p>ds4 keeps model loading mmap-backed and uses backend-specific placement:
+<code>model_open()</code> maps weights, Metal uses <code>ds4_gpu_set_model_map()</code>, and CUDA
+uses <code>ds4_gpu_set_model_map_range()</code>. Its <code>ds4_ssd_*</code> path streams sparsely
+selected routed-expert weights while other expert work can hide I/O.</p>
+<p>Qwen3 dense checkpoints need every layer and every feed-forward weight for
+every token. Streaming dense layers would reread nearly the entire model on
+each decode step, unlike ds4's sparse-expert case. Kipp therefore relies on
+the operating system's page cache for mapped CPU/Metal weights and requires
+resident CUDA weights. Dense layer streaming may be reconsidered only after
+measurement on a larger future checkpoint. Live KV remains memory-resident;
+KV checkpoint files are also deferred.</p>
+<h2>Backend boundary</h2>
+<p>Kipp uses one internal, model-specific backend contract. It is not a generic
+tensor API and does not expose device buffers to callers.</p>
+<p>The contract will live in <code>src/kipp_backend.h</code> and have this shape:</p>
+<pre><code class="language-c">typedef struct {
+    void *session;
+    const uint32_t *tokens;
+    uint32_t token_count;
+    uint32_t start_position;
+    float *logits;
+} kipp_eval_item;
 
-</div></main>
-<footer class="site"><div class="wrap">
-  <span>&copy; 2026 Kipp contributors &middot; MIT License</span>
-  <span>
-    <a href="https://github.com/Polished-Snow/Kipp">GitHub</a> &middot;
-    <a href="https://x.com/polished_snow">X / Twitter</a> &middot;
-    <a href="https://www.linkedin.com/company/plsn">LinkedIn</a>
-  </span>
-</div></footer>
+typedef struct {
+    int  (*model_create)(const kipp_model_view *model, void **backend_model);
+    void (*model_destroy)(void *backend_model);
+    int  (*session_create)(void *backend_model, uint32_t capacity,
+                           void **backend_session);
+    void (*session_destroy)(void *backend_session);
+    int  (*eval)(void *backend_model, kipp_eval_item *items,
+                 size_t item_count);
+} kipp_backend_ops;
+</code></pre>
+<p>The final declarations may add error-output parameters and const qualifiers,
+but they must preserve these ownership and execution semantics.</p>
+<p><code>kipp_model_view</code> contains the validated mmap, fixed model dimensions, and
+explicit semantic weight views. Core C owns model parsing, tokenization,
+sampling, public lifecycle, and error reporting. A backend owns its prepared
+weight representation, activation scratch, KV storage, and Qwen3 execution.</p>
+<p><code>eval</code> is synchronous. Each item appends <code>token_count</code> tokens at
+<code>start_position</code>, which must equal that session's logical KV length, and
+writes logits for the last <code>logits_count</code> tokens (1 = only the final token,
+the common case; the public <code>kipp_session_eval_n</code> exposes the multi-row
+form). Multi-row logits are the primitive behind speculative-decode
+verification and prompt logprobs; the CPU oracle writes them bitwise-equal
+to per-position evaluation, and Metal within the standard <code>1e-4</code>. CUDA and
+stateless evaluation currently support only the final row. Phase 1 calls it with one
+item and no reused cache. Phase 2 activates session KV state. Multi-item
+calls are live through the public <code>kipp_eval_batch</code>: backends may interleave
+the items so weights are read once per step across sequences (the Metal
+backend packs chunks of every item into shared rounds), and batched results
+must match isolated evaluation within the backend's documented tolerance.</p>
+<p>The CPU implementation lives with the readable reference forward pass in
+<code>src/kipp.c</code>. <code>src/metal/kipp_metal.m</code> and <code>src/cuda/kipp_cuda.cu</code> each expose
+their own static <code>kipp_backend_ops</code>. Device-specific headers, handles, and
+errors do not cross this interface.</p>
+<h2>Public engine and session model</h2>
+<p>The public C API will use opaque model and session handles:</p>
+<ul>
+<li>a model owns the validated file mapping and one selected backend model;</li>
+<li>a session owns one independent token timeline and KV cache;</li>
+<li>model objects are immutable after creation;</li>
+<li>sessions are not concurrently mutable;</li>
+<li>destroying a model requires all of its sessions to be destroyed first.</li>
+</ul>
+<p>The engine accepts token IDs or UTF-8 text, but both paths converge before
+backend evaluation. Sampling consumes host FP32 logits. Backend selection is
+explicit at model creation and never changes for that model.</p>
+<h2>Server and API surface</h2>
+<p><code>src/kipp_server.c</code> exposes a deliberately small OpenAI-compatible surface
+on loopback, with ordinary JSON responses and optional SSE streaming:</p>
+<ul>
+<li><code>GET /healthz</code></li>
+<li><code>GET /metrics</code></li>
+<li><code>GET /v1/models</code></li>
+<li><code>POST /v1/completions</code></li>
+<li><code>POST /v1/chat/completions</code></li>
+</ul>
+<p>The completion request supports one string prompt, up to eight completions
+(<code>n</code>), a bounded <code>max_tokens</code>, and the full sampling surface — <code>temperature</code>,
+<code>top_p</code>, <code>top_k</code>, <code>min_p</code>, <code>frequency_penalty</code>, <code>presence_penalty</code>,
+<code>repetition_penalty</code>, <code>logit_bias</code>, and <code>seed</code> — plus stop strings and an
+optional <code>stream</code> flag that switches the response to server-sent events in
+the OpenAI chunk shape (terminated by <code>data: [DONE]</code>; each chunk carries its
+choice index). Generated-token log-probabilities are available (legacy
+<code>logprobs</code> = top-N in [0,5]; chat <code>logprobs</code>/<code>top_logprobs</code> in [0,20]),
+computed as a numerically-stable log-softmax of the raw model logits at
+sample time and emitted in the endpoint's native shape — streamed per chunk
+or attached to the final response. <code>stream_options.include_usage</code> adds a
+trailing usage-only chunk, and every non-streamed response (plus that final
+chunk) carries a llama.cpp-style <code>timings</code> object: prompt/predicted token
+counts, milliseconds, and tokens-per-second from a monotonic clock.</p>
+<p>Chat completions are available for instruct checkpoints. Messages are rendered
+through the native Qwen3 ChatML renderer (<code>src/kipp_chat.c</code>) with
+<code>chat_template_kwargs.enable_thinking</code> support; base checkpoints reject chat
+requests since they have no template. Penalties apply over a 64-token
+per-choice window, and sampling uses the single <code>kipp_sample_ex</code> core entry
+point shared by the CLI and server.</p>
+<p>Multiple choices decode together through <code>kipp_eval_batch</code>, so each step reads
+the weights once for all choices. Streamed text is held back while it could
+still grow into a stop string, because emitted bytes cannot be recalled. The
+non-streaming response reports the model identifier, generated text, finish
+reason, and prompt/completion token counts. Unsupported fields receive a clear
+client error rather than being ignored.</p>
+<p>The server runs a single-threaded poll() event loop over concurrent
+loopback connections. Parsed completion requests join a FIFO and are
+admitted while the total choice count fits the batch limit; each scheduler
+step evaluates one prompt chunk (chunked prefill, 32 tokens) or one decode
+token per active choice through <code>kipp_eval_batch</code>, so concurrent requests
+read the weights once per step. Slow or disconnected clients are cancelled
+without disturbing other requests. A single cached session plus its
+evaluated token timeline provides serial prefix reuse: when an idle
+single-choice request shares a prefix with the timeline, the session is
+rolled back with <code>kipp_session_truncate</code> and only the suffix is prefilled.
+Multi-entry prefix caching and production KV block pooling remain future
+reviewed work and must not change this API surface.</p>
+<p>Greedy self-speculative decoding is available (CLI <code>--spec</code>): each step
+drafts the continuation with a prompt-lookup n-gram matcher
+(<code>src/kipp_spec.c</code>), verifies the whole draft in one multi-logit forward,
+and accepts the longest greedy-matching prefix — rolling the KV back with
+<code>kipp_session_truncate</code> for rejected drafts. The emitted sequence is exactly
+the plain greedy sequence (a gated invariant); it just takes fewer forward
+passes (measured ~1.9x on repetitive/structured content, multiplicative with
+quantization).</p>
+<p>The v1 server does not claim support for Anthropic Messages, tools,
+structured output, embeddings, multimodal input, authentication, TLS,
+distributed execution, or multi-model serving. Chat APIs require an explicitly approved instruction
+checkpoint and are not emulated with the base model.</p>
+<p>HTTP parsing, compatibility translation, scheduling, and model execution
+remain separate layers. The server cannot access backend buffers or KV memory
+directly.</p>
+<h2>Build phases and exit conditions</h2>
+<p>Every phase ends with test results and a review stop. A later phase does not
+begin until the previous phase is approved.</p>
+<h3>Phase 1 — CPU reference path</h3>
+<p>Build in this order:</p>
+<ol>
+<li>Pinned download, strict conversion, manifest, and test-vector tooling.</li>
+<li>GGUF metadata/tensor validation and mmap-backed semantic weight binding.</li>
+<li>Native Qwen tokenizer with byte-level, Unicode, special-token, encode, and
+decode tests.</li>
+<li>Scalar BF16 conversion, RMSNorm, matmul, RoPE, Q/K norm, softmax, GQA,
+SwiGLU, and residual unit tests.</li>
+<li>The readable full-prompt forward pass and output projection.</li>
+</ol>
+<p>Tooling captures immutable token IDs, selected intermediate tensors, and full
+FP32 logits from each pinned checkpoint. CPU completion requires exact metadata
+and token IDs, identical final argmax, and full-logit NMSE no greater than
+<code>5e-5</code> against BF16-weight/FP32-accumulation reference vectors. The test
+manifest records commands, tool versions, hashes, and tolerances.</p>
+<p>The <code>5e-5</code> bound is a documented recalibration of v1's <code>1e-5</code>: the FP32
+reference does not round K/V through BF16, while Kipp's KV storage contract
+does, and smaller checkpoints feel that rounding more (measured NMSE
+<code>3.8e-7</code> at 4B and <code>1.8e-5</code> at 0.6B; both fall below <code>1e-10</code> when the
+rounding is disabled, demonstrating the implementation itself is exact).</p>
+<p>Exit condition: a fixed UTF-8 prompt is converted to the expected tokens and a
+single native CPU forward pass produces accepted full-vocabulary logits.</p>
+<h3>Phase 2 — KV cache</h3>
+<p>Add session allocation, reset, bounded append, full-prompt prefill, and
+one-token incremental decode. The no-cache CPU path rounds K/V to the same BF16
+storage contract so it remains a valid oracle.</p>
+<p>Tests cover zero/one/many tokens, exact capacity, overflow rejection, reset,
+and multiple independent sessions. Cached decode must preserve the final
+argmax and have NMSE no greater than <code>1e-6</code> against CPU recomputation at every
+checked position.</p>
+<p>Exit condition: incremental decoding matches no-cache recomputation for the
+fixed vector and cache lifecycle tests pass.</p>
+<h3>Phase 3 — Metal backend</h3>
+<p>Implement no-copy mapped weights, persistent scratch/KV buffers, and Qwen3
+kernels on the local Apple M5. Optimize only after operator-level comparisons
+pass.</p>
+<p>Bitwise equality is not required because parallel reductions change floating
+point operation order. The accepted contract is identical argmax and
+full-logit NMSE no greater than <code>1e-4</code> versus CPU for prefill and every checked
+decode position. Any wider tolerance requires a documented plan change.</p>
+<p>Exit condition: the Metal backend passes those vectors on the M5 and reports
+measured memory, prefill throughput, and decode throughput.</p>
+<h3>Phase 4 — CUDA backend</h3>
+<p>Implement the same backend contract with resident VRAM weights and isolated
+CUDA kernels. Do not change Metal code to accommodate CUDA.</p>
+<p>Exit condition: on the provided NVIDIA machine, CUDA preserves CPU argmax and
+full-logit NMSE no greater than <code>1e-4</code> for prefill and decode, with memory and
+throughput reported. If CUDA hardware is unavailable, this phase stops without
+a success claim.</p>
+<h3>Phase 5 — Continuous batching and scheduler</h3>
+<p>Only after one GPU backend is correct, introduce KV blocks, allocation, and a
+small FIFO scheduler. Keep request state separate from execution and the HTTP
+layer. Prefix hashing and radix trees remain deferred.</p>
+<p>Exit condition: mixed-length concurrent requests reproduce their isolated
+backend outputs within that backend's existing tolerance, including cache
+exhaustion, cancellation, and block-reuse tests.</p>
+<h3>Phase 6 — Server</h3>
+<p>Implement only the approved OpenAI Completions subset around the tested
+scheduler and engine.</p>
+<p>Exit condition: endpoint schema, unsupported-field, context-limit, overload,
+disconnect, deterministic-seed, and end-to-end completion tests pass without
+the HTTP layer touching backend state.</p>
+<h3>Phase 7 — Explicitly reviewed extensions</h3>
+<p>The checkpoint registry, instruction/chat support, Q8_0 and affine 4-bit
+weight quantization, multi-row logits, and prompt-lookup speculative decoding
+were admitted through separate reviews and correctness gates.</p>
+<p>Still deferred:</p>
+<ul>
+<li>cross-session prefix caching and radix attention;</li>
+<li>KV persistence, offload, or quantization;</li>
+<li>SSD weight streaming;</li>
+<li>additional model families;</li>
+<li>distributed inference; and</li>
+<li>ROCm/HIP, on a separate community-maintained branch.</li>
+</ul>
+<p>Each deferred item requires a new plan, tests, and a measured reason to add
+complexity.</p>
+<h2>Research provenance</h2>
+<p>The references below were read for architecture concepts only. Kipp does not
+vendor their code or translate functions near-verbatim.</p>
+<ul>
+<li><code>antirez/ds4</code> at <code>80ebbc396aee40eedc1d829222f3362d10fa4c6c</code>
+(MIT): <code>ds4.c</code> (<code>model_open</code>, weight binding, session state),
+<code>ds4_gpu.h</code> (model-map and device-tensor boundary), <code>ds4_ssd.c</code>,
+<code>ds4_ssd.h</code>, and <code>ds4_server.c</code>.</li>
+<li><code>ggml-org/llama.cpp</code> at
+<code>049326a00025d00b08cc188ed716b681e984a3f8</code> (MIT):
+<code>conversion/qwen.py</code>, <code>gguf-py/gguf/tensor_mapping.py</code>,
+<code>src/llama-model-loader.*</code>, <code>src/llama-mmap.*</code>, <code>src/llama-vocab.*</code>, and
+<code>tests/test-llama-archs.cpp</code>.</li>
+<li><code>ggml-org/ggml</code> at <code>2faff76703c6b3a8ba9ebf92e2bb1bc93b7b1b1a</code>
+(MIT): <code>docs/gguf.md</code>, <code>src/gguf.cpp</code>, and
+<code>src/ggml-backend-impl.h</code>.</li>
+<li><code>ggml-org/whisper.cpp</code> at
+<code>6fc7c33b4c3a2cec83e4b65abd5e96a890480375</code> (MIT):
+<code>src/whisper.cpp</code> and <code>src/whisper-arch.h</code>.</li>
+<li><code>karpathy/llm.c</code> at <code>f1e2ace651495b74ae22d45d1723443fd00ecd3a</code>
+(MIT): <code>train_gpt2.c</code>, <code>llmc/tokenizer.h</code>, and <code>dev/test/</code>.</li>
+<li><code>GeeeekExplorer/nano-vllm</code> at
+<code>bb823b3e06983d71485a8e1f23715ebd87d98ef8</code> (MIT):
+<code>nanovllm/engine/block_manager.py</code>, <code>sequence.py</code>, <code>scheduler.py</code>, and
+<code>llm_engine.py</code>.</li>
+<li><code>vllm-project/vllm</code> at
+<code>e12b91b032daed2afc34d77cca20902cef957b3c</code> (Apache-2.0):
+<code>vllm/v1/request.py</code>, <code>vllm/v1/core/kv_cache_manager.py</code>, and
+<code>vllm/v1/core/sched/scheduler.py</code>.</li>
+<li><code>sgl-project/sglang</code> at
+<code>b86466d54b2ff3f7d1635fd9a856a95ab3dba9b6</code> (Apache-2.0):
+<code>python/sglang/srt/managers/scheduler.py</code>,
+<code>python/sglang/srt/managers/schedule_batch.py</code>, and
+<code>python/sglang/srt/mem_cache/</code>.</li>
+</ul>
+<p>The pinned Qwen model's <code>config.json</code>, <code>tokenizer_config.json</code>, safetensors
+index, README, and Apache-2.0 license are the authority for model-specific
+facts. Reference repositories inform boundaries and testing strategy, not
+Kipp's implementation text.</p>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
 </body>
 </html>

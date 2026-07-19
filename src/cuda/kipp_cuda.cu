@@ -14,7 +14,6 @@
 
 #define KIPP_CUDA_ORACLE_CAPACITY 256u
 #define KIPP_CUDA_RMS_EPSILON 1.0e-6f
-#define KIPP_CUDA_ROPE_THETA 1000000.0f
 
 typedef struct cuda_backend_model cuda_backend_model;
 
@@ -132,17 +131,19 @@ static void cuda_session_delete(cuda_backend_session *session) {
     free(session);
 }
 
-static uint64_t cuda_session_device_bytes(uint32_t capacity) {
+static uint64_t cuda_session_device_bytes(const kipp_model_config *config,
+                                          uint32_t capacity) {
     uint64_t slab_elements =
-        static_cast<uint64_t>(KIPP_BLOCK_COUNT) * capacity *
+        static_cast<uint64_t>(config->block_count) * capacity *
         KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
     uint64_t score_elements =
-        static_cast<uint64_t>(KIPP_ATTENTION_HEAD_COUNT) * capacity;
+        static_cast<uint64_t>(config->attention_head_count) * capacity;
     uint64_t float_elements =
-        3u * KIPP_EMBEDDING_LENGTH +
-        2u * KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM +
+        3u * static_cast<uint64_t>(config->embedding_length) +
+        2u * static_cast<uint64_t>(config->attention_width) +
         2u * KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM +
-        2u * KIPP_FEED_FORWARD_LENGTH + score_elements + KIPP_VOCAB_SIZE;
+        2u * static_cast<uint64_t>(config->feed_forward_length) +
+        score_elements + KIPP_VOCAB_SIZE;
     return 2u * slab_elements * sizeof(uint16_t) +
            float_elements * sizeof(float);
 }
@@ -150,10 +151,11 @@ static uint64_t cuda_session_device_bytes(uint32_t capacity) {
 static cuda_backend_session *
 cuda_session_new(cuda_backend_model *model, uint32_t capacity,
                  kipp_error *error) {
-    if (capacity == 0 || capacity > KIPP_CONTEXT_LENGTH) {
+    const kipp_model_config *config = &model->view->config;
+    if (capacity == 0 || capacity > config->context_length) {
         cuda_fail(error, KIPP_ERROR_RANGE,
                   "CUDA session capacity must be between 1 and %u",
-                  KIPP_CONTEXT_LENGTH);
+                  config->context_length);
         return NULL;
     }
     size_t free_bytes = 0;
@@ -163,7 +165,7 @@ cuda_session_new(cuda_backend_model *model, uint32_t capacity,
         cuda_fail_status(error, "session memory capacity query", memory_status);
         return NULL;
     }
-    uint64_t required_bytes = cuda_session_device_bytes(capacity);
+    uint64_t required_bytes = cuda_session_device_bytes(config, capacity);
     if (required_bytes > free_bytes) {
         cuda_fail(error, KIPP_ERROR_MEMORY,
                   "CUDA session requires %llu device bytes but only %zu of "
@@ -173,10 +175,10 @@ cuda_session_new(cuda_backend_model *model, uint32_t capacity,
         return NULL;
     }
     size_t slab_elements =
-        static_cast<size_t>(KIPP_BLOCK_COUNT) * capacity *
+        static_cast<size_t>(config->block_count) * capacity *
         KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
     size_t score_elements =
-        static_cast<size_t>(KIPP_ATTENTION_HEAD_COUNT) * capacity;
+        static_cast<size_t>(config->attention_head_count) * capacity;
 
     cuda_backend_session *session =
         static_cast<cuda_backend_session *>(calloc(1, sizeof(*session)));
@@ -200,12 +202,11 @@ cuda_session_new(cuda_backend_model *model, uint32_t capacity,
             0 ||
         cuda_allocate(&session->value_cache, slab_elements, "value cache",
                       error) != 0 ||
-        cuda_allocate(&session->x, KIPP_EMBEDDING_LENGTH, "residual scratch",
-                      error) != 0 ||
-        cuda_allocate(&session->normalized, KIPP_EMBEDDING_LENGTH,
+        cuda_allocate(&session->x, config->embedding_length,
+                      "residual scratch", error) != 0 ||
+        cuda_allocate(&session->normalized, config->embedding_length,
                       "normalization scratch", error) != 0 ||
-        cuda_allocate(&session->query,
-                      KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
+        cuda_allocate(&session->query, config->attention_width,
                       "query scratch", error) != 0 ||
         cuda_allocate(&session->key,
                       KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
@@ -213,14 +214,13 @@ cuda_session_new(cuda_backend_model *model, uint32_t capacity,
         cuda_allocate(&session->value,
                       KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
                       "value scratch", error) != 0 ||
-        cuda_allocate(&session->attention,
-                      KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
+        cuda_allocate(&session->attention, config->attention_width,
                       "attention scratch", error) != 0 ||
-        cuda_allocate(&session->projection, KIPP_EMBEDDING_LENGTH,
+        cuda_allocate(&session->projection, config->embedding_length,
                       "projection scratch", error) != 0 ||
-        cuda_allocate(&session->gate, KIPP_FEED_FORWARD_LENGTH, "gate scratch",
-                      error) != 0 ||
-        cuda_allocate(&session->up, KIPP_FEED_FORWARD_LENGTH, "up scratch",
+        cuda_allocate(&session->gate, config->feed_forward_length,
+                      "gate scratch", error) != 0 ||
+        cuda_allocate(&session->up, config->feed_forward_length, "up scratch",
                       error) != 0 ||
         cuda_allocate(&session->scores, score_elements, "attention scores",
                       error) != 0 ||
@@ -289,7 +289,9 @@ static int cuda_model_tensor_span(const kipp_model_view *view,
     } while (0)
 
     INCLUDE_TENSOR(view->weights.token_embedding);
-    for (uint32_t index = 0; index < KIPP_BLOCK_COUNT; ++index) {
+    /* Aliases token_embedding when tied; otherwise the separate head. */
+    INCLUDE_TENSOR(view->weights.lm_head);
+    for (uint32_t index = 0; index < view->config.block_count; ++index) {
         const kipp_qwen3_layer_weights *layer = &view->weights.layers[index];
         INCLUDE_TENSOR(layer->attention_norm);
         INCLUDE_TENSOR(layer->attention_q);
@@ -338,49 +340,53 @@ static int cuda_encode_token(cuda_backend_model *model,
                              float *host_logits, kipp_error *error) {
     cudaStream_t stream = session->stream;
     const kipp_qwen3_weights *weights = &model->view->weights;
+    const kipp_model_config *config = &model->view->config;
+    const uint32_t embed = config->embedding_length;
+    const uint32_t attention_width = config->attention_width;
+    const uint32_t feed_forward = config->feed_forward_length;
     if (cuda_check_launch(
             kipp_cuda_launch_embed(cuda_tensor(model, &weights->token_embedding),
-                                   session->x, token, stream),
+                                   session->x, token, embed, stream),
             "embedding launch", error) != 0) {
         return -1;
     }
 
-    for (uint32_t layer_index = 0; layer_index < KIPP_BLOCK_COUNT;
+    for (uint32_t layer_index = 0; layer_index < config->block_count;
          ++layer_index) {
         const kipp_qwen3_layer_weights *layer =
             &weights->layers[layer_index];
         if (cuda_check_launch(
                 kipp_cuda_launch_rms_norm(
                     session->x, cuda_tensor(model, &layer->attention_norm),
-                    session->normalized, KIPP_EMBEDDING_LENGTH,
+                    session->normalized, embed,
                     KIPP_CUDA_RMS_EPSILON, stream),
                 "attention RMSNorm launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
                     cuda_tensor(model, &layer->attention_q),
-                    session->normalized, session->query,
-                    KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-                    KIPP_EMBEDDING_LENGTH, stream),
+                    session->normalized, session->query, attention_width,
+                    embed, stream),
                 "query projection launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
                     cuda_tensor(model, &layer->attention_k),
                     session->normalized, session->key,
                     KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-                    KIPP_EMBEDDING_LENGTH, stream),
+                    embed, stream),
                 "key projection launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
                     cuda_tensor(model, &layer->attention_v),
                     session->normalized, session->value,
                     KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-                    KIPP_EMBEDDING_LENGTH, stream),
+                    embed, stream),
                 "value projection launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_head_norm(
                     session->query,
                     cuda_tensor(model, &layer->attention_q_norm),
-                    KIPP_ATTENTION_HEAD_COUNT, KIPP_CUDA_RMS_EPSILON, stream),
+                    config->attention_head_count, KIPP_CUDA_RMS_EPSILON,
+                    stream),
                 "query head norm launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_head_norm(
@@ -391,13 +397,13 @@ static int cuda_encode_token(cuda_backend_model *model,
                 "key head norm launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_rope(session->query,
-                                      KIPP_ATTENTION_HEAD_COUNT, position,
-                                      KIPP_CUDA_ROPE_THETA, stream),
+                                      config->attention_head_count, position,
+                                      config->rope_theta, stream),
                 "query RoPE launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_rope(session->key,
                                       KIPP_ATTENTION_HEAD_COUNT_KV, position,
-                                      KIPP_CUDA_ROPE_THETA, stream),
+                                      config->rope_theta, stream),
                 "key RoPE launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_kv_write(
@@ -409,54 +415,50 @@ static int cuda_encode_token(cuda_backend_model *model,
                 kipp_cuda_launch_cached_gqa(
                     session->query, session->key_cache, session->value_cache,
                     session->scores, session->attention, layer_index, position,
-                    session->capacity, stream),
+                    session->capacity, config->attention_head_count, stream),
                 "cached GQA launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
                     cuda_tensor(model, &layer->attention_output),
-                    session->attention, session->projection,
-                    KIPP_EMBEDDING_LENGTH,
-                    KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-                    stream),
+                    session->attention, session->projection, embed,
+                    attention_width, stream),
                 "attention output launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_residual(
-                    session->x, session->projection, KIPP_EMBEDDING_LENGTH,
-                    stream),
+                    session->x, session->projection, embed, stream),
                 "attention residual launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_rms_norm(
                     session->x,
                     cuda_tensor(model, &layer->feed_forward_norm),
-                    session->normalized, KIPP_EMBEDDING_LENGTH,
+                    session->normalized, embed,
                     KIPP_CUDA_RMS_EPSILON, stream),
                 "feed-forward RMSNorm launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
                     cuda_tensor(model, &layer->feed_forward_gate),
-                    session->normalized, session->gate,
-                    KIPP_FEED_FORWARD_LENGTH, KIPP_EMBEDDING_LENGTH, stream),
+                    session->normalized, session->gate, feed_forward, embed,
+                    stream),
                 "gate projection launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
                     cuda_tensor(model, &layer->feed_forward_up),
-                    session->normalized, session->up,
-                    KIPP_FEED_FORWARD_LENGTH, KIPP_EMBEDDING_LENGTH, stream),
+                    session->normalized, session->up, feed_forward, embed,
+                    stream),
                 "up projection launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_swiglu(session->gate, session->up,
-                                        KIPP_FEED_FORWARD_LENGTH, stream),
+                                        feed_forward, stream),
                 "SwiGLU launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
                     cuda_tensor(model, &layer->feed_forward_down),
-                    session->gate, session->projection,
-                    KIPP_EMBEDDING_LENGTH, KIPP_FEED_FORWARD_LENGTH, stream),
+                    session->gate, session->projection, embed, feed_forward,
+                    stream),
                 "down projection launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_residual(
-                    session->x, session->projection, KIPP_EMBEDDING_LENGTH,
-                    stream),
+                    session->x, session->projection, embed, stream),
                 "feed-forward residual launch", error) != 0) {
             return -1;
         }
@@ -466,14 +468,14 @@ static int cuda_encode_token(cuda_backend_model *model,
         if (cuda_check_launch(
                 kipp_cuda_launch_rms_norm(
                     session->x, cuda_tensor(model, &weights->output_norm),
-                    session->normalized, KIPP_EMBEDDING_LENGTH,
+                    session->normalized, embed,
                     KIPP_CUDA_RMS_EPSILON, stream),
                 "output RMSNorm launch", error) != 0 ||
             cuda_check_launch(
                 kipp_cuda_launch_matvec(
-                    cuda_tensor(model, &weights->token_embedding),
+                    cuda_tensor(model, &weights->lm_head),
                     session->normalized, session->logits, KIPP_VOCAB_SIZE,
-                    KIPP_EMBEDDING_LENGTH, stream),
+                    embed, stream),
                 "logit projection launch", error) != 0) {
             return -1;
         }
@@ -500,6 +502,10 @@ static int cuda_model_create(const kipp_model_view *view, void **backend_model,
                          "CUDA model arguments are required");
     }
     *backend_model = NULL;
+    if (view->config.quant_scheme != KIPP_QUANT_BF16) {
+        return cuda_fail(error, KIPP_ERROR_UNSUPPORTED,
+                         "the CUDA backend supports BF16 weights only");
+    }
 
     int device = 0;
     cudaError_t status = cudaGetDevice(&device);
@@ -539,7 +545,7 @@ static int cuda_model_create(const kipp_model_view *view, void **backend_model,
     }
     uint64_t required_bytes =
         static_cast<uint64_t>(span_bytes) +
-        cuda_session_device_bytes(KIPP_CUDA_ORACLE_CAPACITY);
+        cuda_session_device_bytes(&view->config, KIPP_CUDA_ORACLE_CAPACITY);
     if (required_bytes > free_bytes) {
         cuda_fail(error, KIPP_ERROR_MEMORY,
                   "CUDA model requires %llu device bytes but only %zu of %zu "
@@ -629,6 +635,24 @@ static int cuda_session_reset(void *backend_session, kipp_error *error) {
     return 0;
 }
 
+static int cuda_session_truncate(void *backend_session, uint32_t length,
+                                 kipp_error *error) {
+    cuda_clear_error(error);
+    if (backend_session == NULL) {
+        return cuda_fail(error, KIPP_ERROR_ARGUMENT,
+                         "CUDA session is required");
+    }
+    cuda_backend_session *session =
+        static_cast<cuda_backend_session *>(backend_session);
+    if (length > session->length) {
+        return cuda_fail(error, KIPP_ERROR_RANGE,
+                         "cannot truncate CUDA session of length %u to %u",
+                         session->length, length);
+    }
+    session->length = length;
+    return 0;
+}
+
 static int cuda_eval(void *backend_model, kipp_eval_item *items,
                      size_t item_count, kipp_error *error) {
     cuda_clear_error(error);
@@ -649,6 +673,10 @@ static int cuda_eval(void *backend_model, kipp_eval_item *items,
             item->logits == NULL) {
             return cuda_fail(error, KIPP_ERROR_ARGUMENT,
                              "CUDA evaluation item is incomplete");
+        }
+        if (item->logits_count > 1) {
+            return cuda_fail(error, KIPP_ERROR_UNSUPPORTED,
+                             "CUDA backend writes only the final logits");
         }
         for (uint32_t token_index = 0; token_index < item->token_count;
              ++token_index) {
@@ -710,11 +738,16 @@ static int cuda_eval(void *backend_model, kipp_eval_item *items,
 
 extern "C" const kipp_backend_ops *kipp_cuda_backend_operations(void) {
     static const kipp_backend_ops operations = {
-        cuda_model_create,   cuda_model_destroy, cuda_session_create,
+        cuda_model_create,    cuda_model_destroy, cuda_session_create,
         cuda_session_destroy, cuda_session_reset, cuda_eval,
+        cuda_session_truncate,
     };
     return &operations;
 }
+
+/* Operator tests run without a model; they use the 4B dimensions. */
+constexpr uint32_t KIPP_CUDA_TEST_EMBED = 2560u;
+constexpr uint32_t KIPP_CUDA_TEST_Q_HEADS = 32u;
 
 static uint16_t cuda_test_float_to_bf16(float value) {
     uint32_t bits;
@@ -818,13 +851,13 @@ static int cuda_test_bf16(cudaStream_t stream, kipp_error *error) {
 }
 
 static int cuda_test_embedding(cudaStream_t stream, kipp_error *error) {
-    const size_t count = 2u * KIPP_EMBEDDING_LENGTH;
+    const size_t count = 2u * KIPP_CUDA_TEST_EMBED;
     uint16_t *embedding =
         static_cast<uint16_t *>(calloc(count, sizeof(*embedding)));
     float *actual = static_cast<float *>(
-        malloc(KIPP_EMBEDDING_LENGTH * sizeof(*actual)));
+        malloc(KIPP_CUDA_TEST_EMBED * sizeof(*actual)));
     float *expected = static_cast<float *>(
-        malloc(KIPP_EMBEDDING_LENGTH * sizeof(*expected)));
+        malloc(KIPP_CUDA_TEST_EMBED * sizeof(*expected)));
     if (embedding == NULL || actual == NULL || expected == NULL) {
         free(embedding);
         free(actual);
@@ -832,8 +865,8 @@ static int cuda_test_embedding(cudaStream_t stream, kipp_error *error) {
         return cuda_fail(error, KIPP_ERROR_MEMORY,
                          "CUDA embedding test allocation failed");
     }
-    for (uint32_t index = 0; index < KIPP_EMBEDDING_LENGTH; ++index) {
-        embedding[KIPP_EMBEDDING_LENGTH + index] =
+    for (uint32_t index = 0; index < KIPP_CUDA_TEST_EMBED; ++index) {
+        embedding[KIPP_CUDA_TEST_EMBED + index] =
             cuda_test_float_to_bf16(2.0f);
         expected[index] = 2.0f;
     }
@@ -842,19 +875,19 @@ static int cuda_test_embedding(cudaStream_t stream, kipp_error *error) {
     int result = 0;
     if (device_embedding.allocate(count, "embedding test weights", error) !=
             0 ||
-        device_output.allocate(KIPP_EMBEDDING_LENGTH, "embedding test output",
+        device_output.allocate(KIPP_CUDA_TEST_EMBED, "embedding test output",
                                error) != 0 ||
         device_embedding.upload(embedding, count, "embedding test upload",
                                 error) != 0 ||
         cuda_check_launch(kipp_cuda_launch_embed(
                               device_embedding.get(), device_output.get(), 1,
-                              stream),
+                              KIPP_CUDA_TEST_EMBED, stream),
                           "embedding test launch", error) != 0 ||
-        device_output.download(actual, KIPP_EMBEDDING_LENGTH, stream,
+        device_output.download(actual, KIPP_CUDA_TEST_EMBED, stream,
                                "embedding test download", error) != 0 ||
         cuda_test_sync(stream, error) != 0 ||
         cuda_expect_near("embedding", actual, expected,
-                         KIPP_EMBEDDING_LENGTH, 0.0f, error) != 0) {
+                         KIPP_CUDA_TEST_EMBED, 0.0f, error) != 0) {
         result = -1;
     }
     free(embedding);
@@ -1030,7 +1063,7 @@ static int cuda_test_kv_gqa(cudaStream_t stream, kipp_error *error) {
     constexpr size_t state_values =
         KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
     constexpr size_t query_values =
-        KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM;
+        KIPP_CUDA_TEST_Q_HEADS * KIPP_ATTENTION_HEAD_DIM;
     float key[state_values] = {0.0f};
     float value[state_values] = {0.0f};
     float query[query_values] = {0.0f};
@@ -1053,7 +1086,7 @@ static int cuda_test_kv_gqa(cudaStream_t stream, kipp_error *error) {
             0 ||
         device_value_cache.allocate(kv_values, "GQA test value cache", error) !=
             0 ||
-        device_scores.allocate(KIPP_ATTENTION_HEAD_COUNT * capacity,
+        device_scores.allocate(KIPP_CUDA_TEST_Q_HEADS * capacity,
                                "GQA test scores", error) != 0 ||
         device_output.allocate(query_values, "GQA test output", error) != 0 ||
         device_key.upload(key, state_values, "KV key upload", error) != 0 ||
@@ -1083,14 +1116,15 @@ static int cuda_test_kv_gqa(cudaStream_t stream, kipp_error *error) {
         cuda_check_launch(kipp_cuda_launch_cached_gqa(
                               device_query.get(), device_key_cache.get(),
                               device_value_cache.get(), device_scores.get(),
-                              device_output.get(), 0, 1, capacity, stream),
+                              device_output.get(), 0, 1, capacity,
+                              KIPP_CUDA_TEST_Q_HEADS, stream),
                           "GQA test launch", error) != 0 ||
         device_output.download(actual, query_values, stream,
                                "GQA test download", error) != 0 ||
         cuda_test_sync(stream, error) != 0) {
         return -1;
     }
-    for (uint32_t head = 0; head < KIPP_ATTENTION_HEAD_COUNT; ++head) {
+    for (uint32_t head = 0; head < KIPP_CUDA_TEST_Q_HEADS; ++head) {
         size_t base = static_cast<size_t>(head) * KIPP_ATTENTION_HEAD_DIM;
         if (fabsf(actual[base] - 2.0f) > 1.0e-6f) {
             return cuda_fail(error, KIPP_ERROR_INTERNAL,

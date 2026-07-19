@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inspiration notes — Kipp</title>
+  <meta name="description" content="Reference repositories and provenance rules.">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="../index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="../index.html">Home</a>
+        <a href="../architecture.html">Architecture</a>
+        <a href="../roadmap.html">Roadmap</a>
+        <a href="../model-support.html">Models</a>
+        <a href="../benchmarks.html">Benchmarks</a>
+        <a href="../contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Inspiration Notes</h1>
+<p>These repositories are architecture references only. Kipp must not vendor or
+copy their code. Before adapting anything beyond a general idea, inspect the
+source file and its repository license, preserve required notices, and record
+the provenance explicitly.</p>
+<h2>antirez/ds4</h2>
+<p>Study the narrow, model-specific native-engine structure; readable C core;
+isolated Metal and CUDA paths; mmap-oriented loading; KV-cache design; and
+model-aware quantization decisions.</p>
+<h2>ggml-org/llama.cpp and ggml-org/ggml</h2>
+<p>Study GGUF metadata and tensor layout, quantization formats and kernels,
+backend boundaries, and portable low-level tensor representations. Kipp will
+support only the subset required by its chosen model.</p>
+<h2>ggml-org/whisper.cpp</h2>
+<p>Study how a deliberately narrow C engine keeps model loading, inference, and
+platform acceleration understandable without becoming a generic runtime.</p>
+<h2>karpathy/llm.c</h2>
+<p>Study naming, file organization, direct C/CUDA implementations, and the use
+of small reference paths to make low-level numerical code approachable.</p>
+<h2>GeeeekExplorer/nano-vllm</h2>
+<p>Study the concepts behind paged attention, request lifecycle, continuous
+batching, and KV-cache ownership. Reimplement any selected ideas natively.</p>
+<h2>vllm-project/vllm and sgl-project/sglang</h2>
+<p>Study scheduler behavior, memory management, prefix reuse, and serving
+semantics. Treat their breadth as research material, not Kipp's initial scope.</p>
+<h2>Research workflow</h2>
+<p>Once Nia is configured manually, index every repository listed in
+<code>.cursor/commands/nia.md</code>. Notes derived from source research should name the
+repository, file, revision, and applicable license.</p>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
+</body>
+</html>

@@ -3,6 +3,7 @@
 #endif
 
 #include "kipp.h"
+#include "kipp_spec.h"
 
 #include <errno.h>
 #include <math.h>
@@ -10,6 +11,139 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#define KIPP_CLI_MAX_DRAFT 8u
+
+static uint32_t argmax_logits(const float *logits) {
+    uint32_t best = 0;
+    for (uint32_t token = 1; token < KIPP_VOCAB_SIZE; ++token) {
+        if (logits[token] > logits[best]) {
+            best = token;
+        }
+    }
+    return best;
+}
+
+static int emit_token(const kipp_model *model, uint32_t token,
+                      size_t *decoded, kipp_error *error) {
+    char *piece = NULL;
+    size_t piece_length = 0;
+    if (kipp_detokenize(model, &token, 1, &piece, &piece_length, error) != 0) {
+        return -1;
+    }
+    (void)fwrite(piece, 1, piece_length, stdout);
+    (void)fflush(stdout);
+    kipp_text_free(piece);
+    ++*decoded;
+    return 0;
+}
+
+/*
+ * Greedy self-speculative decode: each step drafts the continuation via
+ * prompt-lookup, verifies the whole draft in one multi-logit forward, and
+ * accepts the longest greedy-matching prefix. The emitted sequence is exactly
+ * the plain greedy sequence — only fewer forward passes produce it.
+ */
+static int run_spec_decode(kipp_model *model, kipp_session *session,
+                           float *logits, const uint32_t *prompt,
+                           size_t prompt_len, size_t decode_count,
+                           size_t *out_decoded, uint64_t *out_drafted,
+                           uint64_t *out_accepted, kipp_error *error) {
+    size_t capacity = prompt_len + decode_count + KIPP_CLI_MAX_DRAFT + 1;
+    uint32_t *hist = malloc(capacity * sizeof(*hist));
+    float *rows = malloc((size_t)(KIPP_CLI_MAX_DRAFT + 1) * KIPP_VOCAB_SIZE *
+                         sizeof(*rows));
+    uint32_t drafts[KIPP_CLI_MAX_DRAFT];
+    uint32_t feed[KIPP_CLI_MAX_DRAFT + 1];
+    if (hist == NULL || rows == NULL) {
+        free(hist);
+        free(rows);
+        fprintf(stderr, "kipp: unable to allocate speculative buffers\n");
+        (void)error;
+        return -1;
+    }
+    memcpy(hist, prompt, prompt_len * sizeof(*hist));
+    size_t hlen = prompt_len;       /* committed tokens (prompt + emitted) */
+    uint32_t next_tok = argmax_logits(logits); /* token for position hlen */
+    int status = -1;
+
+    while (*out_decoded < decode_count) {
+        if (kipp_model_is_stop_token(model, next_tok)) {
+            break;
+        }
+        if (emit_token(model, next_tok, out_decoded, error) != 0) {
+            goto done;
+        }
+        hist[hlen++] = next_tok;
+        if (*out_decoded >= decode_count) {
+            break;
+        }
+        size_t k = kipp_spec_prompt_lookup(hist, hlen, 3, 1,
+                                           KIPP_CLI_MAX_DRAFT, drafts);
+        if (k == 0) {
+            /* No draft: a single ordinary step. */
+            if (kipp_session_eval(session, &next_tok, 1, logits,
+                                  KIPP_VOCAB_SIZE, error) != 0) {
+                goto done;
+            }
+            next_tok = argmax_logits(logits);
+            continue;
+        }
+        feed[0] = next_tok;
+        memcpy(feed + 1, drafts, k * sizeof(*drafts));
+        if (kipp_session_eval_n(session, feed, k + 1, rows, (uint32_t)(k + 1),
+                                error) != 0) {
+            goto done;
+        }
+        *out_drafted += k;
+        /* Accept drafts while each equals the greedy argmax of its row. */
+        size_t accepted = 0;
+        int finished = 0;
+        for (size_t i = 0; i < k; ++i) {
+            uint32_t correct = argmax_logits(rows + i * KIPP_VOCAB_SIZE);
+            if (correct != drafts[i]) {
+                break;
+            }
+            if (kipp_model_is_stop_token(model, drafts[i])) {
+                finished = 1;
+                ++accepted;
+                break;
+            }
+            if (emit_token(model, drafts[i], out_decoded, error) != 0) {
+                goto done;
+            }
+            hist[hlen++] = drafts[i];
+            ++accepted;
+            *out_accepted += 1;
+            if (*out_decoded >= decode_count) {
+                finished = 1;
+                break;
+            }
+        }
+        /* The verify appended next_tok + all k drafts to the KV; keep only
+         * next_tok + the accepted drafts and drop the rest. */
+        kipp_session_info info;
+        if (kipp_session_get_info(session, &info) != 0) {
+            goto done;
+        }
+        uint32_t keep = info.length - (uint32_t)(k - accepted);
+        if (kipp_session_truncate(session, keep, error) != 0) {
+            goto done;
+        }
+        if (finished) {
+            break;
+        }
+        /* Next token: the correction at the first mismatch, or the bonus
+         * argmax after the last accepted draft. */
+        next_tok = argmax_logits(rows + accepted * KIPP_VOCAB_SIZE);
+    }
+    status = 0;
+
+done:
+    free(hist);
+    free(rows);
+    return status;
+}
 
 static void usage(const char *program) {
     fprintf(stderr,
@@ -20,6 +154,10 @@ static void usage(const char *program) {
             "  [--temperature F]           0 = greedy argmax (default)\n"
             "  [--top-p F]                 nucleus mass, 0 < F <= 1 "
             "(default 1)\n"
+            "  [--top-k N]                 keep N highest logits "
+            "(0 = off)\n"
+            "  [--min-p F]                 min prob vs top, 0 <= F <= 1 "
+            "(0 = off)\n"
             "  [--seed N]                  nonzero sampling seed "
             "(default 1)\n"
             "  [--top N]                   final top-N logits to print "
@@ -62,6 +200,9 @@ int main(int argc, char **argv) {
     size_t decode_count = 0;
     float temperature = 0.0f;
     float top_p = 1.0f;
+    size_t top_k = 0;
+    float min_p = 0.0f;
+    int spec = 0;
     uint64_t rng_state = 1;
     kipp_backend_kind backend = KIPP_BACKEND_CPU;
     kipp_model *model = NULL;
@@ -87,7 +228,7 @@ int main(int argc, char **argv) {
             continue;
         } else if (strcmp(argv[index], "--decode") == 0 &&
                    index + 1 < argc &&
-                   parse_count(argv[++index], KIPP_CONTEXT_LENGTH,
+                   parse_count(argv[++index], 1u << 20,
                                &decode_count) == 0) {
             continue;
         } else if (strcmp(argv[index], "--temperature") == 0 &&
@@ -98,6 +239,16 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[index], "--top-p") == 0 && index + 1 < argc &&
                    parse_float(argv[++index], &top_p) == 0 &&
                    top_p > 0.0f && top_p <= 1.0f) {
+            continue;
+        } else if (strcmp(argv[index], "--top-k") == 0 && index + 1 < argc &&
+                   parse_count(argv[++index], KIPP_VOCAB_SIZE, &top_k) == 0) {
+            continue;
+        } else if (strcmp(argv[index], "--min-p") == 0 && index + 1 < argc &&
+                   parse_float(argv[++index], &min_p) == 0 &&
+                   min_p >= 0.0f && min_p <= 1.0f) {
+            continue;
+        } else if (strcmp(argv[index], "--spec") == 0) {
+            spec = 1;
             continue;
         } else if (strcmp(argv[index], "--seed") == 0 && index + 1 < argc) {
             size_t seed = 0;
@@ -136,6 +287,11 @@ int main(int argc, char **argv) {
                 error.message);
         goto cleanup;
     }
+    kipp_model_info info;
+    if (kipp_model_get_info(model, &info) != 0) {
+        fprintf(stderr, "kipp: unable to read model info\n");
+        goto cleanup;
+    }
     if (kipp_tokenize(model, prompt, &tokens, &error) != 0) {
         fprintf(stderr, "kipp: tokenize: %s\n", error.message);
         goto cleanup;
@@ -144,8 +300,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "kipp: prompt produced no tokens\n");
         goto cleanup;
     }
-    if (tokens.count > KIPP_CONTEXT_LENGTH ||
-        decode_count > KIPP_CONTEXT_LENGTH - tokens.count ||
+    if (tokens.count > info.context_length ||
+        decode_count > info.context_length - tokens.count ||
         kipp_session_create(model, (uint32_t)(tokens.count + decode_count),
                             &session,
                             &error) != 0) {
@@ -159,8 +315,9 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    fprintf(stderr, "kipp: evaluating %zu token%s on %s\n", tokens.count,
-            tokens.count == 1 ? "" : "s", kipp_backend_name(backend));
+    fprintf(stderr, "kipp: evaluating %zu token%s of %s on %s\n",
+            tokens.count, tokens.count == 1 ? "" : "s", info.checkpoint_id,
+            kipp_backend_name(backend));
     (void)clock_gettime(CLOCK_MONOTONIC, &started);
     if (kipp_session_eval(session, tokens.data, tokens.count, logits,
                           KIPP_VOCAB_SIZE, &error) != 0) {
@@ -171,17 +328,42 @@ int main(int argc, char **argv) {
     prefill_seconds = elapsed_seconds(started, finished);
 
     size_t decoded_count = 0;
-    if (decode_count != 0) {
+    uint64_t spec_drafted = 0;
+    uint64_t spec_accepted = 0;
+    if (decode_count != 0 && spec) {
+        if (temperature > 0.0f) {
+            fprintf(stderr,
+                    "kipp: --spec requires greedy decoding (temperature 0)\n");
+            goto cleanup;
+        }
+        fputs("generated\t", stdout);
+        (void)clock_gettime(CLOCK_MONOTONIC, &started);
+        if (run_spec_decode(model, session, logits, tokens.data, tokens.count,
+                            decode_count, &decoded_count, &spec_drafted,
+                            &spec_accepted, &error) != 0) {
+            fprintf(stderr, "kipp: spec decode: %s\n", error.message);
+            goto cleanup;
+        }
+        (void)clock_gettime(CLOCK_MONOTONIC, &finished);
+        decode_seconds = elapsed_seconds(started, finished);
+        putchar('\n');
+    } else if (decode_count != 0) {
         fputs("generated\t", stdout);
         (void)clock_gettime(CLOCK_MONOTONIC, &started);
         for (size_t index = 0; index < decode_count; ++index) {
             uint32_t token;
-            if (kipp_sample(logits, KIPP_VOCAB_SIZE, temperature, top_p,
-                            &rng_state, &token, &error) != 0) {
+            kipp_sample_params sp = {0};
+            sp.temperature = temperature;
+            sp.top_p = top_p;
+            sp.top_k = (uint32_t)top_k;
+            sp.min_p = min_p;
+            sp.repetition_penalty = 1.0f;
+            if (kipp_sample_ex(logits, KIPP_VOCAB_SIZE, &sp, &rng_state,
+                               &token, &error) != 0) {
                 fprintf(stderr, "kipp: sample: %s\n", error.message);
                 goto cleanup;
             }
-            if (token == KIPP_EOS_TOKEN_ID) {
+            if (kipp_model_is_stop_token(model, token)) {
                 break;
             }
             char *piece = NULL;
@@ -238,6 +420,14 @@ int main(int argc, char **argv) {
             "prefill_seconds=%.9f decode_tokens=%zu decode_seconds=%.9f\n",
             kipp_backend_name(backend), tokens.count, prefill_seconds,
             decoded_count, decode_seconds);
+    if (spec) {
+        fprintf(stderr,
+                "KIPP_SPEC drafted=%llu accepted=%llu accept_rate=%.3f\n",
+                (unsigned long long)spec_drafted,
+                (unsigned long long)spec_accepted,
+                spec_drafted == 0 ? 0.0
+                                  : (double)spec_accepted / (double)spec_drafted);
+    }
     exit_code = 0;
 
 cleanup:

@@ -1,137 +1,128 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Roadmap — Kipp</title>
-<meta name="description" content="Kipp's five development phases, from model selection to serving.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9889;</text></svg>">
-<style>
-:root{
-  --bg:#0b0e14; --panel:#11151f; --panel2:#151a26; --border:#232a3a;
-  --text:#e6e9ef; --muted:#9aa3b2; --faint:#7c8698;
-  --accent:#6366f1; --accent2:#22d3ee;
-  --code-bg:#0d1118; --good:#34d399; --warn:#fbbf24;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
-a{color:var(--accent2);text-decoration:none}
-a:hover{text-decoration:underline}
-code,pre{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:.9em}
-code{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:.12em .4em}
-pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto;line-height:1.55}
-pre code{background:none;border:none;padding:0}
-.wrap{max-width:960px;margin:0 auto;padding:0 24px}
-header.site{position:sticky;top:0;z-index:10;background:rgba(11,14,20,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
-header.site .wrap{display:flex;align-items:center;gap:22px;height:60px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--text)}
-.brand:hover{text-decoration:none}
-.brand .mark{display:inline-block;width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
-nav.top{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
-nav.top a{color:var(--muted);padding:6px 11px;border-radius:8px;font-size:14px}
-nav.top a:hover{color:var(--text);background:var(--panel2);text-decoration:none}
-nav.top a.active{color:var(--text);background:var(--panel2);border:1px solid var(--border)}
-main{padding:48px 0 24px}
-.hero{text-align:center;padding:56px 0 8px}
-.hero img{max-width:420px;width:90%}
-.hero p.tag{margin:18px auto 0;max-width:640px;font-size:19px;color:var(--muted)}
-.hero .cta{margin-top:28px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
-.btn{display:inline-block;padding:10px 20px;border-radius:10px;font-weight:600;font-size:15px;border:1px solid var(--border);color:var(--text);background:var(--panel2)}
-.btn:hover{text-decoration:none;border-color:var(--accent)}
-.btn.primary{background:linear-gradient(135deg,var(--accent),#4f46e5);border-color:transparent}
-.btn.primary:hover{filter:brightness(1.12)}
-.notice{margin:36px 0;padding:14px 18px;border:1px solid var(--warn);border-left-width:4px;border-radius:10px;background:rgba(251,191,36,.06);color:var(--text);font-size:15px}
-h1{font-size:34px;letter-spacing:-.5px;margin-bottom:8px}
-h2{font-size:24px;margin:44px 0 14px;letter-spacing:-.3px}
-h2 .h-mark{color:var(--accent2);margin-right:8px}
-h3{font-size:18px;margin:28px 0 10px}
-p{margin:12px 0;color:var(--text)}
-p.lead{color:var(--muted);font-size:17px}
-ul,ol{margin:12px 0 12px 24px;color:var(--text)}
-li{margin:6px 0}
-li::marker{color:var(--accent2)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin:24px 0}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px 22px}
-.card h3{margin:0 0 8px;font-size:16px}
-.card p{margin:0;color:var(--muted);font-size:14.5px}
-table{width:100%;border-collapse:collapse;margin:18px 0;font-size:15px}
-th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border)}
-th{color:var(--faint);font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:1px}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid var(--border)}
-.pill.todo{color:var(--warn);border-color:rgba(251,191,36,.4)}
-.pill.ref{color:var(--good);border-color:rgba(52,211,153,.4)}
-.tree{color:var(--muted)}
-.tree b{color:var(--text)}
-footer.site{margin-top:72px;border-top:1px solid var(--border);padding:28px 0 40px;color:var(--faint);font-size:14px}
-footer.site .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
-footer.site a{color:var(--muted)}
-blockquote{border-left:3px solid var(--accent);padding:4px 18px;margin:16px 0;color:var(--muted)}
-@media (max-width:640px){header.site .wrap{height:auto;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Roadmap — Kipp</title>
+  <meta name="description" content="Correctness-gated implementation phases and delivered extensions.">
+  <link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
-<header class="site"><div class="wrap">
-  <a class="brand" href="index.html"><span class="mark"></span>Kipp</a>
-  <nav class="top"><a href="index.html">Home</a><a href="architecture.html">Architecture</a><a href="roadmap.html" class="active">Roadmap</a><a href="model-support.html">Model Support</a><a href="benchmarks.html">Benchmarks</a><a href="contributing.html">Contributing</a><a href="https://github.com/Polished-Snow/Kipp">GitHub &#8599;</a></nav>
-</div></header>
-<main><div class="wrap">
-
-<h1>Roadmap</h1>
-<p class="lead">The order below is provisional until the first target model family is chosen. Correctness gates each phase; dates and performance claims are intentionally absent.</p>
-
-<h2><span class="h-mark">0</span>Select and specify the model</h2>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="index.html">Home</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="roadmap.html" aria-current="page">Roadmap</a>
+        <a href="model-support.html">Models</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Kipp Roadmap</h1>
+<p>This sequence is binding unless <code>ARCHITECTURE.md</code> is explicitly revised.
+Correctness gates every phase; dates and speculative performance claims are
+intentionally absent.</p>
+<p><strong>Status (v0.0.2):</strong> This release expands Kipp from the single pinned
+checkpoint of v0.0.1 to the <strong>Qwen3 dense family</strong> (0.6B–32B, base +
+instruct) behind a strict compiled-in checkpoint registry, with the BF16
+reference path still byte-identical to v0.0.1. It adds Q8_0 and 4-bit affine
+quantization (CPU + Metal, bit-accurate); an OpenAI Completions <strong>and</strong> Chat
+Completions server (native Qwen3 ChatML, full sampling pack, generated-token
+logprobs, <code>stream_options.include_usage</code>, <code>timings</code>, Prometheus <code>/metrics</code>)
+on a FIFO event-loop scheduler with chunked prefill, admission control, and
+continuous batching (<code>kipp_eval_batch</code>, gated batched-equals-isolated);
+multi-logit evaluation (<code>kipp_session_eval_n</code>) and greedy prompt-lookup
+speculative decoding (token-identical to plain greedy); and <strong>paged KV</strong> on
+both the CPU oracle and the Metal backend — a per-session 32-position block
+table gated bitwise-equal to the contiguous layout (<code>--paged-cpu</code>,
+<code>--paged-metal</code>). Everything is gated on Apple M5 (CPU + Metal); the whole
+family plus quantization is additionally validated on NVIDIA A100 via
+ephemeral cloud runs. Still deferred: the cross-request KV block pool
+(<code>src/kipp_kv_pool.c</code> exists and is unit-tested but not yet wired into the
+backends), Metal flash-attention prefill, and quantized KV.</p>
+<p><strong>v2 expansion (approved 2026-07-16):</strong> scope grew from one pinned
+checkpoint to the pinned Qwen3 dense family via a compiled-in registry
+(<code>src/kipp_checkpoints.h</code>); dimensions, context, RoPE theta, embedding
+tying, and stop tokens became per-checkpoint runtime configuration with the
+4B refactor gated byte-identical.</p>
+<p>Delivered since: validated checkpoints spanning Qwen3 dense 0.6B through
+32B on CPU plus a GPU backend (Metal on M5, CUDA on a Verda A100);
+<code>/v1/chat/completions</code> with a native ChatML renderer; the full sampling
+surface (top-k, min-p, penalties, logit_bias); a <code>/metrics</code> endpoint; and
+<strong>weight quantization</strong> — Q8_0 (near-lossless, ~1.6x decode, brings 8B
+under the M5 Metal buffer cap) and affine 4-bit gs32 (~2x decode, 2.6x
+smaller, coherent output), both gated on CPU + Metal. Remaining: production
+KV block pooling with cross-request prefix caching, a token-budget scheduler,
+and quantized KV — each behind its own CPU-vs-GPU gate. Prompt-lookup
+speculative decoding and generated-token logprobs are already delivered.</p>
+<h2>Phase 0 — Specify the model</h2>
 <ul>
-  <li>Choose one model family and a deliberately small initial checkpoint set.</li>
-  <li>Confirm model and weight licenses permit the intended distribution.</li>
-  <li>Document tensor shapes, tokenizer behavior, precision, and hardware needs.</li>
-  <li>Replace target-model placeholders and write Kipp's one-line description.</li>
+<li>Pin <code>Qwen/Qwen3-4B-Base</code> and its exact revision.</li>
+<li>Confirm model, tokenizer, and weight licenses.</li>
+<li>Fix tensor shapes, tokenizer behavior, precision, memory, and API boundaries.</li>
 </ul>
-
-<h2><span class="h-mark">1</span>Build the CPU reference path</h2>
+<h2>Phase 1 — Build the CPU reference path</h2>
 <ul>
-  <li>Define the minimal native model format and mmap-backed loader.</li>
-  <li>Implement tokenizer, forward pass, sampling, and deterministic test vectors.</li>
-  <li>Add end-to-end correctness tests for supported checkpoints.</li>
+<li>Convert the pinned BF16 weights into Kipp's strict GGUF subset.</li>
+<li>Implement mmap-backed loading, native tokenization, scalar operators, and
+the readable full-prompt forward pass.</li>
+<li>Pass deterministic full-logit vectors with exact argmax and NMSE at most
+<code>1e-5</code>.</li>
 </ul>
-
-<h2><span class="h-mark">2</span>Add the Metal backend</h2>
+<h2>Phase 2 — Add the KV cache</h2>
 <ul>
-  <li>Define a narrow C-to-Objective-C backend boundary.</li>
-  <li>Implement and validate Apple Silicon kernels against CPU reference outputs.</li>
-  <li>Measure memory use, prefill throughput, and token-generation latency.</li>
+<li>Add bounded contiguous BF16 K/V storage and session lifecycle.</li>
+<li>Match no-cache CPU recomputation for incremental decoding.</li>
 </ul>
-
-<h2><span class="h-mark">3</span>Add isolated CUDA backends</h2>
+<h2>Phase 3 — Add the Metal backend</h2>
 <ul>
-  <li>Implement a generic CUDA path without coupling it to Metal internals.</li>
-  <li>Add a separately tuned <code>cuda-spark</code> configuration if target hardware justifies it.</li>
-  <li>Validate both CUDA targets on actual NVIDIA hardware.</li>
+<li>Implement Apple Silicon kernels behind the fixed backend boundary.</li>
+<li>Validate prefill and decode against CPU on actual Metal hardware.</li>
 </ul>
-
-<h2><span class="h-mark">4</span>Serve and schedule</h2>
+<h2>Phase 4 — Add the CUDA backend</h2>
 <ul>
-  <li>Add minimal OpenAI- and Anthropic-compatible streaming APIs.</li>
-  <li>Introduce batching and KV-cache management only with correctness tests.</li>
-  <li>Define failure behavior, resource limits, and reproducible benchmarks.</li>
+<li>Implement isolated resident-weight CUDA execution.</li>
+<li>Validate on the provided NVIDIA machine; stop if hardware is unavailable.</li>
 </ul>
-
-<h2><span class="h-mark">&#8734;</span>Deferred</h2>
+<h2>Phase 5 — Continuous batching</h2>
 <ul>
-  <li>ROCm/HIP support, on a separate community-maintained branch</li>
-  <li>Additional model families</li>
-  <li>Generic tensor-runtime or arbitrary-GGUF compatibility</li>
-  <li>Broad API parity with llama.cpp, vLLM, or SGLang</li>
+<li>Deliver batched multi-sequence evaluation and a small FIFO scheduler.</li>
+<li>Require batched requests to reproduce isolated execution.</li>
+<li>Keep cross-session KV sharing separate until backend pools, cache-pressure
+admission, cancellation, and eviction are integrated.</li>
 </ul>
-
-</div></main>
-<footer class="site"><div class="wrap">
-  <span>&copy; 2026 Kipp contributors &middot; MIT License</span>
-  <span>
-    <a href="https://github.com/Polished-Snow/Kipp">GitHub</a> &middot;
-    <a href="https://x.com/polished_snow">X / Twitter</a> &middot;
-    <a href="https://www.linkedin.com/company/plsn">LinkedIn</a>
-  </span>
-</div></footer>
+<h2>Phase 6 — Serve</h2>
+<ul>
+<li>Add the approved OpenAI Completions and Chat Completions subset, including
+optional SSE streaming and Prometheus metrics.</li>
+<li>Keep HTTP, scheduling, and backend execution separate.</li>
+</ul>
+<h2>Phase 7 — Explicitly reviewed extensions</h2>
+<p>Delivered through explicit reviews:</p>
+<ul>
+<li>Q8_0 and affine 4-bit weight quantization</li>
+<li>prompt-lookup speculative decoding and multi-row logits</li>
+<li>pinned Qwen3 dense checkpoint registry and native chat rendering</li>
+</ul>
+<p>Still deferred:</p>
+<ul>
+<li>ROCm/HIP support, on a separate community-maintained branch</li>
+<li>additional model families</li>
+<li>generic tensor-runtime or arbitrary-GGUF compatibility</li>
+<li>cross-session prefix/radix caching, SSD streaming, and quantized KV</li>
+<li>broad API parity with llama.cpp, vLLM, or SGLang</li>
+</ul>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
 </body>
 </html>

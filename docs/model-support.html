@@ -1,115 +1,352 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Model Support — Kipp</title>
-<meta name="description" content="What supporting a model checkpoint will mean in Kipp.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9889;</text></svg>">
-<style>
-:root{
-  --bg:#0b0e14; --panel:#11151f; --panel2:#151a26; --border:#232a3a;
-  --text:#e6e9ef; --muted:#9aa3b2; --faint:#7c8698;
-  --accent:#6366f1; --accent2:#22d3ee;
-  --code-bg:#0d1118; --good:#34d399; --warn:#fbbf24;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
-a{color:var(--accent2);text-decoration:none}
-a:hover{text-decoration:underline}
-code,pre{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:.9em}
-code{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:.12em .4em}
-pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto;line-height:1.55}
-pre code{background:none;border:none;padding:0}
-.wrap{max-width:960px;margin:0 auto;padding:0 24px}
-header.site{position:sticky;top:0;z-index:10;background:rgba(11,14,20,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
-header.site .wrap{display:flex;align-items:center;gap:22px;height:60px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--text)}
-.brand:hover{text-decoration:none}
-.brand .mark{display:inline-block;width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
-nav.top{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
-nav.top a{color:var(--muted);padding:6px 11px;border-radius:8px;font-size:14px}
-nav.top a:hover{color:var(--text);background:var(--panel2);text-decoration:none}
-nav.top a.active{color:var(--text);background:var(--panel2);border:1px solid var(--border)}
-main{padding:48px 0 24px}
-.hero{text-align:center;padding:56px 0 8px}
-.hero img{max-width:420px;width:90%}
-.hero p.tag{margin:18px auto 0;max-width:640px;font-size:19px;color:var(--muted)}
-.hero .cta{margin-top:28px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
-.btn{display:inline-block;padding:10px 20px;border-radius:10px;font-weight:600;font-size:15px;border:1px solid var(--border);color:var(--text);background:var(--panel2)}
-.btn:hover{text-decoration:none;border-color:var(--accent)}
-.btn.primary{background:linear-gradient(135deg,var(--accent),#4f46e5);border-color:transparent}
-.btn.primary:hover{filter:brightness(1.12)}
-.notice{margin:36px 0;padding:14px 18px;border:1px solid var(--warn);border-left-width:4px;border-radius:10px;background:rgba(251,191,36,.06);color:var(--text);font-size:15px}
-h1{font-size:34px;letter-spacing:-.5px;margin-bottom:8px}
-h2{font-size:24px;margin:44px 0 14px;letter-spacing:-.3px}
-h2 .h-mark{color:var(--accent2);margin-right:8px}
-h3{font-size:18px;margin:28px 0 10px}
-p{margin:12px 0;color:var(--text)}
-p.lead{color:var(--muted);font-size:17px}
-ul,ol{margin:12px 0 12px 24px;color:var(--text)}
-li{margin:6px 0}
-li::marker{color:var(--accent2)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin:24px 0}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px 22px}
-.card h3{margin:0 0 8px;font-size:16px}
-.card p{margin:0;color:var(--muted);font-size:14.5px}
-table{width:100%;border-collapse:collapse;margin:18px 0;font-size:15px}
-th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border)}
-th{color:var(--faint);font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:1px}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid var(--border)}
-.pill.todo{color:var(--warn);border-color:rgba(251,191,36,.4)}
-.pill.ref{color:var(--good);border-color:rgba(52,211,153,.4)}
-.tree{color:var(--muted)}
-.tree b{color:var(--text)}
-footer.site{margin-top:72px;border-top:1px solid var(--border);padding:28px 0 40px;color:var(--faint);font-size:14px}
-footer.site .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
-footer.site a{color:var(--muted)}
-blockquote{border-left:3px solid var(--accent);padding:4px 18px;margin:16px 0;color:var(--muted)}
-@media (max-width:640px){header.site .wrap{height:auto;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model support — Kipp</title>
+  <meta name="description" content="Pinned checkpoint, backend, and quantization support status.">
+  <link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
-<header class="site"><div class="wrap">
-  <a class="brand" href="index.html"><span class="mark"></span>Kipp</a>
-  <nav class="top"><a href="index.html">Home</a><a href="architecture.html">Architecture</a><a href="roadmap.html">Roadmap</a><a href="model-support.html" class="active">Model Support</a><a href="benchmarks.html">Benchmarks</a><a href="contributing.html">Contributing</a><a href="https://github.com/Polished-Snow/Kipp">GitHub &#8599;</a></nav>
-</div></header>
-<main><div class="wrap">
-
-<h1>Model Support</h1>
-<div class="notice">&#9888;&#65039; No model family is supported yet. Selecting the first one is <a href="roadmap.html">Phase 0 of the roadmap</a>.</div>
-<p class="lead">Kipp will initially support one explicitly selected family and a small, documented set of checkpoints.</p>
-
-<h2><span class="h-mark">#</span>What the support record will contain</h2>
-<ul>
-  <li>Exact upstream model identifiers and revisions</li>
-  <li>Model, tokenizer, and weight licenses</li>
-  <li>Supported parameter counts and architectural variants</li>
-  <li>Accepted source and runtime weight formats</li>
-  <li>Quantization and numeric-format support by backend</li>
-  <li>Tokenizer and chat-template compatibility</li>
-  <li>Minimum memory and hardware requirements</li>
-  <li>Known correctness or quality limitations</li>
-</ul>
-
-<h2><span class="h-mark">#</span>The bar for a new checkpoint</h2>
-<p>Supporting a new checkpoint will require:</p>
-<ol>
-  <li>A <strong>reproducible conversion procedure</strong> (see <code>tools/convert_to_gguf.py</code>).</li>
-  <li><strong>Reference test vectors</strong> generated for the checkpoint.</li>
-  <li><strong>Validation on every backend</strong> claimed to support it, on real hardware.</li>
-</ol>
-<blockquote>Kipp is not intended to accept arbitrary GGUF files.</blockquote>
-
-</div></main>
-<footer class="site"><div class="wrap">
-  <span>&copy; 2026 Kipp contributors &middot; MIT License</span>
-  <span>
-    <a href="https://github.com/Polished-Snow/Kipp">GitHub</a> &middot;
-    <a href="https://x.com/polished_snow">X / Twitter</a> &middot;
-    <a href="https://www.linkedin.com/company/plsn">LinkedIn</a>
-  </span>
-</div></footer>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="index.html">Home</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="model-support.html" aria-current="page">Models</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Kipp Model Support</h1>
+<p>This document describes Kipp v0.0.2.</p>
+<p>&quot;Supported&quot; has a narrow meaning here: a checkpoint is supported only when
+it has a pinned entry in the compiled-in registry (<code>src/kipp_checkpoints.h</code>,
+mirrored by <code>tools/checkpoints.py</code>), its conversion and test vectors were
+generated from that pinned revision, and every gate below has run green on
+real hardware. A registry entry alone is necessary but not sufficient.</p>
+<h2>The registry</h2>
+<p>All entries are dense Qwen3 decoders (Apache-2.0), BF16, 8 KV heads,
+head width 128, vocabulary 151,936, RMS epsilon <code>1e-6</code>, converted to Kipp's
+strict GGUF-v3 subset. Per-entry dimensions, context lengths, RoPE theta,
+embedding tying, and stop tokens are recorded in the registry sources.</p>
+<table>
+<thead>
+<tr>
+<th>Checkpoint id</th>
+<th>Layers</th>
+<th>Hidden</th>
+<th>Variant</th>
+<th>Tied head</th>
+<th>Gate status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>qwen3-0.6b-base</td>
+<td>28</td>
+<td>1024</td>
+<td>base</td>
+<td>yes</td>
+<td><strong>validated (CPU + Metal M5 + CUDA A100)</strong></td>
+</tr>
+<tr>
+<td>qwen3-0.6b</td>
+<td>28</td>
+<td>1024</td>
+<td>instruct</td>
+<td>yes</td>
+<td>registry only</td>
+</tr>
+<tr>
+<td>qwen3-1.7b-base</td>
+<td>28</td>
+<td>2048</td>
+<td>base</td>
+<td>yes</td>
+<td>registry only</td>
+</tr>
+<tr>
+<td>qwen3-1.7b</td>
+<td>28</td>
+<td>2048</td>
+<td>instruct</td>
+<td>yes</td>
+<td>registry only</td>
+</tr>
+<tr>
+<td>qwen3-4b-base</td>
+<td>36</td>
+<td>2560</td>
+<td>base</td>
+<td>yes</td>
+<td><strong>validated (CPU + Metal M5 + CUDA A100)</strong></td>
+</tr>
+<tr>
+<td>qwen3-4b</td>
+<td>36</td>
+<td>2560</td>
+<td>instruct</td>
+<td>yes</td>
+<td>registry only</td>
+</tr>
+<tr>
+<td>qwen3-4b-instruct-2507</td>
+<td>36</td>
+<td>2560</td>
+<td>instruct-2507</td>
+<td>yes</td>
+<td><strong>validated (CPU + Metal M5 + CUDA A100)</strong></td>
+</tr>
+<tr>
+<td>qwen3-4b-thinking-2507</td>
+<td>36</td>
+<td>2560</td>
+<td>thinking-2507</td>
+<td>yes</td>
+<td>registry only</td>
+</tr>
+<tr>
+<td>qwen3-8b-base</td>
+<td>36</td>
+<td>4096</td>
+<td>base</td>
+<td>no</td>
+<td><strong>validated (CPU + CUDA A100)</strong> — Metal blocked by buffer size (see below)</td>
+</tr>
+<tr>
+<td>qwen3-8b</td>
+<td>36</td>
+<td>4096</td>
+<td>instruct</td>
+<td>no</td>
+<td>registry only</td>
+</tr>
+<tr>
+<td>qwen3-14b-base</td>
+<td>40</td>
+<td>5120</td>
+<td>base</td>
+<td>no</td>
+<td><strong>validated (CPU + CUDA A100)</strong> — Metal blocked by size</td>
+</tr>
+<tr>
+<td>qwen3-14b</td>
+<td>40</td>
+<td>5120</td>
+<td>instruct</td>
+<td>no</td>
+<td>registry only</td>
+</tr>
+<tr>
+<td>qwen3-32b</td>
+<td>64</td>
+<td>5120</td>
+<td>instruct</td>
+<td>no</td>
+<td><strong>validated (CPU + CUDA A100)</strong> — Metal blocked by size</td>
+</tr>
+</tbody>
+</table>
+<p>&quot;Registry only&quot; means the entry exists and the loader will accept a
+correctly converted artifact, but the gates have not run for it yet, so no
+support claim is made.</p>
+<p><strong>Metal single-buffer limit.</strong> The Metal backend wraps the entire GGUF mmap
+in one no-copy <code>MTLBuffer</code>, so a model is Metal-runnable on a given device
+only if its artifact fits <code>MTLDevice.maxBufferLength</code>. On this project's
+Apple M5 that cap is <strong>13.32 GiB</strong> (recommended working set 17.76 GiB), so
+the 8B BF16 artifact (15.26 GiB) is rejected at model creation with a clear
+error rather than a fallback. The 8B Q8_0 artifact fits and is validated on
+Metal, while its BF16 artifact remains unsupported there. 14B and 32B BF16
+exceed the cap by more and are validated on CUDA in the cloud; any Metal
+claim for those sizes requires a separately gated quantized artifact.</p>
+<h2>What the gates check</h2>
+<p>For each checkpoint: exact registry/tokenizer/metadata match; golden
+tokenizer cases (including the four instruct-era special tokens, which
+base checkpoints must BPE-split and instruct checkpoints must isolate);
+exact reference token IDs; full-vocabulary logits versus an FP32
+HF Transformers reference with identical argmax and NMSE at most <code>1e-5</code>
+(Phase 1); cached incremental decode equal to no-cache recomputation with
+identical argmax and NMSE at most <code>1e-6</code> at every position (Phase 2); and
+Metal-versus-CPU with identical argmax and NMSE at most <code>1e-4</code> for prefill,
+every checked decode position, truncate/resume, and batched-equals-isolated
+evaluation (Phase 3, Apple M5).</p>
+<h2>Validated results</h2>
+<h3>qwen3-4b-base (CPU + Metal, Apple M5)</h3>
+<p>The v2 registry refactor was gated byte-identical against v0.0.1 output:
+identical top-10 logits at <code>%.9g</code> on CPU and Metal, and an identical
+8-token greedy Metal decode. Phase 1 NMSE <code>3.79e-7</code>; Phase 2 NMSE <code>0</code>;
+Phase 3 maximum NMSE <code>2.96e-8</code> (decode) / <code>1.41e-8</code> (batch suffix), all
+with exact argmax. Sampling, truncation, batched evaluation, and the
+19-test server suite pass unchanged.</p>
+<h3>qwen3-0.6b-base (CPU + Metal, Apple M5)</h3>
+<p>The first non-4B checkpoint, exercising 16 query heads and an attention
+width (2,048) wider than the hidden width (1,024). All 13 golden tokenizer
+cases pass, including the think/tool special tokens. Phase 1 NMSE
+<code>1.83e-5</code> with exact argmax (<code>1.14e-11</code> with the BF16 KV rounding disabled,
+confirming the deviation is the storage contract, not the implementation);
+Phase 2 NMSE <code>0</code> at every position; Phase 3 Metal maximum NMSE <code>5.9e-7</code>
+with exact argmax across decode, prefill, truncate/resume, and batched
+evaluation.</p>
+<h3>qwen3-8b-base (CPU, Apple M5)</h3>
+<p>The first untied checkpoint, binding a separate <code>lm_head.weight</code> instead of
+aliasing the token embedding. Phase 1 NMSE <code>3.63e-7</code> with exact argmax and
+Phase 2 NMSE <code>0</code> on CPU. The Metal gate is blocked, not failed: the 15.26
+GiB artifact exceeds the M5's 13.32 GiB single-buffer cap and is rejected at
+model creation. Metal validation is deferred to the quantized artifact.</p>
+<h3>qwen3-4b-instruct-2507 (CPU + Metal, Apple M5)</h3>
+<p>The first instruct checkpoint, exercising RoPE theta <code>5e6</code>, the 262,144
+context limit, and the instruct stop set. All 13 golden tokenizer cases
+pass with the think/tool strings isolated as single tokens. Phase 1 NMSE
+<code>7.31e-6</code> with exact argmax; Phase 2 NMSE <code>0</code> at every position; Phase 3
+Metal maximum NMSE <code>5.1e-8</code> with exact argmax. A ChatML-format smoke decode
+on Metal produces a coherent reply and generation stops on <code>&lt;|im_end|&gt;</code>
+(151645) via the stop set rather than running to the token limit.</p>
+<h3>Other checkpoints</h3>
+<p>Gate transcripts land here as each checkpoint's vectors are generated and
+run. Until then the table above is the authority.</p>
+<h3>CUDA (NVIDIA A100 80GB, first validation 2026-07-17)</h3>
+<p>The Phase 4 CUDA gate ran for the first time on a Verda A100-SXM4-80GB
+(driver 580.126.09, CUDA 12.8, sm_80), built warning-clean with the
+existing <code>CUDA_GENERIC_ARCH_FLAGS</code>. All four available checkpoints pass
+<code>--phase4-cuda</code> with identical argmax and CUDA-vs-CPU full-logit NMSE well
+under the <code>1e-4</code> bound at prefill, every decode position, stateless prefill,
+and reset/reuse:</p>
+<table>
+<thead>
+<tr>
+<th>Checkpoint</th>
+<th>max NMSE vs CPU</th>
+<th>argmax</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>qwen3-4b-base</td>
+<td>1.78e-8</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>qwen3-0.6b-base</td>
+<td>5.86e-7</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>qwen3-4b-instruct-2507</td>
+<td>2.52e-7</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>qwen3-8b-base</td>
+<td>4.98e-8</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>qwen3-14b-base</td>
+<td>2.82e-6 (CUDA)</td>
+<td>exact</td>
+</tr>
+<tr>
+<td>qwen3-32b</td>
+<td>1.10e-7 (CUDA)</td>
+<td>exact</td>
+</tr>
+</tbody>
+</table>
+<p>14B and 32B also pass CPU Phase 1 (argmax exact) and Phase 2 (NMSE <code>0</code>). 14B
+uses the FP32 CPU reference (Phase 1 NMSE <code>7.8e-6</code>, under the <code>5e-5</code> bound).
+32B is too large for an FP32 host reference (~256 GiB), so its reference is
+BF16-on-GPU; that reference differs from Kipp's BF16-weight/FP32-accumulate
+path by more, so the full-logit bound for a BF16 reference is recorded as
+<code>2e-3</code> in the vector's <code>nmse-max.txt</code> (32B measured <code>7.3e-4</code>, argmax exact).
+The native Phase 1 gate reads this per-vector bound rather than hardcoding
+one. Both BF16 artifacts exceed the M5 Metal buffer cap, so their Metal
+claims wait on quantization.</p>
+<p>Validated checkpoints now span the registry's 0.6B through 32B range on at
+least CPU plus one GPU backend. Entries marked “registry only” remain
+unvalidated.</p>
+<p>CUDA copies all weights resident into VRAM at model creation, so it is not
+subject to Metal's single-buffer cap — this is how 8B (which Metal cannot
+map on the M5) is validated. The gate ran against the exact same pinned
+golden vectors used locally. <code>tools/ops/verda_cuda_gate.sh</code> captures the
+disposable Verda workflow; it requires an explicit cost acknowledgement and
+deletes both the VM and its OS volume on exit.</p>
+<h2>Quantization (Q8_0)</h2>
+<p>Kipp converts the seven per-layer projection tensors to <strong>Q8_0</strong> (32-weight
+blocks: fp16 scale + int8 quants, 8.5 bpw); token embedding, lm_head, and all
+norms stay BF16. <code>tools/convert_to_gguf.py --quant q8_0</code> writes a
+<code>kipp-&lt;id&gt;-q8_0.gguf</code> artifact with a <code>kipp.quant.scheme</code> metadata key; the
+loader validates per-tensor types and byte counts. Both CPU and Metal decode
+Q8_0 (the Metal path adds token-tiled <code>kipp_matvec_q8_0</code> decode/prefill
+kernels).</p>
+<p>Validated on Apple M5:</p>
+<table>
+<thead>
+<tr>
+<th>Checkpoint</th>
+<th>artifact</th>
+<th>CPU NMSE vs bf16 ref</th>
+<th>Metal vs CPU NMSE</th>
+<th>4B decode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>qwen3-4b-base q8_0</td>
+<td>4.32 GiB (was 7.5)</td>
+<td>1.9e-5</td>
+<td>5.5e-10</td>
+<td>22.2 tok/s (bf16 13.8)</td>
+</tr>
+<tr>
+<td>qwen3-8b-base q8_0</td>
+<td>9.20 GiB (was 15.26)</td>
+<td>1.6e-5</td>
+<td>1.0e-10</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>Both pass with exact argmax. Q8_0 is near-lossless (NMSE under the 5e-5 bf16
+bound) and ~1.6× faster decode / ~2× faster prefill on the 4B. Critically,
+<strong>8B now runs on Metal</strong> — its 9.20 GiB Q8_0 artifact fits the 13.32 GiB
+single-buffer cap that its 15.26 GiB BF16 artifact exceeded. 14B (Q8 ≈ 15
+GiB) still exceeds the cap and awaits 4-bit; 8B/14B/32B Q8_0 remain CUDA- and
+CPU-runnable.</p>
+<h2>Quantization (AFFINE4_GS32)</h2>
+<p>Kipp also implements a private 4-bit affine format with 32-weight groups:
+16 packed nibbles plus fp16 scale and bias (5.0 bits per weight). CPU and
+Metal have dedicated decode paths, and the converter emits the format with
+<code>--quant affine4_gs32</code>. Unlike Q8_0, this is a Q4-class lossy format; model
+gates therefore use an explicit per-vector tolerance rather than presenting
+it as near-lossless. A checkpoint gains a quantized support claim only after
+its full-logit and backend gates pass.</p>
+<h2>Backends</h2>
+<p>The CPU oracle, the Metal backend (Apple M5), and the CUDA backend (NVIDIA
+A100) are validated backends. Metal must be selected explicitly — a Metal
+initialization or shader compilation failure is fatal rather than falling
+back. Metal compiles its pipelines per model, specializing the hidden width
+and query-head count through function constants; the mmap of each GGUF is
+wrapped in one shared no-copy buffer (hence the single-buffer cap). CUDA
+copies the required tensors to VRAM at model creation and fails explicitly
+if they do not fit.</p>
+<p>CUDA is validated on the checkpoints in the table above; other registry
+entries stay &quot;registry only&quot; for CUDA until their gate runs.</p>
+<p>BF16, Q8_0, and AFFINE4_GS32 are the only accepted weight schemes. No MoE,
+vision-language, Qwen3-Next, Qwen3.5, or arbitrary GGUF checkpoint is
+supported; those require a new architecture review, not a registry entry.</p>
+<p>See <code>ARCHITECTURE.md</code> for the binding contract and phase criteria.</p>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
 </body>
 </html>

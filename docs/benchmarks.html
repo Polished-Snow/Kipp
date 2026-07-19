@@ -1,113 +1,140 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Benchmarks — Kipp</title>
-<meta name="description" content="Kipp's benchmark reporting rules: reproducibility, required fields, and comparison policy.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9889;</text></svg>">
-<style>
-:root{
-  --bg:#0b0e14; --panel:#11151f; --panel2:#151a26; --border:#232a3a;
-  --text:#e6e9ef; --muted:#9aa3b2; --faint:#7c8698;
-  --accent:#6366f1; --accent2:#22d3ee;
-  --code-bg:#0d1118; --good:#34d399; --warn:#fbbf24;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font:16px/1.65 -apple-system,'Segoe UI',Helvetica,Arial,sans-serif}
-a{color:var(--accent2);text-decoration:none}
-a:hover{text-decoration:underline}
-code,pre{font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:.9em}
-code{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;padding:.12em .4em}
-pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:16px 18px;overflow-x:auto;line-height:1.55}
-pre code{background:none;border:none;padding:0}
-.wrap{max-width:960px;margin:0 auto;padding:0 24px}
-header.site{position:sticky;top:0;z-index:10;background:rgba(11,14,20,.85);backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}
-header.site .wrap{display:flex;align-items:center;gap:22px;height:60px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:var(--text)}
-.brand:hover{text-decoration:none}
-.brand .mark{display:inline-block;width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--accent),var(--accent2))}
-nav.top{display:flex;gap:4px;flex-wrap:wrap;margin-left:auto}
-nav.top a{color:var(--muted);padding:6px 11px;border-radius:8px;font-size:14px}
-nav.top a:hover{color:var(--text);background:var(--panel2);text-decoration:none}
-nav.top a.active{color:var(--text);background:var(--panel2);border:1px solid var(--border)}
-main{padding:48px 0 24px}
-.hero{text-align:center;padding:56px 0 8px}
-.hero img{max-width:420px;width:90%}
-.hero p.tag{margin:18px auto 0;max-width:640px;font-size:19px;color:var(--muted)}
-.hero .cta{margin-top:28px;display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
-.btn{display:inline-block;padding:10px 20px;border-radius:10px;font-weight:600;font-size:15px;border:1px solid var(--border);color:var(--text);background:var(--panel2)}
-.btn:hover{text-decoration:none;border-color:var(--accent)}
-.btn.primary{background:linear-gradient(135deg,var(--accent),#4f46e5);border-color:transparent}
-.btn.primary:hover{filter:brightness(1.12)}
-.notice{margin:36px 0;padding:14px 18px;border:1px solid var(--warn);border-left-width:4px;border-radius:10px;background:rgba(251,191,36,.06);color:var(--text);font-size:15px}
-h1{font-size:34px;letter-spacing:-.5px;margin-bottom:8px}
-h2{font-size:24px;margin:44px 0 14px;letter-spacing:-.3px}
-h2 .h-mark{color:var(--accent2);margin-right:8px}
-h3{font-size:18px;margin:28px 0 10px}
-p{margin:12px 0;color:var(--text)}
-p.lead{color:var(--muted);font-size:17px}
-ul,ol{margin:12px 0 12px 24px;color:var(--text)}
-li{margin:6px 0}
-li::marker{color:var(--accent2)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin:24px 0}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px 22px}
-.card h3{margin:0 0 8px;font-size:16px}
-.card p{margin:0;color:var(--muted);font-size:14.5px}
-table{width:100%;border-collapse:collapse;margin:18px 0;font-size:15px}
-th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border)}
-th{color:var(--faint);font-weight:600;text-transform:uppercase;font-size:12px;letter-spacing:1px}
-.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid var(--border)}
-.pill.todo{color:var(--warn);border-color:rgba(251,191,36,.4)}
-.pill.ref{color:var(--good);border-color:rgba(52,211,153,.4)}
-.tree{color:var(--muted)}
-.tree b{color:var(--text)}
-footer.site{margin-top:72px;border-top:1px solid var(--border);padding:28px 0 40px;color:var(--faint);font-size:14px}
-footer.site .wrap{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
-footer.site a{color:var(--muted)}
-blockquote{border-left:3px solid var(--accent);padding:4px 18px;margin:16px 0;color:var(--muted)}
-@media (max-width:640px){header.site .wrap{height:auto;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Benchmarks — Kipp</title>
+  <meta name="description" content="Reproducible benchmark policy and measured results.">
+  <link rel="stylesheet" href="assets/site.css">
 </head>
 <body>
-<header class="site"><div class="wrap">
-  <a class="brand" href="index.html"><span class="mark"></span>Kipp</a>
-  <nav class="top"><a href="index.html">Home</a><a href="architecture.html">Architecture</a><a href="roadmap.html">Roadmap</a><a href="model-support.html">Model Support</a><a href="benchmarks.html" class="active">Benchmarks</a><a href="contributing.html">Contributing</a><a href="https://github.com/Polished-Snow/Kipp">GitHub &#8599;</a></nav>
-</div></header>
-<main><div class="wrap">
-
-<h1>Benchmarks</h1>
-<div class="notice">&#9888;&#65039; Kipp has no inference implementation, so there are no benchmark results yet. The rules below govern all future numbers.</div>
-<p class="lead">Results must be reproducible and must not mix unsupported backends or model variants. <code>tools/bench.py</code> is the canonical harness; the current Apple M5 Metal numbers live in <code>docs/BENCHMARKS.md</code>.</p>
-
-<h2><span class="h-mark">#</span>Required report fields</h2>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="index.html">Home</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="model-support.html">Models</a>
+        <a href="benchmarks.html" aria-current="page">Benchmarks</a>
+        <a href="contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Kipp Benchmarks</h1>
+<p>Kipp has a scalar CPU correctness oracle plus correctness-gated Metal and CUDA
+backends. Results must not mix unsupported checkpoints, weight schemes, or
+backend variants.</p>
+<h2>Required report fields</h2>
 <ul>
-  <li>Kipp commit and clean/dirty working-tree state</li>
-  <li>Model identifier, revision, parameter count, and quantization</li>
-  <li>Backend, build target, compiler, and relevant build flags</li>
-  <li>Hardware model, memory capacity, and OS / driver versions</li>
-  <li>Prompt length, generated-token count, batch size, and concurrency</li>
-  <li>Warm-up procedure and number of measured runs</li>
-  <li>Peak memory, prefill throughput, generation throughput, and latency</li>
-  <li>Sampling settings and any cache or scheduler configuration</li>
+<li>Kipp commit and clean/dirty working-tree state</li>
+<li>Model identifier, revision, parameter count, and quantization</li>
+<li>Backend, build target, compiler, and relevant build flags</li>
+<li>Hardware model, memory capacity, and operating-system/driver versions</li>
+<li>Prompt length, generated-token count, batch size, and concurrency</li>
+<li>Warm-up procedure and number of measured runs</li>
+<li>Peak memory, prefill throughput, generation throughput, and latency</li>
+<li>Sampling settings and any cache or scheduler configuration</li>
 </ul>
-
-<h2><span class="h-mark">#</span>Benchmark policy</h2>
+<h2>Benchmark policy</h2>
+<p>Report medians and a dispersion measure rather than only the best run. Keep
+prefill and token-generation measurements separate. Comparisons with other
+engines must use equivalent model weights, context, sampling settings, and
+hardware, and must link the exact commands used.</p>
+<p><code>tools/bench.py</code> is the canonical subprocess harness. It performs discarded
+warm-up runs, captures the CLI's separate prefill and decode timers, samples
+peak process RSS with <code>/usr/bin/time -l</code>, and reports the median, median
+absolute deviation, minimum, maximum, and each raw run as JSON.</p>
+<h2>Optimized Metal kernels on Apple M5 (v0.0.1)</h2>
+<p>Measured on 2026-07-13 with Kipp v0.0.1's batched Metal path: one serial compute
+encoder per command buffer, up to 32 prefill tokens per batch,
+simdgroup-matrix BF16 projections for batched prefill (16-token tiles, FP32
+accumulation, with a vector-kernel fallback on devices without bfloat
+simdgroup matrices), a simdgroup matvec for single-token decode, and split-K
+streaming online-softmax attention (eight partial softmaxes per head merged
+in threadgroup memory). Same hardware, model artifact, build flags, and
+harness as the baseline below; one discarded warm-up and five measured
+subprocesses per configuration.</p>
+<p>Commands:</p>
+<pre><code class="language-bash">python3 tools/bench.py --warmup 1 --runs 5 --decode 8
+python3 tools/bench.py --warmup 1 --runs 5 --decode 32 --prompt &quot;&lt;265-token prompt&gt;&quot;
+</code></pre>
+<p>Results (median, with median absolute deviation):</p>
 <ul>
-  <li>Report <strong>medians and a dispersion measure</strong>, never only the best run.</li>
-  <li>Keep prefill and token-generation measurements separate.</li>
-  <li>Comparisons with other engines must use equivalent model weights, context, sampling settings, and hardware — and must link the exact commands used.</li>
+<li>3-token prompt, greedy decode of 8:
+prefill <strong>9.375 tokens/s</strong> (MAD 0.939, range 8.436–12.557);
+decode <strong>13.776 tokens/s</strong> (MAD 0.063, range 13.259–13.985)</li>
+<li>265-token prompt, greedy decode of 32:
+prefill <strong>147.769 tokens/s</strong> (MAD 2.219, range 123.937–149.988);
+decode <strong>13.072 tokens/s</strong> (MAD 0.802, range 12.133–13.969)</li>
+<li>Single spot check at a 1,981-token prompt: prefill 136.6 tokens/s and
+decode 13.0 tokens/s (decode was 11.0 tokens/s before split-K
+attention — long contexts are where the partitioned kernel pays).</li>
+<li>Peak process RSS: <strong>~40 MB median</strong> in both configurations (see the RSS
+caveat below; mapped GPU-touched weights are not charged to the process)</li>
 </ul>
-
-</div></main>
-<footer class="site"><div class="wrap">
-  <span>&copy; 2026 Kipp contributors &middot; MIT License</span>
-  <span>
-    <a href="https://github.com/Polished-Snow/Kipp">GitHub</a> &middot;
-    <a href="https://x.com/polished_snow">X / Twitter</a> &middot;
-    <a href="https://www.linkedin.com/company/plsn">LinkedIn</a>
-  </span>
-</div></footer>
+<p>Short-prompt prefill is dominated by fixed per-evaluation cost; the
+265-token configuration reflects the batched matrix-kernel prefill path.
+Decode remains memory-bandwidth-bound: at ~13.8 tokens/s the engine streams
+roughly 115 GB/s of BF16 weights through the M5. Long-context prefill is
+now limited by per-layer KV re-reads in attention rather than by the
+projection matmuls.</p>
+<p>Batched decoding through the server (48 sampled tokens per sequence,
+temperature 0.8, single measurements). Multi-choice requests (<code>n</code>) and
+independent concurrent clients batch the same way — each step reads the
+weights once for every active sequence:</p>
+<ul>
+<li>one request, <code>n</code> = 1/2/4/8: 12.7 / 18.9 / 29.7 / 41.4 tokens/s aggregate</li>
+<li>concurrent clients (distinct prompts and seeds), 1/2/4/8 connections:
+12.7 / 20.3 / 29.1 / 39.7 tokens/s aggregate</li>
+</ul>
+<p>Aggregate throughput approaches compute limits instead of scaling the
+bandwidth cost with the number of sequences.</p>
+<h2>Phase 3 Apple M5 baseline (superseded)</h2>
+<p>Measured on 2026-07-10 with the original one-token-per-command-buffer
+kernels, on:</p>
+<ul>
+<li>Apple M5, 10-core GPU, 24 GiB unified memory</li>
+<li>macOS 26.4, Apple clang 21.0.0</li>
+<li>dirty development tree at <code>0eac2059cfa138c8e56ce2664c9213c9e4340261</code></li>
+<li><code>Qwen/Qwen3-4B-Base</code> revision
+<code>906bfd4b4dc7f14ee4320094d8b41684abff8539</code></li>
+<li>8,049,127,680-byte BF16 Kipp GGUF-v3 artifact</li>
+<li><code>-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror</code></li>
+<li>prompt <code>Hi 世界</code> (3 tokens), greedy decode of 8 tokens, batch 1,
+concurrency 1</li>
+<li>one discarded warm-up and five measured subprocesses</li>
+</ul>
+<p>Command:</p>
+<pre><code class="language-bash">python3 tools/bench.py --warmup 1 --runs 5 --decode 8
+</code></pre>
+<p>Results:</p>
+<ul>
+<li>Prefill: <strong>6.405 tokens/s median</strong>, 0.027 tokens/s median absolute
+deviation (range 6.379–6.719)</li>
+<li>Decode: <strong>8.193 tokens/s median</strong>, 0.004 tokens/s median absolute
+deviation (range 8.189–8.207)</li>
+<li>Peak process RSS: <strong>47,775,744 bytes median</strong> (45.6 MiB), 32,768-byte
+median absolute deviation</li>
+</ul>
+<p>Peak process RSS is not total unified-memory residency. Metal accesses the
+7.50 GiB model through a shared no-copy mmap, and macOS does not charge those
+GPU-touched mapped pages to the CLI's reported peak RSS in the same way as
+ordinary process allocations. The artifact size and cache layout therefore
+remain necessary context; the RSS number must not be presented as the total
+memory needed to run the model.</p>
+<p>This was a readable fixed-shape baseline, not an optimized performance claim.
+At that revision the implementation intentionally excluded fusion,
+quantization, batching, and private weight copies; later results above
+supersede those constraints.</p>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
 </body>
 </html>

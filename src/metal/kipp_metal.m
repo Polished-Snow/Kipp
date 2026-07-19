@@ -60,9 +60,11 @@ typedef struct {
 @interface KippMetalSession : NSObject
 @property(nonatomic, weak) KippMetalModel *model;
 @property(nonatomic) uint32_t capacity;
+@property(nonatomic) uint32_t slabPositions; /* capacity rounded to blocks */
 @property(nonatomic) uint32_t length;
 @property(nonatomic, strong) id<MTLBuffer> keyCache;
 @property(nonatomic, strong) id<MTLBuffer> valueCache;
+@property(nonatomic, strong) id<MTLBuffer> blockTable; /* logical->physical */
 @property(nonatomic, strong) id<MTLBuffer> tokens;
 @property(nonatomic, strong) id<MTLBuffer> x;
 @property(nonatomic, strong) id<MTLBuffer> normalized;
@@ -87,6 +89,7 @@ typedef struct {
 @property(nonatomic, strong)
     NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines;
 @property(nonatomic) const kipp_model_view *view;
+@property(nonatomic) kipp_model_config config;
 @property(nonatomic) BOOL matrixKernelAvailable;
 @property(nonatomic, strong) id<MTLBuffer> batchLogits;
 @property(nonatomic, strong) KippMetalSession *oracleSession;
@@ -134,39 +137,61 @@ static id<MTLBuffer> metal_new_shared_buffer(id<MTLDevice> device,
 static KippMetalSession *
 metal_session_new(KippMetalModel *model, uint32_t capacity,
                   kipp_error *error) {
-    if (capacity == 0 || capacity > KIPP_CONTEXT_LENGTH) {
+    const kipp_model_config config = model.config;
+    if (capacity == 0 || capacity > config.context_length) {
         metal_fail(error, KIPP_ERROR_RANGE,
                    "Metal session capacity must be between 1 and %u",
-                   KIPP_CONTEXT_LENGTH);
+                   config.context_length);
         return nil;
     }
+    /* Round the physical KV store up to whole 32-position blocks so the paged
+     * block table addresses cleanly; the reported logical size is unchanged. */
+    uint32_t blockCapacity = (capacity + 31u) / 32u;
+    uint32_t slabPositions = blockCapacity * 32u;
     uint64_t slabBytes =
-        (uint64_t)KIPP_BLOCK_COUNT * capacity *
+        (uint64_t)config.block_count * slabPositions *
         KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM *
         sizeof(uint16_t);
     if (slabBytes > NSUIntegerMax) {
         metal_fail(error, KIPP_ERROR_MEMORY, "Metal session size overflows");
         return nil;
     }
+    /* The staging buffer re-encodes the widest activation as BF16. */
+    NSUInteger stagingWidth = config.feed_forward_length;
+    if (config.attention_width > stagingWidth) {
+        stagingWidth = config.attention_width;
+    }
+    if (config.embedding_length > stagingWidth) {
+        stagingWidth = config.embedding_length;
+    }
 
     KippMetalSession *session = [[KippMetalSession alloc] init];
     session.model = model;
     session.capacity = capacity;
+    session.slabPositions = slabPositions;
     session.keyCache =
         metal_new_shared_buffer(model.device, (NSUInteger)slabBytes);
     session.valueCache =
         metal_new_shared_buffer(model.device, (NSUInteger)slabBytes);
+    session.blockTable =
+        metal_new_shared_buffer(model.device, blockCapacity * sizeof(uint32_t));
+    if (session.blockTable != nil) {
+        uint32_t *table = session.blockTable.contents;
+        for (uint32_t block = 0; block < blockCapacity; ++block) {
+            table[block] = block; /* identity mapping */
+        }
+    }
     session.tokens = metal_new_shared_buffer(
         model.device, KIPP_METAL_BATCH * sizeof(uint32_t));
     session.x = metal_new_shared_buffer(
         model.device,
-        KIPP_METAL_BATCH * KIPP_EMBEDDING_LENGTH * sizeof(float));
+        KIPP_METAL_BATCH * config.embedding_length * sizeof(float));
     session.normalized = metal_new_shared_buffer(
         model.device,
-        KIPP_METAL_BATCH * KIPP_EMBEDDING_LENGTH * sizeof(float));
+        KIPP_METAL_BATCH * config.embedding_length * sizeof(float));
     session.query = metal_new_shared_buffer(
-        model.device, KIPP_METAL_BATCH * KIPP_ATTENTION_HEAD_COUNT *
-                          KIPP_ATTENTION_HEAD_DIM * sizeof(float));
+        model.device,
+        KIPP_METAL_BATCH * config.attention_width * sizeof(float));
     session.key = metal_new_shared_buffer(
         model.device, KIPP_METAL_BATCH * KIPP_ATTENTION_HEAD_COUNT_KV *
                           KIPP_ATTENTION_HEAD_DIM * sizeof(float));
@@ -174,22 +199,22 @@ metal_session_new(KippMetalModel *model, uint32_t capacity,
         model.device, KIPP_METAL_BATCH * KIPP_ATTENTION_HEAD_COUNT_KV *
                           KIPP_ATTENTION_HEAD_DIM * sizeof(float));
     session.attention = metal_new_shared_buffer(
-        model.device, KIPP_METAL_BATCH * KIPP_ATTENTION_HEAD_COUNT *
-                          KIPP_ATTENTION_HEAD_DIM * sizeof(float));
+        model.device,
+        KIPP_METAL_BATCH * config.attention_width * sizeof(float));
     session.projection = metal_new_shared_buffer(
         model.device,
-        KIPP_METAL_BATCH * KIPP_EMBEDDING_LENGTH * sizeof(float));
+        KIPP_METAL_BATCH * config.embedding_length * sizeof(float));
     session.gate = metal_new_shared_buffer(
         model.device,
-        KIPP_METAL_BATCH * KIPP_FEED_FORWARD_LENGTH * sizeof(float));
+        KIPP_METAL_BATCH * config.feed_forward_length * sizeof(float));
     session.up = metal_new_shared_buffer(
         model.device,
-        KIPP_METAL_BATCH * KIPP_FEED_FORWARD_LENGTH * sizeof(float));
+        KIPP_METAL_BATCH * config.feed_forward_length * sizeof(float));
     session.staging = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * KIPP_FEED_FORWARD_LENGTH * sizeof(uint16_t));
+        model.device, KIPP_METAL_BATCH * stagingWidth * sizeof(uint16_t));
 
     if (session.keyCache == nil || session.valueCache == nil ||
+        session.blockTable == nil ||
         session.tokens == nil || session.x == nil ||
         session.normalized == nil || session.query == nil ||
         session.key == nil || session.value == nil ||
@@ -292,7 +317,7 @@ static void metal_encode_embed(id<MTLComputeCommandEncoder> target,
     const kipp_tensor_view *embedding =
         &model.view->weights.token_embedding;
     metal_enc_threads(target, metal_pipeline(model, @"kipp_embed_gather"),
-                      KIPP_EMBEDDING_LENGTH, tokenCount,
+                      model.config.embedding_length, tokenCount,
                       ^(id<MTLComputeCommandEncoder> encoder) {
                         [encoder setBuffer:model.weights
                                     offset:metal_weight_offset(model, embedding)
@@ -333,9 +358,18 @@ static void metal_encode_matvec(id<MTLComputeCommandEncoder> target,
         tokenCount == 1
             ? 1
             : (tokenCount + KIPP_METAL_TOKEN_TILE - 1) / KIPP_METAL_TOKEN_TILE;
-    id<MTLComputePipelineState> pipeline = metal_pipeline(
-        model, tokenCount == 1 ? @"kipp_matvec_bf16_decode"
-                               : @"kipp_matvec_bf16_prefill");
+    /* The weight tensor's type selects the matvec kernel family; each is
+     * specialized into a decode (1-token) and prefill (tiled) variant. */
+    NSString *base = @"kipp_matvec_bf16";
+    if (weight->type == KIPP_TENSOR_Q8_0) {
+        base = @"kipp_matvec_q8_0";
+    } else if (weight->type == KIPP_TENSOR_AFFINE4_GS32) {
+        base = @"kipp_matvec_affine4";
+    }
+    NSString *name = [base stringByAppendingString:tokenCount == 1
+                                                       ? @"_decode"
+                                                       : @"_prefill"];
+    id<MTLComputePipelineState> pipeline = metal_pipeline(model, name);
     metal_enc_groups(
         target, pipeline, rowGroups, tokenGroups, KIPP_METAL_GROUP_THREADS,
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -377,7 +411,10 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
                                     id<MTLBuffer> input, id<MTLBuffer> output,
                                     uint32_t rows, uint32_t columns,
                                     uint32_t tokenCount, bool useMatrix) {
-    if (!useMatrix) {
+    /* The BF16 simdgroup-matrix path applies only to BF16 weights; quantized
+     * projections always take their own vector kernel (which reads the FP32
+     * activations directly, so no BF16 staging is needed). */
+    if (!useMatrix || weight->type != KIPP_TENSOR_BF16) {
         metal_encode_matvec(target, model, weight, input, output, 0, rows,
                             columns, tokenCount);
         return;
@@ -422,7 +459,7 @@ static void metal_encode_rope(id<MTLComputeCommandEncoder> target,
                               NSUInteger statesOffset, uint32_t headCount,
                               uint32_t startPosition, uint32_t tokenCount) {
     metal_rope_params params = {headCount, startPosition,
-                                KIPP_METAL_ROPE_THETA};
+                                model.config.rope_theta};
     metal_enc_threads(target, metal_pipeline(model, @"kipp_rope"),
                       (NSUInteger)headCount * (KIPP_ATTENTION_HEAD_DIM / 2),
                       tokenCount, ^(id<MTLComputeCommandEncoder> encoder) {
@@ -443,7 +480,7 @@ static void metal_encode_kv_write(id<MTLComputeCommandEncoder> target,
                                   uint32_t startPosition,
                                   uint32_t tokenCount) {
     metal_kv_params params = {layer, startPosition, tokenCount,
-                              kvSession.capacity};
+                              kvSession.slabPositions};
     metal_enc_threads(target, metal_pipeline(model, @"kipp_kv_write"),
                       KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
                       tokenCount, ^(id<MTLComputeCommandEncoder> encoder) {
@@ -462,6 +499,9 @@ static void metal_encode_kv_write(id<MTLComputeCommandEncoder> target,
                         [encoder setBytes:&params
                                    length:sizeof(params)
                                   atIndex:4];
+                        [encoder setBuffer:kvSession.blockTable
+                                    offset:0
+                                   atIndex:5];
                       });
 }
 
@@ -472,16 +512,18 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
                              NSUInteger headStateOffset, uint32_t layer,
                              uint32_t startPosition, uint32_t tokenCount) {
     metal_kv_params params = {layer, startPosition, tokenCount,
-                              kvSession.capacity};
+                              kvSession.slabPositions};
     metal_enc_groups(
         target, metal_pipeline(model, @"kipp_flash_gqa"),
-        KIPP_ATTENTION_HEAD_COUNT, tokenCount, KIPP_METAL_GQA_THREADS,
+        model.config.attention_head_count, tokenCount,
+        KIPP_METAL_GQA_THREADS,
         ^(id<MTLComputeCommandEncoder> encoder) {
           [encoder setBuffer:query offset:headStateOffset atIndex:0];
           [encoder setBuffer:kvSession.keyCache offset:0 atIndex:1];
           [encoder setBuffer:kvSession.valueCache offset:0 atIndex:2];
           [encoder setBuffer:output offset:headStateOffset atIndex:3];
           [encoder setBytes:&params length:sizeof(params) atIndex:4];
+          [encoder setBuffer:kvSession.blockTable offset:0 atIndex:5];
         });
 }
 
@@ -489,7 +531,7 @@ static void metal_encode_residual(id<MTLComputeCommandEncoder> target,
                                   KippMetalModel *model,
                                   KippMetalSession *session,
                                   uint32_t tokenCount) {
-    uint32_t count = KIPP_EMBEDDING_LENGTH * tokenCount;
+    uint32_t count = model.config.embedding_length * tokenCount;
     metal_enc_threads(target, metal_pipeline(model, @"kipp_residual_add"),
                    count, 1, ^(id<MTLComputeCommandEncoder> encoder) {
                      [encoder setBuffer:session.x offset:0 atIndex:0];
@@ -504,7 +546,7 @@ static void metal_encode_swiglu(id<MTLComputeCommandEncoder> target,
                                 KippMetalModel *model,
                                 KippMetalSession *session,
                                 uint32_t tokenCount) {
-    uint32_t count = KIPP_FEED_FORWARD_LENGTH * tokenCount;
+    uint32_t count = model.config.feed_forward_length * tokenCount;
     metal_enc_threads(target, metal_pipeline(model, @"kipp_swiglu"),
                    count, 1, ^(id<MTLComputeCommandEncoder> encoder) {
                      [encoder setBuffer:session.gate offset:0 atIndex:0];
@@ -525,6 +567,7 @@ typedef struct {
     uint32_t position;
     float *finishLogits;
     NSUInteger logitsOffset;
+    uint32_t logitsRows; /* logit rows to write (last N tokens of the part) */
 } metal_round_part;
 
 /*
@@ -545,45 +588,46 @@ static int metal_encode_round(KippMetalModel *model,
         return metal_fail(error, KIPP_ERROR_INTERNAL,
                           "unable to create Metal command buffer");
     }
-    const NSUInteger querySlotBytes = (NSUInteger)KIPP_ATTENTION_HEAD_COUNT *
-                                      KIPP_ATTENTION_HEAD_DIM * sizeof(float);
+    const kipp_model_config config = model.config;
+    const NSUInteger querySlotBytes =
+        (NSUInteger)config.attention_width * sizeof(float);
     const NSUInteger kvSlotBytes = (NSUInteger)KIPP_ATTENTION_HEAD_COUNT_KV *
                                    KIPP_ATTENTION_HEAD_DIM * sizeof(float);
     /* Below ~8 tokens the vector kernel keeps more threadgroups in
      * flight than the matrix kernel and wins despite re-reading weights. */
     bool useMatrix =
-        model.matrixKernelAvailable && totalTokens >= KIPP_METAL_TOKEN_TILE;
+        model.matrixKernelAvailable && totalTokens >= KIPP_METAL_TOKEN_TILE &&
+        model.config.quant_scheme == KIPP_QUANT_BF16;
     metal_encode_embed(encoder, model, workspace, totalTokens);
-    for (uint32_t layerIndex = 0; layerIndex < KIPP_BLOCK_COUNT;
+    for (uint32_t layerIndex = 0; layerIndex < config.block_count;
          ++layerIndex) {
         const kipp_qwen3_layer_weights *layer =
             &model.view->weights.layers[layerIndex];
         metal_encode_norm(encoder, model, workspace.x, 0,
                           &layer->attention_norm, workspace.normalized,
-                          KIPP_EMBEDDING_LENGTH, totalTokens);
+                          config.embedding_length, totalTokens);
         if (useMatrix) {
             metal_encode_stage(encoder, model, workspace,
                                workspace.normalized,
-                               KIPP_EMBEDDING_LENGTH * totalTokens);
+                               config.embedding_length * totalTokens);
         }
         metal_encode_projection(
             encoder, model, workspace, &layer->attention_q,
-            workspace.normalized, workspace.query,
-            KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM,
-            KIPP_EMBEDDING_LENGTH, totalTokens, useMatrix);
+            workspace.normalized, workspace.query, config.attention_width,
+            config.embedding_length, totalTokens, useMatrix);
         metal_encode_projection(
             encoder, model, workspace, &layer->attention_k,
             workspace.normalized, workspace.key,
             KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-            KIPP_EMBEDDING_LENGTH, totalTokens, useMatrix);
+            config.embedding_length, totalTokens, useMatrix);
         metal_encode_projection(
             encoder, model, workspace, &layer->attention_v,
             workspace.normalized, workspace.value,
             KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-            KIPP_EMBEDDING_LENGTH, totalTokens, useMatrix);
+            config.embedding_length, totalTokens, useMatrix);
         metal_encode_head_norm(encoder, model, workspace.query,
                                &layer->attention_q_norm,
-                               KIPP_ATTENTION_HEAD_COUNT, totalTokens);
+                               config.attention_head_count, totalTokens);
         metal_encode_head_norm(encoder, model, workspace.key,
                                &layer->attention_k_norm,
                                KIPP_ATTENTION_HEAD_COUNT_KV, totalTokens);
@@ -591,7 +635,7 @@ static int metal_encode_round(KippMetalModel *model,
             const metal_round_part *p = &parts[part];
             metal_encode_rope(encoder, model, workspace.query,
                               p->slot * querySlotBytes,
-                              KIPP_ATTENTION_HEAD_COUNT, p->position,
+                              config.attention_head_count, p->position,
                               p->tokens);
             metal_encode_rope(encoder, model, workspace.key,
                               p->slot * kvSlotBytes,
@@ -607,44 +651,44 @@ static int metal_encode_round(KippMetalModel *model,
         if (useMatrix) {
             metal_encode_stage(encoder, model, workspace,
                                workspace.attention,
-                               KIPP_ATTENTION_HEAD_COUNT *
-                                   KIPP_ATTENTION_HEAD_DIM * totalTokens);
+                               config.attention_width * totalTokens);
         }
         metal_encode_projection(
             encoder, model, workspace, &layer->attention_output,
-            workspace.attention, workspace.projection, KIPP_EMBEDDING_LENGTH,
-            KIPP_ATTENTION_HEAD_COUNT * KIPP_ATTENTION_HEAD_DIM, totalTokens,
+            workspace.attention, workspace.projection,
+            config.embedding_length, config.attention_width, totalTokens,
             useMatrix);
         metal_encode_residual(encoder, model, workspace, totalTokens);
         metal_encode_norm(encoder, model, workspace.x, 0,
                           &layer->feed_forward_norm, workspace.normalized,
-                          KIPP_EMBEDDING_LENGTH, totalTokens);
+                          config.embedding_length, totalTokens);
         if (useMatrix) {
             metal_encode_stage(encoder, model, workspace,
                                workspace.normalized,
-                               KIPP_EMBEDDING_LENGTH * totalTokens);
+                               config.embedding_length * totalTokens);
         }
         metal_encode_projection(encoder, model, workspace,
                                 &layer->feed_forward_gate,
                                 workspace.normalized, workspace.gate,
-                                KIPP_FEED_FORWARD_LENGTH,
-                                KIPP_EMBEDDING_LENGTH, totalTokens,
+                                config.feed_forward_length,
+                                config.embedding_length, totalTokens,
                                 useMatrix);
         metal_encode_projection(encoder, model, workspace,
                                 &layer->feed_forward_up,
                                 workspace.normalized, workspace.up,
-                                KIPP_FEED_FORWARD_LENGTH,
-                                KIPP_EMBEDDING_LENGTH, totalTokens,
+                                config.feed_forward_length,
+                                config.embedding_length, totalTokens,
                                 useMatrix);
         metal_encode_swiglu(encoder, model, workspace, totalTokens);
         if (useMatrix) {
             metal_encode_stage(encoder, model, workspace, workspace.gate,
-                               KIPP_FEED_FORWARD_LENGTH * totalTokens);
+                               config.feed_forward_length * totalTokens);
         }
         metal_encode_projection(encoder, model, workspace,
                                 &layer->feed_forward_down, workspace.gate,
-                                workspace.projection, KIPP_EMBEDDING_LENGTH,
-                                KIPP_FEED_FORWARD_LENGTH, totalTokens,
+                                workspace.projection,
+                                config.embedding_length,
+                                config.feed_forward_length, totalTokens,
                                 useMatrix);
         metal_encode_residual(encoder, model, workspace, totalTokens);
     }
@@ -653,16 +697,19 @@ static int metal_encode_round(KippMetalModel *model,
         if (p->finishLogits == NULL) {
             continue;
         }
-        NSUInteger lastOffset = (NSUInteger)(p->slot + p->tokens - 1) *
-                                KIPP_EMBEDDING_LENGTH * sizeof(float);
-        metal_encode_norm(encoder, model, workspace.x, lastOffset,
+        /* Write logits for the last `logitsRows` tokens of this part (row
+         * per token). The norm + lm_head matvec batch over those tokens. */
+        uint32_t rows = p->logitsRows == 0 ? 1 : p->logitsRows;
+        NSUInteger firstOffset =
+            (NSUInteger)(p->slot + p->tokens - rows) *
+            config.embedding_length * sizeof(float);
+        metal_encode_norm(encoder, model, workspace.x, firstOffset,
                           &model.view->weights.output_norm,
-                          workspace.normalized, KIPP_EMBEDDING_LENGTH, 1);
-        metal_encode_matvec(encoder, model,
-                            &model.view->weights.token_embedding,
+                          workspace.normalized, config.embedding_length, rows);
+        metal_encode_matvec(encoder, model, &model.view->weights.lm_head,
                             workspace.normalized, model.batchLogits,
                             p->logitsOffset, KIPP_VOCAB_SIZE,
-                            KIPP_EMBEDDING_LENGTH, 1);
+                            config.embedding_length, rows);
     }
 
     [encoder endEncoding];
@@ -672,10 +719,11 @@ static int metal_encode_round(KippMetalModel *model,
     for (uint32_t part = 0; part < partCount; ++part) {
         const metal_round_part *p = &parts[part];
         if (p->finishLogits != NULL) {
+            uint32_t rows = p->logitsRows == 0 ? 1 : p->logitsRows;
             memcpy(p->finishLogits,
                    (const uint8_t *)model.batchLogits.contents +
                        p->logitsOffset,
-                   KIPP_VOCAB_SIZE * sizeof(float));
+                   (size_t)rows * KIPP_VOCAB_SIZE * sizeof(float));
         }
     }
     return 0;
@@ -756,6 +804,7 @@ static int metal_eval_multi(KippMetalModel *model, kipp_eval_item *items,
                 cursor->item->start_position + cursor->progress,
                 finishes ? cursor->item->logits : NULL,
                 (NSUInteger)index * KIPP_VOCAB_SIZE * sizeof(float),
+                1, /* batched eval writes one logit row per item */
             };
             memcpy((uint32_t *)workspace.tokens.contents + slot,
                    cursor->item->tokens + cursor->progress,
@@ -779,7 +828,8 @@ static int metal_eval_multi(KippMetalModel *model, kipp_eval_item *items,
 }
 
 static int metal_compile_pipelines(
-    id<MTLDevice> device, id<MTLLibrary> *outLibrary,
+    id<MTLDevice> device, uint32_t embeddingLength, uint32_t queryHeadCount,
+    id<MTLLibrary> *outLibrary,
     NSDictionary<NSString *, id<MTLComputePipelineState>> **outPipelines,
     BOOL *outMatrixKernelAvailable, kipp_error *error) {
     NSError *libraryError = nil;
@@ -810,7 +860,9 @@ static int metal_compile_pipelines(
     }
     /* The matvec kernel is specialized twice through function constant 0:
      * a one-token variant for decode and a KIPP_METAL_TOKEN_TILE variant
-     * that reuses each weight read across prefill tokens. */
+     * that reuses each weight read across prefill tokens. Constants 1 and 2
+     * carry the model's hidden width and query-head count; values that a
+     * function does not reference are ignored at function creation. */
     NSMutableDictionary<NSString *, NSNumber *> *tiles =
         [NSMutableDictionary dictionaryWithDictionary:@{
           @"kipp_bf16_roundtrip" : @0, @"kipp_embed_gather" : @0,
@@ -820,6 +872,10 @@ static int metal_compile_pipelines(
           @"kipp_bf16_stage" : @0,
           @"kipp_matvec_bf16_decode" : @1,
           @"kipp_matvec_bf16_prefill" : @KIPP_METAL_TOKEN_TILE,
+          @"kipp_matvec_q8_0_decode" : @1,
+          @"kipp_matvec_q8_0_prefill" : @KIPP_METAL_TOKEN_TILE,
+          @"kipp_matvec_affine4_decode" : @1,
+          @"kipp_matvec_affine4_prefill" : @KIPP_METAL_TOKEN_TILE,
         }];
     if (matrixKernel) {
         tiles[@"kipp_matmul_bf16"] = @0;
@@ -830,13 +886,30 @@ static int metal_compile_pipelines(
         uint32_t tile = tiles[name].unsignedIntValue;
         id<MTLFunction> function;
         NSError *pipelineError = nil;
+        MTLFunctionConstantValues *values =
+            [[MTLFunctionConstantValues alloc] init];
+        [values setConstantValue:&embeddingLength
+                            type:MTLDataTypeUInt
+                         atIndex:1];
+        [values setConstantValue:&queryHeadCount
+                            type:MTLDataTypeUInt
+                         atIndex:2];
         if (tile == 0) {
-            function = [library newFunctionWithName:name];
+            function = [library newFunctionWithName:name
+                                     constantValues:values
+                                              error:&pipelineError];
         } else {
-            MTLFunctionConstantValues *values =
-                [[MTLFunctionConstantValues alloc] init];
+            /* Tiled matvecs are keyed <base>_decode / <base>_prefill and
+             * created from the base MSL function with the token-tile
+             * function constant. */
+            NSString *base = name;
+            if ([name hasSuffix:@"_decode"]) {
+                base = [name substringToIndex:name.length - 7];
+            } else if ([name hasSuffix:@"_prefill"]) {
+                base = [name substringToIndex:name.length - 8];
+            }
             [values setConstantValue:&tile type:MTLDataTypeUInt atIndex:0];
-            function = [library newFunctionWithName:@"kipp_matvec_bf16"
+            function = [library newFunctionWithName:base
                                      constantValues:values
                                               error:&pipelineError];
         }
@@ -902,8 +975,10 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
         BOOL matrixKernel = NO;
-        if (metal_compile_pipelines(device, &library, &pipelines,
-                                    &matrixKernel, error) != 0) {
+        if (metal_compile_pipelines(device, view->config.embedding_length,
+                                    view->config.attention_head_count,
+                                    &library, &pipelines, &matrixKernel,
+                                    error) != 0) {
             return -1;
         }
 
@@ -923,6 +998,7 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
         model.weights = weights;
         model.pipelines = pipelines;
         model.view = view;
+        model.config = view->config;
         model.matrixKernelAvailable = matrixKernel;
         model.batchLogits = metal_new_shared_buffer(
             device, (NSUInteger)KIPP_METAL_BATCH * KIPP_VOCAB_SIZE *
@@ -1061,6 +1137,17 @@ static int metal_eval(void *backendModel, kipp_eval_item *items,
                               "Metal session append exceeds capacity %u",
                               session.capacity);
         }
+        uint32_t rows = item->logits_count == 0 ? 1 : item->logits_count;
+        if (rows > item->token_count) {
+            return metal_fail(error, KIPP_ERROR_RANGE,
+                              "logits_count %u exceeds token_count %u", rows,
+                              item->token_count);
+        }
+        if (rows > 1 && item->token_count > KIPP_METAL_BATCH) {
+            return metal_fail(
+                error, KIPP_ERROR_UNSUPPORTED,
+                "multi-row logits require token_count <= %u", KIPP_METAL_BATCH);
+        }
         uint32_t initialLength = session.length;
         for (uint32_t done = 0; done < item->token_count;) {
             uint32_t batch = item->token_count - done;
@@ -1075,6 +1162,7 @@ static int metal_eval(void *backendModel, kipp_eval_item *items,
                 item->start_position + done,
                 finalBatch ? item->logits : NULL,
                 0,
+                finalBatch ? rows : 0,
             };
             memcpy(session.tokens.contents, item->tokens + done,
                    (size_t)batch * sizeof(uint32_t));
@@ -1111,6 +1199,29 @@ const char *kipp_metal_device_name(void) {
     return name;
 }
 
+/* Test hook: reverse a Metal session's page table (before any eval) so the
+ * paged gate can prove the kernels honor the block table under a non-identity
+ * mapping. Mirrors the CPU hook in kipp.c. */
+int kipp_metal_test_scramble_session(void *backendSession) {
+    if (backendSession == NULL) {
+        return -1;
+    }
+    KippMetalSession *session = (__bridge KippMetalSession *)backendSession;
+    if (session.blockTable == nil) {
+        return -1;
+    }
+    uint32_t blocks = session.slabPositions / 32u;
+    uint32_t *table = session.blockTable.contents;
+    for (uint32_t low = 0, high = blocks; low + 1 < high;) {
+        --high;
+        uint32_t swap = table[low];
+        table[low] = table[high];
+        table[high] = swap;
+        ++low;
+    }
+    return 0;
+}
+
 static uint16_t metal_test_float_to_bf16(float value) {
     uint32_t bits;
     memcpy(&bits, &value, sizeof(bits));
@@ -1133,6 +1244,12 @@ static int metal_expect_near(const char *name, const float *actual,
     return 0;
 }
 
+/* Operator tests run without a model; they use the 4B dimensions. */
+enum {
+    KIPP_TEST_EMBED = 2560,
+    KIPP_TEST_Q_HEADS = 32
+};
+
 int kipp_metal_run_operator_tests(kipp_error *error) {
     metal_clear_error(error);
     @autoreleasepool {
@@ -1144,7 +1261,8 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
         BOOL matrixKernel = NO;
-        if (metal_compile_pipelines(device, &library, &pipelines,
+        if (metal_compile_pipelines(device, KIPP_TEST_EMBED,
+                                    KIPP_TEST_Q_HEADS, &library, &pipelines,
                                     &matrixKernel, error) != 0) {
             return -1;
         }
@@ -1195,36 +1313,36 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
 
         {
             uint16_t *embedding =
-                calloc(2 * KIPP_EMBEDDING_LENGTH, sizeof(*embedding));
+                calloc(2 * KIPP_TEST_EMBED, sizeof(*embedding));
             float *expected =
-                malloc(2 * KIPP_EMBEDDING_LENGTH * sizeof(*expected));
+                malloc(2 * KIPP_TEST_EMBED * sizeof(*expected));
             if (embedding == NULL || expected == NULL) {
                 free(embedding);
                 free(expected);
                 return metal_fail(error, KIPP_ERROR_MEMORY,
                                   "operator test allocation failed");
             }
-            for (uint32_t i = 0; i < KIPP_EMBEDDING_LENGTH; ++i) {
+            for (uint32_t i = 0; i < KIPP_TEST_EMBED; ++i) {
                 embedding[i] = metal_test_float_to_bf16(-1.0f);
-                embedding[KIPP_EMBEDDING_LENGTH + i] =
+                embedding[KIPP_TEST_EMBED + i] =
                     metal_test_float_to_bf16(2.0f);
                 expected[i] = 2.0f;
-                expected[KIPP_EMBEDDING_LENGTH + i] = -1.0f;
+                expected[KIPP_TEST_EMBED + i] = -1.0f;
             }
             uint32_t tokenIds[] = {1, 0};
             id<MTLBuffer> weights = [device
                 newBufferWithBytes:embedding
-                           length:2 * KIPP_EMBEDDING_LENGTH * sizeof(*embedding)
+                           length:2 * KIPP_TEST_EMBED * sizeof(*embedding)
                           options:MTLResourceStorageModeShared];
             id<MTLBuffer> tokens =
                 [device newBufferWithBytes:tokenIds
                                     length:sizeof(tokenIds)
                                    options:MTLResourceStorageModeShared];
             id<MTLBuffer> output = metal_new_shared_buffer(
-                device, 2 * KIPP_EMBEDDING_LENGTH * sizeof(float));
+                device, 2 * KIPP_TEST_EMBED * sizeof(float));
             id<MTLCommandBuffer> command = [queue commandBuffer];
             metal_dispatch_2d(command, pipelines[@"kipp_embed_gather"],
-                              KIPP_EMBEDDING_LENGTH, 2,
+                              KIPP_TEST_EMBED, 2,
                               ^(id<MTLComputeCommandEncoder> encoder) {
                                 [encoder setBuffer:weights offset:0 atIndex:0];
                                 [encoder setBuffer:tokens offset:0 atIndex:1];
@@ -1234,7 +1352,7 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             if (status == 0) {
                 status = metal_expect_near(
                     "embedding", output.contents, expected,
-                    2 * KIPP_EMBEDDING_LENGTH, 0.0f, error);
+                    2 * KIPP_TEST_EMBED, 0.0f, error);
             }
             free(embedding);
             free(expected);
@@ -1574,7 +1692,7 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                       KIPP_ATTENTION_HEAD_DIM] = {0};
             float value[KIPP_ATTENTION_HEAD_COUNT_KV *
                         KIPP_ATTENTION_HEAD_DIM] = {0};
-            float query[KIPP_ATTENTION_HEAD_COUNT *
+            float query[KIPP_TEST_Q_HEADS *
                         KIPP_ATTENTION_HEAD_DIM] = {0};
             for (uint32_t head = 0; head < KIPP_ATTENTION_HEAD_COUNT_KV;
                  ++head) {
@@ -1598,6 +1716,10 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                 device, kvValues * sizeof(uint16_t));
             id<MTLBuffer> output = metal_new_shared_buffer(
                 device, sizeof(query));
+            /* Identity page table: the two test positions live in block 0. */
+            id<MTLBuffer> blockTable =
+                metal_new_shared_buffer(device, sizeof(uint32_t));
+            ((uint32_t *)blockTable.contents)[0] = 0;
             metal_kv_params position0 = {0, 0, 1, capacity};
             id<MTLCommandBuffer> first = [queue commandBuffer];
             metal_dispatch_2d(first, pipelines[@"kipp_kv_write"],
@@ -1619,6 +1741,9 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                                 [encoder setBytes:&position0
                                            length:sizeof(position0)
                                           atIndex:4];
+                                [encoder setBuffer:blockTable
+                                            offset:0
+                                           atIndex:5];
                               });
             if (metal_commit_and_wait(first, error) != 0) {
                 return -1;
@@ -1649,10 +1774,13 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                                 [encoder setBytes:&position1
                                            length:sizeof(position1)
                                           atIndex:4];
+                                [encoder setBuffer:blockTable
+                                            offset:0
+                                           atIndex:5];
                               });
             metal_dispatch_groups(
                 second, pipelines[@"kipp_flash_gqa"],
-                KIPP_ATTENTION_HEAD_COUNT, 1, KIPP_METAL_GQA_THREADS,
+                KIPP_TEST_Q_HEADS, 1, KIPP_METAL_GQA_THREADS,
                 ^(id<MTLComputeCommandEncoder> encoder) {
                   [encoder setBuffer:queryBuffer offset:0 atIndex:0];
                   [encoder setBuffer:keyCache offset:0 atIndex:1];
@@ -1661,12 +1789,13 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                   [encoder setBytes:&position1
                              length:sizeof(position1)
                             atIndex:4];
+                  [encoder setBuffer:blockTable offset:0 atIndex:5];
                 });
             if (metal_commit_and_wait(second, error) != 0) {
                 return -1;
             }
             float *outputValues = output.contents;
-            for (uint32_t head = 0; head < KIPP_ATTENTION_HEAD_COUNT; ++head) {
+            for (uint32_t head = 0; head < KIPP_TEST_Q_HEADS; ++head) {
                 size_t base = (size_t)head * KIPP_ATTENTION_HEAD_DIM;
                 if (fabsf(outputValues[base] - 2.0f) > 1.0e-6f) {
                     return metal_fail(error, KIPP_ERROR_INTERNAL,

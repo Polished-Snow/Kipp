@@ -1,10 +1,11 @@
 [project]
 name = "kipp-tools"
-version = "0.1.0"
+version = "0.0.2"
 description = "Tooling-only dependencies for Kipp model preparation"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "huggingface-hub>=0.33",
+    "markdown-it-py>=4.0",
     "numpy>=2.2",
     "safetensors>=0.5",
     "torch>=2.7",

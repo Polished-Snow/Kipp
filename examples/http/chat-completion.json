@@ -1,0 +1,12 @@
+{
+  "model": "qwen3-4b-instruct-2507",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Explain why the sky is blue in two sentences."
+    }
+  ],
+  "max_tokens": 96,
+  "temperature": 0.7,
+  "stream": true
+}

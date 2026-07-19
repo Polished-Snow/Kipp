@@ -1,7 +1,8 @@
 # Kipp Benchmarks
 
-Kipp has a scalar CPU correctness oracle and a correctness-first Metal backend.
-Results must not mix unsupported backends or model variants.
+Kipp has a scalar CPU correctness oracle plus correctness-gated Metal and CUDA
+backends. Results must not mix unsupported checkpoints, weight schemes, or
+backend variants.
 
 ## Required report fields
 
@@ -116,6 +117,7 @@ ordinary process allocations. The artifact size and cache layout therefore
 remain necessary context; the RSS number must not be presented as the total
 memory needed to run the model.
 
-This is a readable fixed-shape baseline, not an optimized performance claim.
-The implementation intentionally excludes fusion, quantization, batching, and
-private weight copies until later architecture phases.
+This was a readable fixed-shape baseline, not an optimized performance claim.
+At that revision the implementation intentionally excluded fusion,
+quantization, batching, and private weight copies; later results above
+supersede those constraints.
