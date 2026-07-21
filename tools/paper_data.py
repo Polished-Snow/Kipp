@@ -39,6 +39,8 @@ EXPECTED_INPUTS = [
     "4b-bf16-decode.json", "4b-bf16-prefill.json",
     "4b-q8_0-decode.json", "4b-q8_0-prefill.json",
     "4b-affine4_gs32-decode.json", "4b-affine4_gs32-prefill.json",
+    "4b-bf16-prefill2k.json", "4b-q8_0-prefill2k.json",
+    "4b-affine4_gs32-prefill2k.json",
     "ctx-3.json", "ctx-200.json", "ctx-800.json", "ctx-1600.json",
     "ctx-3200.json", "ctx-6400.json", "ctx-12800.json",
     "06b-bf16-decode.json", "06b-bf16-prefill.json",
@@ -77,7 +79,7 @@ def fmt_ratio(value):
 
 
 def fmt_ppl(value):
-    return f"{value:.3g}"
+    return f"{value:.3f}"
 
 
 def fmt_pct(value):
@@ -211,6 +213,17 @@ def generate(loaded):
                      f"MAD {prefill_mad:.2g}")
         quant_rows.append(f"{label} {decode:.2f} {prefill:.2f} "
                           f"{decode_mad:.3f} {prefill_mad:.3f}")
+    # Matched 2048-token prefill points for the llama.cpp head-to-head.
+    prefill2k_macro = {"bf16": "PrefillTwoKBF", "q8_0": "PrefillTwoKQEight",
+                       "affine4_gs32": "PrefillTwoKAffine"}
+    for scheme, _ in SCHEMES:
+        name = f"4b-{scheme}-prefill2k.json"
+        if name not in loaded:
+            continue
+        prefill, prefill_mad = metric(name, "prefill_tokens_per_second")
+        macros.macro(prefill2k_macro[scheme], fmt_tps(prefill), name,
+                     "prefill_tokens_per_second.median",
+                     result_commit(loaded[name]), f"MAD {prefill_mad:.2g}")
     if "4b-bf16-decode.json" in loaded:
         rss = loaded["4b-bf16-decode.json"]["peak_resident_bytes"]["median"]
         macros.macro("PeakRSS", f"{rss / 1e6:.0f}", "4b-bf16-decode.json",
@@ -460,13 +473,23 @@ def generate(loaded):
                          "llamacpp-qwen3-4b.json",
                          f"results.{scheme}.prefill.avg_tokens_per_second",
                          commit, f"stddev {prefill['stddev']:.2g}")
-        if "bf16" in llama and "4b-bf16-prefill.json" in loaded:
-            kipp_prefill = loaded["4b-bf16-prefill.json"][
+        # Ratios use the matched-2048 Kipp prefill point, since llama-bench
+        # measured prefill at n_prompt=2048.
+        if "bf16" in llama and "4b-bf16-prefill2k.json" in loaded:
+            kipp_prefill = loaded["4b-bf16-prefill2k.json"][
                 "prefill_tokens_per_second"]["median"]
             ratio = llama["bf16"]["prefill"]["avg_tokens_per_second"] / kipp_prefill
             macros.macro("LlamaPrefillRatioBF", f"{ratio:.1f}",
                          "llamacpp-qwen3-4b.json",
-                         "bf16 prefill / kipp bf16 prefill", commit)
+                         "bf16 prefill / kipp bf16 prefill2k median", commit)
+        if "q8_0" in llama and "4b-q8_0-decode.json" in loaded:
+            kipp_decode = loaded["4b-q8_0-decode.json"][
+                "decode_tokens_per_second"]["median"]
+            ratio = kipp_decode / llama["q8_0"]["decode"]["avg_tokens_per_second"]
+            macros.macro("LlamaDecodeRatioQEight", f"{ratio:.2f}",
+                         "llamacpp-qwen3-4b.json",
+                         "kipp q8_0 decode median / llama q8_0 decode avg",
+                         commit)
 
     # Fault injection.
     if "faults.json" in loaded:
@@ -507,9 +530,9 @@ def generate(loaded):
                      f"total_seconds {costs['total_seconds']} -> minutes",
                      commit)
         # Metal full-logit NMSE as reported by the --phase3-metal gate run.
-        nmse = costs.get("metal_full_logit_nmse")
-        if nmse is not None:
-            macros.macro("MetalNmse", fmt_nmse(nmse),
+        if "metal_full_logit_nmse" in costs:
+            macros.macro("MetalNmse",
+                         fmt_nmse(costs["metal_full_logit_nmse"]),
                          "gate-costs.json", "metal_full_logit_nmse", commit)
 
     outputs["generated/results-macros.tex"] = macros.text()
@@ -564,10 +587,11 @@ def spec_coherence_problems(loaded):
             problems.append(
                 f"{name} was measured on scheme '{scheme}'; the spec A/B "
                 "protocol uses the q8_0 model")
-    reference = None
-    if "4b-q8_0-decode.json" in loaded:
-        reference = loaded["4b-q8_0-decode.json"][
-            "decode_tokens_per_second"]["median"]
+    # The two halves of the A/B must agree with each other. They are NOT
+    # compared against the plain 4b-q8_0 decode median: spec workloads
+    # legitimately decode slower than the short-prompt microbenchmark
+    # because their prompts carry much longer attention contexts
+    # (repetitive/code baselines sit near 50 tok/s at 98 tok/s decode).
     for workload in SPEC_WORKLOADS:
         base_a = spec[workload]["baseline_decode_tps"]
         base_b = gated[workload]["baseline_decode_tps"]
@@ -576,13 +600,6 @@ def spec_coherence_problems(loaded):
                 f"spec baseline incoherent for '{workload}': spec.json "
                 f"{base_a} vs spec-gated.json {base_b} (>10% apart; "
                 "regenerate both in one session)")
-        if reference is not None:
-            for label, base in (("spec.json", base_a),
-                                ("spec-gated.json", base_b)):
-                if abs(base - reference) / reference > 0.10:
-                    problems.append(
-                        f"{label} '{workload}' baseline {base} is >10% from "
-                        f"4b-q8_0-decode.json median {reference:.2f}")
     return problems
 
 

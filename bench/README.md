@@ -39,6 +39,25 @@ working-tree changes are freshly written result files records
 `dirty: false`. Any modification outside `bench/results/` still marks the
 run dirty.
 
+## Measurement protocol: GPU steady state
+
+Apple-silicon GPU clocks are aggressively demand-scaled. A short dispatch
+burst (a one-second prefill) issued from an idle GPU runs well below the
+sustained clock and can measure 2–5x low with run-to-run swings of 3x;
+the same measurement taken back-to-back with other GPU work is stable to a
+fraction of a percent. Other GPU clients (browsers, music players, IDE
+rendering) depress compute-bound kernels — quantized prefill hardest,
+because in-kernel dequantization is ALU-heavy — while leaving
+bandwidth-bound decode almost untouched. A cool chassis additionally
+allows a short-lived boost regime above the sustained level.
+
+All committed numbers are therefore **sustained steady-state** figures:
+the machine otherwise idle, measurements taken back-to-back in one session
+after a multi-minute GPU warm-up workload, external baselines (llama.cpp)
+measured in the same session under the same conditions. Result files with
+tight dispersion (MAD well under 1%) indicate the protocol held; a wide
+MAD means the session was contaminated and should be re-run.
+
 ## Results (`results/*.json`)
 
 Committed per configuration. Naming: `<model>-<scheme>-<decode|prefill>.json`,

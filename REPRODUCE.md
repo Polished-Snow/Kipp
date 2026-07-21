@@ -74,6 +74,15 @@ The harness (`tools/bench.py`) runs isolated subprocesses with a discarded
 warm-up, reports median + MAD + min/max, and separates prefill from decode
 timers. Results land in `bench/results/` as JSON.
 
+**Measure in GPU steady state.** Apple-silicon GPU clocks are demand-scaled:
+short bursts from an idle GPU measure far below the sustained clock (2-5x,
+with 3x run-to-run swings), other GPU clients depress compute-bound prefill
+while barely touching bandwidth-bound decode, and a cool chassis briefly
+boosts above the sustained level. Run benches on an otherwise idle machine,
+back-to-back in one session, after a few minutes of continuous GPU work;
+check the recorded MAD is well under 1% before trusting a file (see
+`bench/README.md`, "Measurement protocol").
+
 ```bash
 # Decode throughput by weight scheme (Apple M5 Metal), Qwen3-4B:
 python3 tools/bench.py --backend metal --model models/qwen3-4b-base/kipp-qwen3-4b-base-bf16.gguf \
@@ -85,9 +94,22 @@ python3 tools/bench.py --backend metal --model models/qwen3-4b-base/kipp-qwen3-4
 python3 tools/bench.py --backend metal --model <gguf> --prompt "<~300-word prompt>" \
   --decode 8 --warmup 1 --runs 5 --output bench/results/4b-<scheme>-prefill.json
 
-# Speculative decoding (acceptance, block efficiency, wall-clock speedup):
+# Speculative decoding A/B (run both in one session for coherent baselines):
 python3 bench/spec_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0.gguf \
-  --decode 64 --runs 3
+  --decode 256 --runs 3 --gate off --output bench/results/spec.json
+python3 bench/spec_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0.gguf \
+  --decode 256 --runs 3 --gate on --output bench/results/spec-gated.json
+
+# Serving: batch scaling, cross-request prefix reuse, open-loop load:
+python3 bench/server_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0.gguf \
+  --output bench/results/server-batch.json
+python3 bench/prefix_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0.gguf \
+  --output bench/results/prefix-reuse.json
+python3 bench/load_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0.gguf \
+  --rates 0.5,1,2,4 --requests 32 --output bench/results/load.json
+
+# Quantization quality (wikitext-2 perplexity; CPU-vs-Metal verify included):
+python3 bench/ppl_bench.py --output bench/results/ppl-4b.json
 ```
 
 CUDA numbers use the same harness with `--backend cuda --binary build/kipp-cuda-generic`
@@ -100,6 +122,9 @@ workflow used to produce them.
 cd paper && tectonic main.tex   # -> paper/main.pdf
 ```
 
-The numbers in `paper/main.tex` are LaTeX macros at the top of the file, each
-annotated with the `bench/results/` JSON it came from; update the macros when
-you re-run the harness on new hardware.
+The numbers in `paper/main.tex` are LaTeX macros generated from committed
+`bench/results/*.json` by `make paper-data` (into `paper/generated/` and
+`paper/data/`), each annotated with its source file and field.
+`make paper-check` fails if any consumed result file is missing, untracked,
+modified, or if the generated files drift from regeneration — run it after
+re-running the harness on new hardware.
