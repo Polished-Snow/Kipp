@@ -69,33 +69,35 @@ Committed per configuration. Naming: `<model>-<scheme>-<decode|prefill>.json`,
 
 ## Reference numbers — Apple M5 Max (Qwen3-4B, Metal, greedy, median of 5)
 
-Measured on a MacBook Pro M5 Max (40-core GPU, 128 GB unified memory).
-Numbers from earlier releases were measured on a base M5 (10-core GPU,
-24 GB) and are roughly 4× lower across the board; see each result file's
-recorded hardware.
+Measured on a MacBook Pro M5 Max (40-core GPU, 128 GB unified memory) under
+the steady-state protocol above. Numbers from earlier releases were measured
+on a base M5 (10-core GPU, 24 GB) and are roughly 4× lower across the board;
+see each result file's recorded hardware.
 
-| Weight scheme | Decode tok/s | Prefill tok/s |
-|---|---|---|
-| BF16 | 59.2 | 537 |
-| Q8_0 (8-bit) | 90.6 | 497 |
-| Affine (4-bit) | 127.5 | 527 |
+| Weight scheme | Decode tok/s | Prefill tok/s (348 tokens) | Wikitext-2 PPL |
+|---|---|---|---|
+| BF16 | 60.3 | 355 | 7.731 |
+| Q8_0 (8-bit) | 98.2 | 218 | 7.733 |
+| affine4 (4-bit) | 130 | 297 | 8.170 |
 
 Peak process RSS ≈ 41 MB (weights are mmap-ed; RSS understates GPU-touched
 residency). Decode is bandwidth-bound, so quantization scales it with the
-weight-byte reduction. Prefill is compute-bound; the quantized simdgroup-
-matrix (MMA) kernels dequantize each 32-weight block once per 16-token tile,
-so quantized prefill tracks the BF16 matrix path (the earlier vector-kernel
-path measured 215/239 tok/s for Q8_0/4-bit on this host — a 2.2–2.3×
-regression, since removed).
+weight-byte reduction at unmeasurable quality cost for Q8_0 (+0.02% PPL)
+and a Q4-class cost for affine4 (+5.7% PPL). Prefill is currently
+dominated by the tiled flash-attention prefill kernel, whose cost grows
+with context (355 tok/s at 348 tokens down to ~62 tok/s at 12.8k for
+Q8_0) and which trails BF16 for quantized weights; optimizing it is open
+work — see the paper's ablation section.
 
-Speculative decoding (Q8_0, 256-token decode, controlled A/B, median of 3):
+Speculative decoding (Q8_0, 256-token decode, paired-baseline A/B via
+`--gate both`, median of 3):
 
 | Workload | α | Ungated | Gated | Duty |
 |---|---|---|---|---|
-| Repetitive / copy-heavy | 1.00 | 2.76× | 2.21× | 1.00 |
-| Code | 0.19 | 0.62× | 0.94× | 0.06 |
-| Grounded QA | 0.00 | 0.35× | 0.94× | 0.04 |
-| Open-ended | 0.09 | 0.65× | 0.85× | 0.10 |
+| Repetitive / copy-heavy | 1.00 | 3.09× | 3.17× | 1.00 |
+| Code | 0.19 | 0.72× | 0.89× | 0.06 |
+| Grounded QA | 0.00 | 0.40× | 0.89× | 0.04 |
+| Open-ended | 0.09 | 0.62× | 0.80× | 0.10 |
 
 Prompt-lookup only pays at high acceptance; the adaptive gate suspends
 drafting when a short acceptance EMA collapses and probes periodically, which
@@ -108,8 +110,9 @@ copy-heavy win. Gated speculative output remains token-identical to greedy.
 python3 tools/bench.py --backend metal --model <gguf> \
   --prompt "The capital of France is" --decode 64 --warmup 1 --runs 5 \
   --output bench/results/4b-<scheme>-decode.json
-python3 bench/spec_bench.py --model <q8_0 gguf> --decode 256 --runs 3
+python3 bench/spec_bench.py --model <q8_0 gguf> --decode 256 --runs 3 --gate both
 python3 bench/server_bench.py --model <gguf>
+python3 bench/ppl_bench.py --output bench/results/ppl-4b.json
 ```
 
 ## Submitting results for new hardware
