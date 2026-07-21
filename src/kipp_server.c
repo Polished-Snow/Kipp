@@ -22,9 +22,11 @@
 
 #include "kipp.h"
 #include "kipp_chat.h"
+#include "kipp_kv_pool.h" /* KIPP_KV_BLOCK_TOKENS for pool sizing */
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -64,7 +66,18 @@ static struct {
     uint64_t requests_failed_total;
     uint64_t prompt_tokens_total;
     uint64_t generation_tokens_total;
+    uint64_t prefix_tokens_reused_total;
 } server_metrics;
+
+/*
+ * Pool-backed cross-request prefix sharing (CPU and Metal backends). When
+ * on, every choice gets a pooled session that adopts the longest published
+ * prefix of its prompt at admission, and admission reserves worst-case pool
+ * blocks so an admitted request can never hit exhaustion mid-generation.
+ * The legacy single-slot session cache serves only non-pooled models.
+ */
+static bool server_pooled;
+static kipp_model *server_model; /* for pool stats at GET /metrics */
 
 static void handle_stop_signal(int signal_number) {
     (void)signal_number;
@@ -1995,6 +2008,94 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
     }
 
     size_t needed = gen->tokens.count + gen->request.max_tokens;
+    if (server_pooled) {
+        /*
+         * Pooled admission: one pooled session per choice adopts the longest
+         * published prefix, then worst-case block reservation decides whether
+         * the whole request fits. Refusal leaves the connection WAITING, so
+         * pool pressure delays admission instead of corrupting actives.
+         */
+        uint32_t matched = 0;
+        bool session_failed = false;
+        for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
+            uint32_t choice_matched = 0;
+            if (kipp_session_create(model, (uint32_t)needed,
+                                    &gen->choices[choice].session,
+                                    &error) != 0 ||
+                kipp_session_match_prefix(gen->choices[choice].session,
+                                          gen->tokens.data, gen->tokens.count,
+                                          &choice_matched, &error) != 0 ||
+                (choice > 0 && choice_matched != matched)) {
+                session_failed = true;
+            }
+            if (session_failed) {
+                for (uint32_t undo = 0; undo <= choice; ++undo) {
+                    kipp_session_destroy(gen->choices[undo].session);
+                    gen->choices[undo].session = NULL;
+                }
+                break;
+            }
+            matched = choice_matched;
+        }
+        if (session_failed) {
+            connection_error(conn, 500, "Internal Server Error",
+                             "server_error",
+                             "unable to allocate pooled sessions: %s",
+                             error.message);
+            goto reject;
+        }
+        /*
+         * Worst case, this request still needs its unmatched blocks and
+         * every active choice still needs the tail of its own budget. The
+         * scheduler is single-threaded, so admitting under this bound means
+         * mid-generation allocation can never fail.
+         */
+        uint64_t request_blocks =
+            (needed + KIPP_KV_BLOCK_TOKENS - 1) / KIPP_KV_BLOCK_TOKENS;
+        uint64_t needed_blocks =
+            (uint64_t)gen->choice_count *
+            (request_blocks - matched / KIPP_KV_BLOCK_TOKENS);
+        uint64_t outstanding_blocks = 0;
+        for (uint32_t slot = 0; slot < SERVER_MAX_GENERATIONS; ++slot) {
+            generation *active = &generations[slot];
+            if (!active->in_use) {
+                continue;
+            }
+            uint64_t budget_blocks =
+                (active->tokens.count + active->request.max_tokens +
+                 KIPP_KV_BLOCK_TOKENS - 1) /
+                KIPP_KV_BLOCK_TOKENS;
+            for (uint32_t choice = 0; choice < active->choice_count;
+                 ++choice) {
+                kipp_session_info info;
+                if (kipp_session_get_info(active->choices[choice].session,
+                                          &info) == 0) {
+                    uint64_t held_blocks =
+                        ((uint64_t)info.length + KIPP_KV_BLOCK_TOKENS - 1) /
+                        KIPP_KV_BLOCK_TOKENS;
+                    outstanding_blocks += budget_blocks > held_blocks
+                                              ? budget_blocks - held_blocks
+                                              : 0;
+                }
+            }
+        }
+        kipp_kv_pool_stats_public stats;
+        if (kipp_model_kv_pool_stats(model, &stats) != 0 ||
+            stats.free_blocks < needed_blocks + outstanding_blocks) {
+            for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
+                kipp_session_destroy(gen->choices[choice].session);
+                gen->choices[choice].session = NULL;
+            }
+            free(gen->logits);
+            kipp_tokens_free(&gen->tokens);
+            completion_request_free(&gen->request);
+            memset(gen, 0, sizeof(*gen));
+            return 1; /* pool pressure: stay WAITING, retry via FIFO */
+        }
+        gen->prefill_progress = matched;
+        server_metrics.prefix_tokens_reused_total += matched;
+        goto admitted;
+    }
     if (gen->choice_count == 1 && !cache.busy && cache.session != NULL &&
         cache.capacity >= needed) {
         /* Roll the cached session back to the shared prompt prefix. */
@@ -2057,6 +2158,7 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
         }
     }
 
+admitted:
     gen->id = ++completion_counter;
     gen->created = (long long)time(NULL);
     gen->admitted_ns = now_ns();
@@ -2417,6 +2519,41 @@ static void connection_serve_metrics(server_connection *conn) {
         "# HELP kipp_requests_waiting Parsed requests awaiting admission\n"
         "# TYPE kipp_requests_waiting gauge\nkipp_requests_waiting %u\n",
         running, running_choices, waiting);
+    kipp_kv_pool_stats_public pool_stats;
+    if (server_pooled &&
+        kipp_model_kv_pool_stats(server_model, &pool_stats) == 0) {
+        /* One append per metric: sb_append_format's scratch is small. */
+        sb_append_format(&body,
+                         "# HELP kipp_kv_pool_blocks_total KV pool blocks\n"
+                         "# TYPE kipp_kv_pool_blocks_total gauge\n"
+                         "kipp_kv_pool_blocks_total %u\n",
+                         pool_stats.total_blocks);
+        sb_append_format(&body,
+                         "# HELP kipp_kv_pool_blocks_free Unreferenced KV "
+                         "pool blocks\n"
+                         "# TYPE kipp_kv_pool_blocks_free gauge\n"
+                         "kipp_kv_pool_blocks_free %u\n",
+                         pool_stats.free_blocks);
+        sb_append_format(&body,
+                         "# HELP kipp_kv_pool_reused_blocks_total Pool "
+                         "blocks adopted from the content index\n"
+                         "# TYPE kipp_kv_pool_reused_blocks_total counter\n"
+                         "kipp_kv_pool_reused_blocks_total %llu\n",
+                         (unsigned long long)pool_stats.reused_blocks_total);
+        sb_append_format(&body,
+                         "# HELP kipp_kv_pool_evicted_blocks_total "
+                         "Published blocks reclaimed for new content\n"
+                         "# TYPE kipp_kv_pool_evicted_blocks_total counter\n"
+                         "kipp_kv_pool_evicted_blocks_total %llu\n",
+                         (unsigned long long)pool_stats.evicted_blocks_total);
+        sb_append_format(
+            &body,
+            "# HELP kipp_prefix_tokens_reused_total Prompt tokens adopted "
+            "from the pool at admission\n"
+            "# TYPE kipp_prefix_tokens_reused_total counter\n"
+            "kipp_prefix_tokens_reused_total %llu\n",
+            (unsigned long long)server_metrics.prefix_tokens_reused_total);
+    }
     if (body.failed) {
         conn->phase = CONNECTION_DRAINING;
         sb_free(&body);
@@ -2700,12 +2837,16 @@ static void serve(kipp_model *model, int listener) {
 static void server_usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --model MODEL.gguf [--backend cpu|metal|cuda] "
-            "[--port N]\n"
+            "[--port N] [--kv-pool-mib N]\n"
             "Serves GET /healthz, GET /metrics, GET /v1/models, "
             "POST /v1/completions, and POST /v1/chat/completions "
             "on 127.0.0.1.\n"
             "Concurrent requests decode together through batched "
-            "evaluation.\n",
+            "evaluation.\n"
+            "--kv-pool-mib sizes the shared KV pool for cross-request "
+            "prefix sharing\n"
+            "(CPU/Metal; default sizes it to the checkpoint's context "
+            "length; 0 disables).\n",
             program);
 }
 
@@ -2713,6 +2854,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL;
     kipp_backend_kind backend = KIPP_BACKEND_CPU;
     unsigned long port = SERVER_DEFAULT_PORT;
+    unsigned long pool_mib = ULONG_MAX; /* ULONG_MAX = auto-size */
     kipp_model *model = NULL;
     kipp_error error = {0};
     int listener = -1;
@@ -2740,6 +2882,16 @@ int main(int argc, char **argv) {
             port = strtoul(argv[++index], &end, 10);
             if (errno != 0 || end == argv[index] || *end != '\0' ||
                 port == 0 || port > 65535) {
+                server_usage(argv[0]);
+                return 1;
+            }
+        } else if (strcmp(argv[index], "--kv-pool-mib") == 0 &&
+                   index + 1 < argc) {
+            char *end = NULL;
+            errno = 0;
+            pool_mib = strtoul(argv[++index], &end, 10);
+            if (errno != 0 || end == argv[index] || *end != '\0' ||
+                pool_mib == ULONG_MAX) {
                 server_usage(argv[0]);
                 return 1;
             }
@@ -2771,6 +2923,57 @@ int main(int argc, char **argv) {
         (void)kipp_model_close(model, NULL);
         return 1;
     }
+    /*
+     * Pool-backed prefix sharing is the CPU/Metal default: reopen the model
+     * pooled, sized to the checkpoint's context length (the worst single
+     * session today) unless --kv-pool-mib overrides it. 0 disables; CUDA
+     * stays on the legacy per-session path.
+     */
+    if (pool_mib != 0 && backend != KIPP_BACKEND_CUDA) {
+        uint64_t per_token_bytes = (uint64_t)server_info.block_count * 2u *
+                                   KIPP_ATTENTION_HEAD_COUNT_KV *
+                                   KIPP_ATTENTION_HEAD_DIM * sizeof(uint16_t);
+        uint64_t per_block_bytes = per_token_bytes * KIPP_KV_BLOCK_TOKENS;
+        uint64_t pool_blocks;
+        if (pool_mib == ULONG_MAX) {
+            pool_blocks = (server_info.context_length +
+                           KIPP_KV_BLOCK_TOKENS - 1) /
+                          KIPP_KV_BLOCK_TOKENS;
+        } else {
+            pool_blocks = pool_mib * 1024u * 1024u / per_block_bytes;
+        }
+        if (pool_blocks == 0 || pool_blocks > UINT32_MAX) {
+            fprintf(stderr,
+                    "kipp-server: --kv-pool-mib %lu holds no whole %u-token "
+                    "block (one block is %llu MiB)\n",
+                    pool_mib, KIPP_KV_BLOCK_TOKENS,
+                    (unsigned long long)(per_block_bytes / (1024u * 1024u)));
+            (void)kipp_model_close(model, NULL);
+            return 1;
+        }
+        kipp_model *pooled_model = NULL;
+        if (kipp_model_close(model, &error) != 0) {
+            fprintf(stderr, "kipp-server: close: %s\n", error.message);
+            return 1;
+        }
+        model = NULL;
+        if (kipp_model_open_pooled(model_path, backend,
+                                   (uint32_t)pool_blocks, &pooled_model,
+                                   &error) != 0) {
+            fprintf(stderr, "kipp-server: pooled open: %s: %s\n",
+                    kipp_error_code_name(error.code), error.message);
+            return 1;
+        }
+        model = pooled_model;
+        server_pooled = true;
+        fprintf(stderr,
+                "kipp-server: KV pool %llu blocks (%llu MiB) for "
+                "cross-request prefix sharing\n",
+                (unsigned long long)pool_blocks,
+                (unsigned long long)(pool_blocks * per_block_bytes /
+                                     (1024u * 1024u)));
+    }
+    server_model = model;
 
     listener = socket(AF_INET, SOCK_STREAM, 0);
     if (listener < 0) {

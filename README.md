@@ -35,9 +35,11 @@
 > smaller Q4-class option, with ~1.6–2× faster decode and larger checkpoints
 > under Apple's Metal single-buffer cap. The server speaks the OpenAI
 > **Completions and Chat Completions** subset (SSE streaming, batched
-> multi-sequence decode, serial prefix reuse), a full sampling surface
+> multi-sequence decode), a full sampling surface
 > (temperature, top-p, top-k, min-p, penalties, logit_bias, seed), and a
-> Prometheus `/metrics` endpoint.
+> Prometheus `/metrics` endpoint — with **cross-request KV prefix caching**
+> on CPU/Metal through a content-addressed block pool, gated bitwise
+> against unshared evaluation.
 
 ## What is Kipp?
 

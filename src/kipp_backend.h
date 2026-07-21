@@ -61,6 +61,12 @@ typedef struct {
     float rope_theta;
     bool tied_embeddings;
     kipp_quant_scheme quant_scheme;
+    /*
+     * Pooled KV: when nonzero, the backend model owns one shared slab of
+     * this many 32-position blocks and pooled sessions map their block
+     * tables onto it. 0 keeps today's per-session slabs.
+     */
+    uint32_t kv_pool_blocks;
 } kipp_model_config;
 
 /*
@@ -131,6 +137,13 @@ typedef struct {
      * case). Enables speculative verify and prompt logprobs.
      */
     uint32_t logits_count;
+    /*
+     * Pooled sessions only: logical-to-physical block map into the model's
+     * pooled slab, valid for this call, covering every block up to
+     * ceil((start_position + token_count) / 32) entries. NULL for sessions
+     * with private slabs (their identity table lives in the backend).
+     */
+    const uint32_t *block_table;
 } kipp_eval_item;
 
 typedef struct {

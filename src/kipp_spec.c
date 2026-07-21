@@ -36,3 +36,43 @@ size_t kipp_spec_prompt_lookup(const uint32_t *history, size_t history_len,
     }
     return 0;
 }
+
+void kipp_spec_gate_init(kipp_spec_gate *gate) {
+    gate->ema = 0.5f;
+    gate->active = 1;
+    gate->tokens_since_probe = 0;
+}
+
+int kipp_spec_gate_should_draft(const kipp_spec_gate *gate) {
+    return gate->active ||
+           gate->tokens_since_probe >= KIPP_SPEC_GATE_PROBE_INTERVAL;
+}
+
+void kipp_spec_gate_record(kipp_spec_gate *gate, uint32_t drafted,
+                           uint32_t accepted) {
+    if (drafted == 0) {
+        return;
+    }
+    float fraction = (float)accepted / (float)drafted;
+    if (gate->active) {
+        gate->ema = KIPP_SPEC_GATE_EMA_DECAY * gate->ema +
+                    (1.0f - KIPP_SPEC_GATE_EMA_DECAY) * fraction;
+        if (gate->ema < KIPP_SPEC_GATE_OFF) {
+            gate->active = 0;
+        }
+    } else {
+        /* Probe step: re-enable on a strong result and restart the EMA from
+         * it — the suspended regime's history is stale either way. */
+        if (fraction >= KIPP_SPEC_GATE_PROBE_ON) {
+            gate->active = 1;
+            gate->ema = fraction;
+        }
+    }
+    gate->tokens_since_probe = 0;
+}
+
+void kipp_spec_gate_tick(kipp_spec_gate *gate) {
+    if (!gate->active) {
+        ++gate->tokens_since_probe;
+    }
+}

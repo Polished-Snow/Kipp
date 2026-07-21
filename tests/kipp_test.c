@@ -508,6 +508,27 @@ static void test_public_argument_checks(void) {
     kipp_batch_item batch_item = {NULL, &token, 1, logits};
     CHECK(kipp_eval_batch(NULL, &batch_item, 1, &error) != 0);
     CHECK(error.code == KIPP_ERROR_ARGUMENT);
+    /* Pooled opens validate before touching the file or any hardware. */
+    kipp_model *pooled_model = NULL;
+    CHECK(kipp_model_open_pooled("unused.gguf", KIPP_BACKEND_CPU, 0,
+                                 &pooled_model, &error) != 0);
+    CHECK(error.code == KIPP_ERROR_RANGE);
+    CHECK(pooled_model == NULL);
+    CHECK(kipp_model_open_pooled("unused.gguf", KIPP_BACKEND_METAL, 8,
+                                 &pooled_model, &error) != 0);
+#ifdef KIPP_ENABLE_METAL
+    /* Pooled Metal is supported: the open proceeds past the backend check
+     * and fails on the missing file instead. */
+    CHECK(error.code != KIPP_ERROR_UNSUPPORTED);
+#else
+    CHECK(error.code == KIPP_ERROR_UNSUPPORTED);
+#endif
+    CHECK(kipp_model_open_pooled("unused.gguf", KIPP_BACKEND_CUDA, 8,
+                                 &pooled_model, &error) != 0);
+    CHECK(error.code == KIPP_ERROR_UNSUPPORTED);
+    CHECK(kipp_session_match_prefix(NULL, &token, 1, NULL, &error) != 0);
+    CHECK(error.code == KIPP_ERROR_ARGUMENT);
+    CHECK(kipp_model_kv_pool_stats(NULL, NULL) != 0);
 #ifndef KIPP_ENABLE_METAL
     kipp_model *metal_model = NULL;
     CHECK(kipp_model_open_backend("unused.gguf", KIPP_BACKEND_METAL,
@@ -630,6 +651,57 @@ static void test_prompt_lookup(void) {
     /* Degenerate inputs are safe. */
     CHECK(kipp_spec_prompt_lookup(NULL, 0, 3, 1, 4, drafts) == 0);
     CHECK(kipp_spec_prompt_lookup(repeat, 7, 3, 1, 0, drafts) == 0);
+}
+
+static void test_spec_gate(void) {
+    kipp_spec_gate gate;
+
+    /* Fresh gate drafts immediately. */
+    kipp_spec_gate_init(&gate);
+    CHECK(kipp_spec_gate_should_draft(&gate));
+
+    /* Two zero-acceptance drafts suspend it (0.5 -> 0.25 -> 0.125). */
+    kipp_spec_gate_record(&gate, 8, 0);
+    CHECK(kipp_spec_gate_should_draft(&gate));
+    kipp_spec_gate_record(&gate, 8, 0);
+    CHECK(!kipp_spec_gate_should_draft(&gate));
+
+    /* Suspended: no draft until the probe interval elapses. */
+    for (uint32_t i = 0; i < KIPP_SPEC_GATE_PROBE_INTERVAL - 1; ++i) {
+        kipp_spec_gate_tick(&gate);
+        CHECK(!kipp_spec_gate_should_draft(&gate));
+    }
+    kipp_spec_gate_tick(&gate);
+    CHECK(kipp_spec_gate_should_draft(&gate));
+
+    /* A weak probe stays suspended and restarts the probe clock. */
+    kipp_spec_gate_record(&gate, 8, 1);
+    CHECK(!kipp_spec_gate_should_draft(&gate));
+
+    /* A strong probe re-enables and restarts the EMA from the probe. */
+    for (uint32_t i = 0; i < KIPP_SPEC_GATE_PROBE_INTERVAL; ++i) {
+        kipp_spec_gate_tick(&gate);
+    }
+    CHECK(kipp_spec_gate_should_draft(&gate));
+    kipp_spec_gate_record(&gate, 8, 8);
+    CHECK(kipp_spec_gate_should_draft(&gate));
+
+    /* Full acceptance never suspends. */
+    for (int i = 0; i < 16; ++i) {
+        kipp_spec_gate_record(&gate, 8, 8);
+        CHECK(kipp_spec_gate_should_draft(&gate));
+    }
+
+    /* Sustained mediocre acceptance below the threshold suspends again. */
+    for (int i = 0; i < 16 && kipp_spec_gate_should_draft(&gate); ++i) {
+        kipp_spec_gate_record(&gate, 8, 1);
+    }
+    CHECK(!kipp_spec_gate_should_draft(&gate));
+
+    /* A zero-drafted record is ignored. */
+    kipp_spec_gate_init(&gate);
+    kipp_spec_gate_record(&gate, 0, 0);
+    CHECK(kipp_spec_gate_should_draft(&gate));
 }
 
 static void test_chat_render(void) {
@@ -1127,8 +1199,15 @@ static int run_paged_test(const char *model_path, const char *vector_directory,
      * so the final position's attention spans several physically-scrambled
      * blocks. Compare only the final logits: they already depend on every
      * cached position, so this stays cheap (one lm_head) yet exercises the
-     * whole paged read/write path. */
-    uint32_t n = 2 * KIPP_KV_BLOCK_TOKENS;
+     * whole paged read/write path.
+     *
+     * Three blocks, not two: reversing a 2-entry table is a swap, and for a
+     * block-rollover bug ("first slot of block b written one past the end of
+     * block b-1's physical block, wrapping") the swap composed with the wrap
+     * lands on the correct byte again — the mutation study caught the gate
+     * itself being degenerate at 2 blocks. Reversal over >= 3 blocks breaks
+     * physical adjacency, which is what exposes that fault class. */
+    uint32_t n = 3 * KIPP_KV_BLOCK_TOKENS;
     uint32_t capacity = n;
     tokens = malloc((size_t)n * sizeof(*tokens));
     if (tokens == NULL) {
@@ -1191,6 +1270,400 @@ cleanup:
     free(tokens);
     free(rows_identity);
     free(rows_scrambled);
+    return result;
+}
+
+/*
+ * Phase 5 pooled-KV gate (CPU). Proves, with the real model, that pooled
+ * sessions are bitwise-equal to private-slab sessions; that publish-at-finish
+ * prefix sharing reproduces unshared logits bitwise; that shared and cold
+ * sessions batch together correctly; that pool exhaustion fails cleanly
+ * without disturbing other sessions; that truncation into the private tail
+ * stays correct; and that eviction only shrinks future matches.
+ */
+static int run_pooled_test(const char *model_path,
+                           const char *vector_directory,
+                           kipp_backend_kind backend, const char *label) {
+    enum { POOL_SEQ = 3 * KIPP_KV_BLOCK_TOKENS };
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *seed = NULL;
+    size_t token_bytes = 0;
+    uint32_t sequence[POOL_SEQ];
+    uint32_t alternate[POOL_SEQ];
+    kipp_model *reference_model = NULL;
+    kipp_model *pooled_model = NULL;
+    kipp_model *tiny_model = NULL;
+    kipp_session *session = NULL;
+    kipp_session *second = NULL;
+    kipp_session *third = NULL;
+    float *reference_full = NULL;   /* sequence[0..96) */
+    float *reference_mixed = NULL;  /* sequence[0..64) + alternate[64..96) */
+    float *reference_cut = NULL;    /* sequence[0..70) + alternate[70..96) */
+    float *actual = NULL;
+    float *actual_second = NULL;
+    float *actual_third = NULL;
+    kipp_error error = {0};
+    kipp_kv_pool_stats_public stats;
+    uint32_t matched = 0;
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&seed, &token_bytes) != 0 ||
+        token_bytes < sizeof(*seed) || token_bytes % sizeof(*seed)) {
+        fprintf(stderr, "unable to read pooled-cpu token vector\n");
+        goto cleanup;
+    }
+    size_t seed_count = token_bytes / sizeof(*seed);
+    for (uint32_t index = 0; index < POOL_SEQ; ++index) {
+        sequence[index] = seed[index % seed_count];
+        /* A diverging continuation built from the same valid ids. */
+        alternate[index] = seed[(index + seed_count / 2 + 1) % seed_count];
+    }
+    reference_full = malloc(KIPP_VOCAB_SIZE * sizeof(*reference_full));
+    reference_mixed = malloc(KIPP_VOCAB_SIZE * sizeof(*reference_mixed));
+    reference_cut = malloc(KIPP_VOCAB_SIZE * sizeof(*reference_cut));
+    actual = malloc(KIPP_VOCAB_SIZE * sizeof(*actual));
+    actual_second = malloc(KIPP_VOCAB_SIZE * sizeof(*actual_second));
+    actual_third = malloc(KIPP_VOCAB_SIZE * sizeof(*actual_third));
+    if (reference_full == NULL || reference_mixed == NULL ||
+        reference_cut == NULL || actual == NULL || actual_second == NULL ||
+        actual_third == NULL) {
+        fprintf(stderr, "pooled-%s allocation failed\n", label);
+        goto cleanup;
+    }
+
+    /* References from ordinary private-slab sessions. */
+    if (kipp_model_open_backend(model_path, backend, &reference_model,
+                                &error) != 0) {
+        fprintf(stderr, "pooled-%s reference open failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    {
+        uint32_t mixed[POOL_SEQ];
+        uint32_t cut[POOL_SEQ];
+        memcpy(mixed, sequence, 64 * sizeof(*mixed));
+        memcpy(mixed + 64, alternate + 64, 32 * sizeof(*mixed));
+        memcpy(cut, sequence, 70 * sizeof(*cut));
+        memcpy(cut + 70, alternate + 70, 26 * sizeof(*cut));
+        const uint32_t *inputs[3] = {sequence, mixed, cut};
+        float *outputs[3] = {reference_full, reference_mixed, reference_cut};
+        for (int variant = 0; variant < 3; ++variant) {
+            if (kipp_session_create(reference_model, POOL_SEQ, &session,
+                                    &error) != 0 ||
+                kipp_session_eval(session, inputs[variant], POOL_SEQ,
+                                  outputs[variant], KIPP_VOCAB_SIZE,
+                                  &error) != 0) {
+                fprintf(stderr, "pooled-%s reference eval failed: %s\n", label,
+                        error.message);
+                goto cleanup;
+            }
+            kipp_session_destroy(session);
+            session = NULL;
+        }
+    }
+
+    if (kipp_model_open_pooled(model_path, backend, 32, &pooled_model,
+                               &error) != 0) {
+        fprintf(stderr, "pooled-%s pooled open failed: %s\n", label, error.message);
+        goto cleanup;
+    }
+
+    /* (a) Pooled identity: bitwise-equal to the private-slab session. */
+    if (kipp_session_create(pooled_model, POOL_SEQ, &session, &error) != 0 ||
+        kipp_session_eval(session, sequence, POOL_SEQ, actual,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "pooled-%s identity eval failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (memcmp(actual, reference_full,
+               KIPP_VOCAB_SIZE * sizeof(*actual)) != 0) {
+        fprintf(stderr, "POOLED-%s identity logits differ\n", label);
+        goto cleanup;
+    }
+    if (backend != KIPP_BACKEND_CPU) {
+        /* Cross-backend anchor: pooled GPU logits must also sit within the
+         * standard tolerance of the CPU oracle. */
+        kipp_model *oracle_model = NULL;
+        kipp_session *oracle_session = NULL;
+        float *oracle = malloc(KIPP_VOCAB_SIZE * sizeof(*oracle));
+        int oracle_ok =
+            oracle != NULL &&
+            kipp_model_open_backend(model_path, KIPP_BACKEND_CPU,
+                                    &oracle_model, &error) == 0 &&
+            kipp_session_create(oracle_model, POOL_SEQ, &oracle_session,
+                                &error) == 0 &&
+            kipp_session_eval(oracle_session, sequence, POOL_SEQ, oracle,
+                              KIPP_VOCAB_SIZE, &error) == 0;
+        double oracle_nmse =
+            oracle_ok ? logit_nmse(actual, oracle, KIPP_VOCAB_SIZE) : 1.0;
+        int oracle_argmax = oracle_ok ? argmax(oracle, KIPP_VOCAB_SIZE) : -1;
+        int pooled_argmax = argmax(actual, KIPP_VOCAB_SIZE);
+        kipp_session_destroy(oracle_session);
+        if (oracle_model != NULL) {
+            (void)kipp_model_close(oracle_model, NULL);
+        }
+        free(oracle);
+        fprintf(stderr,
+                "POOLED-%s vs CPU oracle nmse=%.9g cpu_argmax=%d "
+                "pooled_argmax=%d\n",
+                label, oracle_nmse, oracle_argmax, pooled_argmax);
+        if (!oracle_ok || oracle_nmse > 1.0e-4 ||
+            oracle_argmax != pooled_argmax) {
+            fprintf(stderr, "POOLED-%s diverges from the CPU oracle\n",
+                    label);
+            goto cleanup;
+        }
+    }
+
+    /* (b) Serial sharing: destroy publishes; a new session adopts two full
+     * blocks and reproduces the unshared logits bitwise. */
+    kipp_session_destroy(session);
+    session = NULL;
+    if (kipp_session_create(pooled_model, POOL_SEQ, &session, &error) != 0 ||
+        kipp_session_match_prefix(session, sequence, POOL_SEQ, &matched,
+                                  &error) != 0) {
+        fprintf(stderr, "pooled-%s prefix match failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (matched != 2 * KIPP_KV_BLOCK_TOKENS) {
+        fprintf(stderr, "POOLED-%s expected 64 matched tokens, got %u\n", label,
+                matched);
+        goto cleanup;
+    }
+    if (kipp_session_eval(session, sequence + matched, POOL_SEQ - matched,
+                          actual, KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "pooled-%s shared eval failed: %s\n", label, error.message);
+        goto cleanup;
+    }
+    if (memcmp(actual, reference_full,
+               KIPP_VOCAB_SIZE * sizeof(*actual)) != 0) {
+        fprintf(stderr, "POOLED-%s shared-prefix logits differ\n", label);
+        goto cleanup;
+    }
+    if (kipp_model_kv_pool_stats(pooled_model, &stats) != 0 ||
+        stats.reused_blocks_total < 2) {
+        fprintf(stderr, "POOLED-%s reuse counter did not grow\n", label);
+        goto cleanup;
+    }
+
+    /* (e) Truncation into the private tail: roll the shared session back
+     * mid-block and continue on a different suffix. */
+    if (kipp_session_truncate(session, 70, &error) != 0 ||
+        kipp_session_eval(session, alternate + 70, POOL_SEQ - 70, actual,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "pooled-%s truncate eval failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (memcmp(actual, reference_cut,
+               KIPP_VOCAB_SIZE * sizeof(*actual)) != 0) {
+        fprintf(stderr, "POOLED-%s truncated logits differ\n", label);
+        goto cleanup;
+    }
+    kipp_session_destroy(session);
+    session = NULL;
+
+    /* (c) Batched mixed sharing: two adopters (one diverging) and one cold
+     * session in a single kipp_eval_batch call. */
+    if (kipp_session_create(pooled_model, POOL_SEQ, &session, &error) != 0 ||
+        kipp_session_create(pooled_model, POOL_SEQ, &second, &error) != 0 ||
+        kipp_session_create(pooled_model, POOL_SEQ, &third, &error) != 0 ||
+        kipp_session_match_prefix(session, sequence, POOL_SEQ, &matched,
+                                  &error) != 0 ||
+        matched != 2 * KIPP_KV_BLOCK_TOKENS ||
+        kipp_session_match_prefix(second, sequence, POOL_SEQ, &matched,
+                                  &error) != 0 ||
+        matched != 2 * KIPP_KV_BLOCK_TOKENS) {
+        fprintf(stderr, "pooled-%s batch setup failed: %s\n", label, error.message);
+        goto cleanup;
+    }
+    {
+        kipp_batch_item batch[3] = {
+            {session, sequence + 64, POOL_SEQ - 64, actual},
+            {second, alternate + 64, POOL_SEQ - 64, actual_second},
+            {third, sequence, POOL_SEQ, actual_third},
+        };
+        if (kipp_eval_batch(pooled_model, batch, 3, &error) != 0) {
+            fprintf(stderr, "pooled-%s batch eval failed: %s\n", label,
+                    error.message);
+            goto cleanup;
+        }
+    }
+    if (memcmp(actual, reference_full, KIPP_VOCAB_SIZE * sizeof(*actual)) !=
+            0 ||
+        memcmp(actual_second, reference_mixed,
+               KIPP_VOCAB_SIZE * sizeof(*actual_second)) != 0 ||
+        memcmp(actual_third, reference_full,
+               KIPP_VOCAB_SIZE * sizeof(*actual_third)) != 0) {
+        fprintf(stderr, "POOLED-%s batched logits differ\n", label);
+        goto cleanup;
+    }
+    kipp_session_destroy(session);
+    kipp_session_destroy(second);
+    kipp_session_destroy(third);
+    session = second = third = NULL;
+
+    /* (d) Exhaustion: a 3-block pool refuses the fourth block cleanly and
+     * the refused session's failure leaves its neighbor untouched. */
+    if (kipp_model_open_pooled(model_path, backend, 3, &tiny_model,
+                               &error) != 0 ||
+        kipp_session_create(tiny_model, POOL_SEQ, &session, &error) != 0 ||
+        kipp_session_create(tiny_model, POOL_SEQ, &second, &error) != 0) {
+        fprintf(stderr, "pooled-%s tiny setup failed: %s\n", label, error.message);
+        goto cleanup;
+    }
+    if (kipp_session_eval(session, sequence, 64, actual, KIPP_VOCAB_SIZE,
+                          &error) != 0) {
+        fprintf(stderr, "pooled-%s tiny eval failed: %s\n", label, error.message);
+        goto cleanup;
+    }
+    if (kipp_session_eval(second, sequence, 64, actual_second,
+                          KIPP_VOCAB_SIZE, &error) == 0 ||
+        error.code != KIPP_ERROR_RANGE) {
+        fprintf(stderr, "POOLED-%s exhaustion did not fail cleanly\n", label);
+        goto cleanup;
+    }
+    if (kipp_session_eval(session, sequence + 64, 32, actual,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "pooled-%s post-exhaustion eval failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (memcmp(actual, reference_full,
+               KIPP_VOCAB_SIZE * sizeof(*actual)) != 0) {
+        fprintf(stderr, "POOLED-%s neighbor corrupted by exhaustion\n", label);
+        goto cleanup;
+    }
+
+    /* (f) Eviction: publish, then let new content reclaim the blocks; the
+     * old prefix must simply stop matching (never alias). */
+    kipp_session_destroy(session);
+    kipp_session_destroy(second);
+    session = second = NULL;
+    if (kipp_session_create(tiny_model, POOL_SEQ, &session, &error) != 0 ||
+        kipp_session_eval(session, alternate, 96, actual, KIPP_VOCAB_SIZE,
+                          &error) != 0) {
+        fprintf(stderr, "pooled-%s eviction fill failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    kipp_session_destroy(session);
+    session = NULL;
+    if (kipp_session_create(tiny_model, POOL_SEQ, &session, &error) != 0 ||
+        kipp_session_match_prefix(session, sequence, POOL_SEQ, &matched,
+                                  &error) != 0) {
+        fprintf(stderr, "pooled-%s post-eviction match failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (matched != 0) {
+        fprintf(stderr, "POOLED-%s evicted prefix still matched %u\n", label,
+                matched);
+        goto cleanup;
+    }
+
+    fprintf(stderr,
+            "POOLED-%s identity, sharing, batching, exhaustion, truncation, "
+            "and eviction all bitwise-correct over %u-token sequences\n",
+            label, (uint32_t)POOL_SEQ);
+    result = 0;
+
+cleanup:
+    kipp_session_destroy(session);
+    kipp_session_destroy(second);
+    kipp_session_destroy(third);
+    if (pooled_model != NULL) {
+        (void)kipp_model_close(pooled_model, NULL);
+    }
+    if (tiny_model != NULL) {
+        (void)kipp_model_close(tiny_model, NULL);
+    }
+    if (reference_model != NULL) {
+        (void)kipp_model_close(reference_model, NULL);
+    }
+    free(tokens_path);
+    free(seed);
+    free(reference_full);
+    free(reference_mixed);
+    free(reference_cut);
+    free(actual);
+    free(actual_second);
+    free(actual_third);
+    return result;
+}
+
+/*
+ * The conventional tolerance gate, run on the same multi-block sequence the
+ * scramble gate uses: evaluate the synthesized 64-token prompt through an
+ * identity-mapped session and compare its final logits against the stateless
+ * forward pass (which never touches the KV cache) with the Phase-2 NMSE
+ * bound and an argmax check. In an unfaulted build the two are bitwise-equal
+ * (NMSE 0). This is the mutation study's model of "the standard reference
+ * test": identity-mapped, tolerance-based, argmax-checked.
+ */
+static int run_fault_reference_test(const char *model_path,
+                                    const char *vector_directory) {
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *seed = NULL;
+    uint32_t *tokens = NULL;
+    size_t token_bytes = 0;
+    kipp_model *model = NULL;
+    kipp_session *session = NULL;
+    float *cached = NULL;
+    float *reference = NULL;
+    kipp_error error = {0};
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&seed, &token_bytes) != 0 ||
+        token_bytes < sizeof(*seed) || token_bytes % sizeof(*seed)) {
+        fprintf(stderr, "unable to read fault-reference token vector\n");
+        goto cleanup;
+    }
+    size_t seed_count = token_bytes / sizeof(*seed);
+    uint32_t n = 3 * KIPP_KV_BLOCK_TOKENS; /* match the scramble gate */
+    tokens = malloc((size_t)n * sizeof(*tokens));
+    cached = malloc(KIPP_VOCAB_SIZE * sizeof(*cached));
+    reference = malloc(KIPP_VOCAB_SIZE * sizeof(*reference));
+    if (tokens == NULL || cached == NULL || reference == NULL) {
+        fprintf(stderr, "fault-reference allocation failed\n");
+        goto cleanup;
+    }
+    for (uint32_t index = 0; index < n; ++index) {
+        tokens[index] = seed[index % seed_count];
+    }
+    if (kipp_model_open_backend(model_path, KIPP_BACKEND_CPU, &model,
+                                &error) != 0 ||
+        kipp_session_create(model, n, &session, &error) != 0 ||
+        kipp_session_eval(session, tokens, n, cached, KIPP_VOCAB_SIZE,
+                          &error) != 0 ||
+        kipp_model_eval(model, tokens, n, reference, KIPP_VOCAB_SIZE,
+                        &error) != 0) {
+        fprintf(stderr, "fault-reference eval failed: %s\n", error.message);
+        goto cleanup;
+    }
+    double nmse = logit_nmse(cached, reference, KIPP_VOCAB_SIZE);
+    int reference_argmax = argmax(reference, KIPP_VOCAB_SIZE);
+    int cached_argmax = argmax(cached, KIPP_VOCAB_SIZE);
+    fprintf(stderr,
+            "FAULTREF tokens=%u nmse=%.9g reference_argmax=%d "
+            "cached_argmax=%d\n",
+            n, nmse, reference_argmax, cached_argmax);
+    result = nmse <= 1.0e-6 && cached_argmax == reference_argmax ? 0 : -1;
+
+cleanup:
+    kipp_session_destroy(session);
+    if (model != NULL) {
+        (void)kipp_model_close(model, NULL);
+    }
+    free(tokens_path);
+    free(seed);
+    free(tokens);
+    free(cached);
+    free(reference);
     return result;
 }
 
@@ -2065,6 +2538,118 @@ static void test_kv_pool_exhaustion(void) {
     kipp_kv_pool_destroy(pool);
 }
 
+static void test_kv_pool_alloc_seal(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(4);
+    uint32_t a[KIPP_KV_BLOCK_TOKENS];
+    uint32_t ids[4];
+    uint32_t matched_tokens = 0;
+    uint64_t parent = 0;
+    kv_fill_block(a, 7);
+
+    /* alloc claims a private, unindexed block; nothing matches it yet. */
+    uint32_t priv = kipp_kv_pool_alloc(pool);
+    CHECK(priv != KIPP_KV_INVALID_BLOCK);
+    CHECK(kipp_kv_pool_free_count(pool) == 3);
+    CHECK(kipp_kv_pool_prefix_match(pool, a, 33, ids, 4, &matched_tokens,
+                                    &parent) == 0);
+
+    /* seal publishes it; a 33-token prefix now matches the one block. */
+    CHECK(kipp_kv_pool_seal(pool, priv, 0, a) == 0);
+    CHECK(kipp_kv_pool_prefix_match(pool, a, 33, ids, 4, &matched_tokens,
+                                    &parent) == 1);
+    CHECK(ids[0] == priv && matched_tokens == KIPP_KV_BLOCK_TOKENS);
+    kipp_kv_pool_release(pool, ids[0]);
+
+    /* Double seal is rejected; sealing a second block with identical content
+     * leaves the index holding one copy (the original still matches). */
+    CHECK(kipp_kv_pool_seal(pool, priv, 0, a) == -1);
+    uint32_t dup = kipp_kv_pool_alloc(pool);
+    CHECK(dup != KIPP_KV_INVALID_BLOCK);
+    CHECK(kipp_kv_pool_seal(pool, dup, 0, a) == 0);
+    CHECK(kipp_kv_pool_prefix_match(pool, a, 33, ids, 4, &matched_tokens,
+                                    &parent) == 1);
+    CHECK(ids[0] == priv);
+    kipp_kv_pool_release(pool, ids[0]);
+
+    /* Sealing an unreferenced block is rejected. */
+    kipp_kv_pool_release(pool, dup);
+    CHECK(kipp_kv_pool_seal(pool, dup, 0, a) == -1);
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_stats(void) {
+    kipp_kv_pool *pool = kipp_kv_pool_create(2);
+    kipp_kv_pool_stats stats;
+    uint32_t a[KIPP_KV_BLOCK_TOKENS];
+    uint32_t b[KIPP_KV_BLOCK_TOKENS];
+    bool reused;
+    kv_fill_block(a, 1);
+    kv_fill_block(b, 2);
+
+    kipp_kv_pool_get_stats(pool, &stats);
+    CHECK(stats.total_blocks == 2 && stats.free_blocks == 2 &&
+          stats.reused_blocks_total == 0 && stats.evicted_blocks_total == 0);
+
+    uint32_t first = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    uint32_t again = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    CHECK(first == again && reused);
+    kipp_kv_pool_get_stats(pool, &stats);
+    CHECK(stats.free_blocks == 1 && stats.reused_blocks_total == 1);
+
+    /* Release both refs, fill the pool with new content twice: the second
+     * pass must evict the stale indexed blocks and count it. */
+    kipp_kv_pool_release(pool, first);
+    kipp_kv_pool_release(pool, again);
+    uint32_t other = kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    CHECK(other != KIPP_KV_INVALID_BLOCK && !reused);
+    kipp_kv_pool_release(pool, other);
+    kv_fill_block(a, 3);
+    kv_fill_block(b, 4);
+    (void)kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    (void)kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    kipp_kv_pool_get_stats(pool, &stats);
+    CHECK(stats.free_blocks == 0 && stats.evicted_blocks_total == 2);
+    kipp_kv_pool_destroy(pool);
+}
+
+static void test_kv_pool_collision(void) {
+    /* With every hash forced equal, token-unequal blocks must never alias:
+     * the memcmp verify is what makes content addressing collision-proof. */
+    kipp_kv_pool *pool = kipp_kv_pool_create(4);
+    kipp_kv_pool_test_force_hash(pool, true);
+    uint32_t a[KIPP_KV_BLOCK_TOKENS];
+    uint32_t b[KIPP_KV_BLOCK_TOKENS];
+    uint32_t ids[4];
+    uint32_t matched_tokens = 0;
+    bool reused;
+    kv_fill_block(a, 1);
+    kv_fill_block(b, 2);
+
+    uint32_t first = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    uint32_t second = kipp_kv_pool_acquire(pool, 0, b, 32, &reused);
+    CHECK(first != second && !reused);
+
+    /* Token-equal still reuses despite the degenerate hash... */
+    uint32_t again = kipp_kv_pool_acquire(pool, 0, a, 32, &reused);
+    CHECK(again == first && reused);
+    /* ...and prefix matching returns the right block, not a hash sibling. */
+    CHECK(kipp_kv_pool_prefix_match(pool, b, 33, ids, 4, &matched_tokens,
+                                    NULL) == 1);
+    CHECK(ids[0] == second);
+    kipp_kv_pool_release(pool, ids[0]);
+
+    /* Sealed blocks obey the same rule. */
+    uint32_t priv = kipp_kv_pool_alloc(pool);
+    uint32_t c[KIPP_KV_BLOCK_TOKENS];
+    kv_fill_block(c, 3);
+    CHECK(kipp_kv_pool_seal(pool, priv, 0, c) == 0);
+    CHECK(kipp_kv_pool_prefix_match(pool, c, 33, ids, 4, &matched_tokens,
+                                    NULL) == 1);
+    CHECK(ids[0] == priv);
+    kipp_kv_pool_release(pool, ids[0]);
+    kipp_kv_pool_destroy(pool);
+}
+
 int main(int argc, char **argv) {
     RUN(test_error_names);
     RUN(test_bf16);
@@ -2086,6 +2671,7 @@ int main(int argc, char **argv) {
     RUN(test_public_argument_checks);
     RUN(test_registry_rejection);
     RUN(test_prompt_lookup);
+    RUN(test_spec_gate);
     RUN(test_chat_render);
     RUN(test_kv_pool_reuse);
     RUN(test_kv_pool_refcount);
@@ -2094,6 +2680,9 @@ int main(int argc, char **argv) {
     RUN(test_kv_pool_partial_private);
     RUN(test_kv_pool_prefix_match);
     RUN(test_kv_pool_exhaustion);
+    RUN(test_kv_pool_alloc_seal);
+    RUN(test_kv_pool_stats);
+    RUN(test_kv_pool_collision);
     RUN(test_malformed_gguf);
 
     if (argc == 2 && strcmp(argv[1], "--metal-operators") == 0) {
@@ -2158,6 +2747,33 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "PASS paged_cpu\n");
         }
+    } else if (argc == 4 && strcmp(argv[1], "--fault-reference") == 0) {
+        ++tests_run;
+        if (run_fault_reference_test(argv[2], argv[3]) != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL fault_reference\n");
+        } else {
+            fprintf(stderr, "PASS fault_reference\n");
+        }
+    } else if (argc == 4 && strcmp(argv[1], "--pooled-cpu") == 0) {
+        ++tests_run;
+        if (run_pooled_test(argv[2], argv[3], KIPP_BACKEND_CPU, "CPU") != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL pooled_cpu\n");
+        } else {
+            fprintf(stderr, "PASS pooled_cpu\n");
+        }
+#ifdef KIPP_ENABLE_METAL
+    } else if (argc == 4 && strcmp(argv[1], "--pooled-metal") == 0) {
+        ++tests_run;
+        if (run_pooled_test(argv[2], argv[3], KIPP_BACKEND_METAL, "METAL") !=
+            0) {
+            ++failures;
+            fprintf(stderr, "FAIL pooled_metal\n");
+        } else {
+            fprintf(stderr, "PASS pooled_metal\n");
+        }
+#endif
 #ifdef KIPP_ENABLE_METAL
     } else if (argc == 4 && strcmp(argv[1], "--paged-metal") == 0) {
         ++tests_run;

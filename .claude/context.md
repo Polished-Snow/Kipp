@@ -17,27 +17,53 @@ must never silently diverge from it.
 ## Capabilities in place (all gated)
 
 - **Model family + registry**: strict per-checkpoint revision/shape
-  validation; the BF16 reference path is byte-identical to the original
-  v0.0.1 single-checkpoint engine.
-- **Quantization**: Q8_0 (near-lossless) and 4-bit affine (gs32) on the seven
-  per-layer projections; CPU + Metal, bit-accurate.
-- **Serving**: OpenAI Completions + Chat Completions (native Qwen3 ChatML),
-  full sampling pack, generated-token logprobs, `stream_options.include_usage`,
-  a llama.cpp-style `timings` object, and Prometheus `/metrics`.
-- **Multi-logit eval** (`kipp_session_eval_n`) and greedy **speculative
-  decoding** (prompt-lookup, CLI `--spec`), token-identical to plain greedy.
-- **Paged KV** (Phase 5, in progress): both the CPU oracle and the Metal
-  backend address KV through a per-session 32-position block table. Identity
-  mapping is byte-for-byte the contiguous layout; the `--paged-cpu` /
-  `--paged-metal` gates prove correctness under a scrambled table. The shared
-  cross-request block pool lives in `src/kipp_kv_pool.c` (unit-tested,
-  not yet wired into the backends). CUDA is still contiguous.
+  validation; BF16 reference path byte-identical to v0.0.1.
+- **Quantization**: Q8_0 and 4-bit affine (gs32) on the seven per-layer
+  projections; CPU + Metal. Quantized **simdgroup-matrix (MMA) prefill
+  kernels** close the old vector-kernel prefill regression (~2.3× lift,
+  parity with BF16 prefill).
+- **Serving**: OpenAI Completions + Chat Completions, full sampling pack,
+  logprobs, timings, Prometheus `/metrics` (now including KV-pool gauges).
+- **Paged KV (delivered)**: CPU and Metal address KV through per-session
+  32-position block tables; the scramble gates (`--paged-cpu`,
+  `--paged-metal`) prove placement-invariance bitwise over a **3-block/96-
+  token** sequence (2 blocks was degenerate for rollover faults — found by
+  the mutation study). CUDA remains contiguous.
+- **Cross-request KV prefix sharing (delivered)**: pooled sessions
+  (`kipp_model_open_pooled`, CPU + Metal) borrow one model-owned slab;
+  immutable shared full blocks, publish-at-finish, content-addressed pool
+  with memcmp verification. Server default for CPU/Metal (`--kv-pool-mib`);
+  reservation-based admission; gates `--pooled-cpu` / `--pooled-metal`
+  (six bitwise cases each). Measured 211× TTFT on a repeated 6.9k-token
+  prompt.
+- **Speculative decoding**: prompt-lookup + **adaptive gating**
+  (`kipp_spec_gate`): token-identical to greedy (gated; verify rounds force
+  vector kernels — MMA reduction order flips near-tie argmaxes), 2.2× on
+  repetitive text, ≥0.85× elsewhere.
+- **Mutation study**: `build/kipp_test_fault` (KIPP_FAULT=1..4) +
+  `--fault-reference`; results in `bench/results/faults.json` — tolerance
+  and scramble gates are complementary; the rollover fault has NMSE exactly
+  0 vs reference and only the scramble gate catches it.
+
+## Paper (`paper/`)
+
+Full systems-paper structure (11 sections): Proposition 1
+(placement invariance, H1–H3), scramble-gate walkthrough + gate-lattice
+figures, mutation-study detection matrix (§7.3, the centerpiece), llama.cpp
+head-to-head (Kipp wins decode, loses prefill 6.6×), context scaling,
+batching, prefix sharing, gate costs. Every number is a macro bound to a
+committed `bench/results/*.json` (rule in `paper/README.md`). Compiles with
+`tectonic main.tex`.
 
 ## Working rules
 
 - Gate on real hardware before claiming a backend works; state which ones you
-  ran. Build/gate commands are in `AGENT.md`.
+  ran. Build/gate commands in `AGENT.md` + `REPRODUCE.md`.
+- **Hardware**: this machine is an Apple **M5 Max (40-core GPU, 128 GB)**
+  since 2026-07-20; earlier committed numbers were from a base M5 and are
+  ~4× lower. Never mix them; result files self-describe hardware.
 - Commit, branch, push, PR, or merge only when the user asks explicitly.
-- CUDA is validated on ephemeral cloud GPUs at milestones, not locally.
-- Longer-lived cross-session notes live in the user's Claude memory, not here;
-  keep this file to durable, repo-level context.
+- CUDA is validated on ephemeral cloud GPUs at milestones, not locally, and
+  is frozen: contiguous KV, BF16-only, final-row logits.
+- Longer-lived cross-session notes live in the user's Claude memory, not
+  here; keep this file to durable, repo-level context.

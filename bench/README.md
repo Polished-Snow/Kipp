@@ -11,41 +11,76 @@ hardware, and the exact commands.
   min/max over N runs, separate prefill/decode timers, peak RSS (and CUDA
   device bytes). Writes one JSON per configuration into `results/`.
 - `spec_bench.py` — prompt-lookup speculative decoding: acceptance rate `α`,
-  block efficiency (accepted tokens per target forward), and wall-clock
-  speedup vs. non-speculative greedy, across a fixed workload set (repetitive,
-  code, grounded, chat). Greedy speculative output is token-identical to
-  greedy decode, so only the wall clock differs.
+  block efficiency, drafting duty cycle (adaptive gate), and wall-clock
+  speedup vs. non-speculative greedy across a fixed workload set. Greedy
+  speculative output is token-identical to greedy decode (gated), so only
+  the wall clock differs.
+- `server_bench.py` — aggregate server throughput vs. batch size: one
+  request with `n` choices, and `n` concurrent connections.
+- `load_bench.py` — open-loop Poisson serving load: streamed TTFT/TPOT
+  percentiles and goodput under an SLO, per arrival rate.
+- `prefix_bench.py` — cross-request prefix reuse: cold-vs-warm prefill time
+  for the same long prompt against the pooled server.
+- `ppl_bench.py` — wikitext-2 perplexity per weight scheme via the CLI's
+  `--ppl` mode, with a CPU-vs-Metal agreement check.
+- `_provenance.py` — shared self-description module. Every script records
+  the same engine block (commit, dirty, binary, compiler, build flags), the
+  full hardware block (chip, GPU cores, memory), and the model's pinned
+  repository/revision read from its `*.gguf.manifest.json` — never
+  hardcoded.
+
+Every result file records the engine commit, binary, and hardware — **a
+number quoted anywhere (docs, paper) must trace to a committed
+`results/*.json`**, and a hardware change must be visible in that file, not
+inferred.
+
+The recorded `dirty` flag ignores `bench/results/` itself: a run whose only
+working-tree changes are freshly written result files records
+`dirty: false`. Any modification outside `bench/results/` still marks the
+run dirty.
 
 ## Results (`results/*.json`)
 
-Committed per configuration. Naming: `<model>-<scheme>-<decode|prefill>.json`
-and `cuda-a100-...` for cloud CUDA runs. Each file records the engine commit,
-hardware, model revision, and full run distribution.
+Committed per configuration. Naming: `<model>-<scheme>-<decode|prefill>.json`,
+`ctx-<tokens>.json` (context scaling), `spec.json` / `spec-gated.json`
+(speculation without/with the adaptive gate), `server-batch.json`,
+`llamacpp-*.json` (external A/B), `faults.json` (mutation study), and
+`cuda-a100-...` for cloud CUDA runs.
 
-## Reference numbers — Apple M5 (Qwen3-4B, Metal, greedy, median of 5)
+## Reference numbers — Apple M5 Max (Qwen3-4B, Metal, greedy, median of 5)
+
+Measured on a MacBook Pro M5 Max (40-core GPU, 128 GB unified memory).
+Numbers from earlier releases were measured on a base M5 (10-core GPU,
+24 GB) and are roughly 4× lower across the board; see each result file's
+recorded hardware.
 
 | Weight scheme | Decode tok/s | Prefill tok/s |
 |---|---|---|
-| BF16 | 12.6 | 143 |
-| Q8_0 (8-bit) | 20.7 | 35 |
-| Affine (4-bit) | 26.9 | 32 |
+| BF16 | 59.2 | 537 |
+| Q8_0 (8-bit) | 90.6 | 497 |
+| Affine (4-bit) | 127.5 | 527 |
 
-Peak process RSS ≈ 41 MB (weights are mmap-ed). Decode is bandwidth-bound, so
-quantization scales it with the weight-byte reduction; prefill is
-compute-bound and quantization currently *slows* it (the quantized prefill
-uses a vector kernel, not the simdgroup-matrix path).
+Peak process RSS ≈ 41 MB (weights are mmap-ed; RSS understates GPU-touched
+residency). Decode is bandwidth-bound, so quantization scales it with the
+weight-byte reduction. Prefill is compute-bound; the quantized simdgroup-
+matrix (MMA) kernels dequantize each 32-weight block once per 16-token tile,
+so quantized prefill tracks the BF16 matrix path (the earlier vector-kernel
+path measured 215/239 tok/s for Q8_0/4-bit on this host — a 2.2–2.3×
+regression, since removed).
 
-Speculative decoding (Q8_0, controlled A/B, median of 3):
+Speculative decoding (Q8_0, 256-token decode, controlled A/B, median of 3):
 
-| Workload | α | Block eff. | Speedup |
-|---|---|---|---|
-| Repetitive / copy-heavy | 1.00 | 4.00 | 1.93× |
-| Code | 0.17 | 1.39 | 0.88× |
-| Open-ended / grounded | 0.04 | 1.10 | 0.55× |
+| Workload | α | Ungated | Gated | Duty |
+|---|---|---|---|---|
+| Repetitive / copy-heavy | 1.00 | 2.76× | 2.21× | 1.00 |
+| Code | 0.19 | 0.62× | 0.94× | 0.06 |
+| Grounded QA | 0.00 | 0.35× | 0.94× | 0.04 |
+| Open-ended | 0.09 | 0.65× | 0.85× | 0.10 |
 
-Prompt-lookup helps only at high acceptance; below that the multi-token verify
-(which does not amortize weight streaming at small draft batch on this
-bandwidth-bound engine) makes it a net loss.
+Prompt-lookup only pays at high acceptance; the adaptive gate suspends
+drafting when a short acceptance EMA collapses and probes periodically, which
+converts the low-acceptance losses to near-parity while keeping the
+copy-heavy win. Gated speculative output remains token-identical to greedy.
 
 ## Reproduce
 
@@ -53,7 +88,8 @@ bandwidth-bound engine) makes it a net loss.
 python3 tools/bench.py --backend metal --model <gguf> \
   --prompt "The capital of France is" --decode 64 --warmup 1 --runs 5 \
   --output bench/results/4b-<scheme>-decode.json
-python3 bench/spec_bench.py --model <q8_0 gguf> --decode 64 --runs 3
+python3 bench/spec_bench.py --model <q8_0 gguf> --decode 256 --runs 3
+python3 bench/server_bench.py --model <gguf>
 ```
 
 ## Submitting results for new hardware

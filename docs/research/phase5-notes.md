@@ -11,13 +11,21 @@ repositories, not vendored implementations.
   isolated output.
 - The server runs a `poll()` event loop with FIFO admission, chunked prefill,
   batched decode, and disconnect cancellation.
-- `kipp_session_truncate` powers the server's single-slot serial prefix cache.
-- CPU sessions use paged addressing. `src/kipp_kv_pool.c` implements and tests
-  content-addressed block bookkeeping, but it is not connected to production
-  sessions or the server.
+- `kipp_session_truncate` powers the server's single-slot serial prefix cache
+  (now the non-pooled fallback path only).
+- CPU and Metal sessions use paged addressing.
 
-Cross-session KV sharing, pooled backend slabs, and cache-pressure admission
-remain future work.
+**Delivered (v0.1.0-dev):** cross-session KV sharing is in production on CPU
+and Metal. `kipp_model_open_pooled` gives every session a block table into
+one model-owned slab; finished sessions publish full blocks to the
+content-addressed pool (`src/kipp_kv_pool.c`), new sessions adopt matching
+prefixes with `kipp_session_match_prefix`, and the server admits requests
+under a worst-case block reservation so cache pressure delays admission
+instead of corrupting active sequences (the exhaustion/eviction/collision
+gates below are implemented as `--pooled-cpu` / `--pooled-metal` and the
+server-level pool tests). The design followed the nano-vllm notes below:
+immutable full shared blocks, private partial blocks, publish-at-finish
+instead of copy-on-write.
 
 ## nano-vllm block manager
 

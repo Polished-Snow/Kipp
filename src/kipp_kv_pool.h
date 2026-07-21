@@ -77,4 +77,40 @@ uint32_t kipp_kv_pool_prefix_match(kipp_kv_pool *pool, const uint32_t *tokens,
                                    uint32_t max_blocks, uint32_t *matched_tokens,
                                    uint64_t *out_parent_hash);
 
+/*
+ * Claim the LRU free block as a private, unindexed block (ref count 1) with
+ * no recorded tokens, evicting stale indexed content if needed. This is
+ * acquire without the content lookup: the caller writes KV into the block
+ * incrementally and may later publish it with kipp_kv_pool_seal. Returns
+ * KIPP_KV_INVALID_BLOCK when the pool is exhausted.
+ */
+uint32_t kipp_kv_pool_alloc(kipp_kv_pool *pool);
+
+/*
+ * Publish a full private block (ref count >= 1, not yet indexed): record its
+ * 32 tokens, compute the chained hash, and insert it into the content index
+ * so later prefix matches can share it. If an identical block is already
+ * indexed the block stays private (the index keeps one copy per content).
+ * Returns 0 on success, -1 on invalid arguments.
+ */
+int kipp_kv_pool_seal(kipp_kv_pool *pool, uint32_t block_id,
+                      uint64_t parent_hash, const uint32_t *tokens);
+
+typedef struct {
+    uint32_t total_blocks;
+    uint32_t free_blocks;         /* ref_count == 0 (including revivable) */
+    uint64_t reused_blocks_total; /* content hits: acquire + prefix match */
+    uint64_t evicted_blocks_total;/* indexed content reclaimed for new use */
+} kipp_kv_pool_stats;
+
+void kipp_kv_pool_get_stats(const kipp_kv_pool *pool,
+                            kipp_kv_pool_stats *out_stats);
+
+#ifdef KIPP_TESTING
+/* Force every internal content hash to a constant so the collision tests can
+ * prove that hash-equal, token-unequal blocks never alias (the memcmp
+ * verify). Affects this pool's internal hashing only. */
+void kipp_kv_pool_test_force_hash(kipp_kv_pool *pool, bool force);
+#endif
+
 #endif /* KIPP_KV_POOL_H */

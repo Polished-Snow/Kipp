@@ -26,6 +26,33 @@ hardware, and must link the exact commands used.
 warm-up runs, captures the CLI's separate prefill and decode timers, samples
 peak process RSS with `/usr/bin/time -l`, and reports the median, median
 absolute deviation, minimum, maximum, and each raw run as JSON.
+`bench/spec_bench.py`, `bench/server_bench.py`, and `bench/prefix_bench.py`
+cover speculation, server batching, and cross-request prefix reuse; all
+record the engine commit and hardware in their output.
+
+## Apple M5 Max (v0.1.0-dev, 2026-07-20)
+
+The development machine changed from a base M5 (10-core GPU, 24 GiB) to an
+M5 Max (40-core GPU, 128 GB); throughput is roughly 4× the sections below,
+which are retained for the base-M5 configuration. Current reference numbers
+(Qwen3-4B, Metal, greedy; `bench/results/`):
+
+- Decode tok/s (64 tokens, median of 5): BF16 **59.2**, Q8_0 **90.6**,
+  4-bit affine **127.5**.
+- Prefill tok/s (348-token prompt): BF16 **537**, Q8_0 **497**, 4-bit
+  **527** — the quantized simdgroup-matrix prefill kernels close the earlier
+  vector-kernel regression (215/239 tok/s on the same host).
+- Context scaling (Q8_0): decode 98 → 63 tok/s and prefill ~450 → 425 tok/s
+  from a 3- to a 3,200-token prompt (`ctx-*.json`).
+- Server aggregate (Q8_0, sampled, median of 3): n = 1/2/4/8 choices →
+  77/95/148/147 tok/s; 1/2/4/8 concurrent connections → 93/112/134/110.
+- Cross-request prefix reuse: a 6,890-token prompt sent twice adopts 6,880
+  tokens on the second request; prefill drops 20.2 s → 96 ms (211× TTFT).
+- Speculation (Q8_0, 256-token decode): adaptive-gated 2.21× on repetitive
+  text, ≥0.85× elsewhere (ungated: 2.76× / down to 0.35×).
+- llama.cpp A/B (same weights/host, `llamacpp-qwen3-4b.json`): Kipp decode
+  59.2/90.6 vs llama.cpp 47.3/78.9 (BF16/Q8); llama.cpp prefill ~6.6×
+  faster (3,569 vs 537 BF16).
 
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 

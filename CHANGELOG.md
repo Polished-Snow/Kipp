@@ -3,6 +3,39 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## Unreleased
+
+### Cross-request KV prefix sharing (CPU + Metal)
+- **Pooled models** (`kipp_model_open_pooled`, CPU and Metal backends): all
+  sessions
+  share one model-owned KV slab; a finished session's full 32-token blocks
+  are published to the content-addressed block pool, and
+  `kipp_session_match_prefix` lets a new session adopt a cached prefix
+  instead of re-evaluating it. Shared blocks are immutable and complete;
+  appends always land in private blocks, so speculative rollback never
+  touches shared state. Gated by `--pooled-cpu` (`make test-pooled-cpu`):
+  pooled identity, shared and batched-mixed evaluation bitwise-equal to
+  unshared runs, clean exhaustion, truncation, and eviction. The Metal
+  backend shares one model-owned `MTLBuffer` slab with zero shader changes,
+  gated the same way by `--pooled-metal` (`make test-pooled-metal`) plus a
+  `1e-4` NMSE anchor against the CPU oracle.
+- `kipp_kv_pool` gains `alloc`/`seal` (publish-at-finish), reuse/eviction
+  stats, and a collision-safety test hook; `kipp_model_kv_pool_stats`
+  exposes the counters.
+- The eval-item contract gains an optional per-item `block_table`; backend
+  function signatures are unchanged, and non-pooled models are
+  byte-identical to v0.0.2.
+- **Serving**: the server opens CPU/Metal models pooled by default
+  (`--kv-pool-mib` sizes the pool, default = the checkpoint's context
+  length; `0` disables). Every choice adopts the longest published prompt
+  prefix at admission, and admission reserves worst-case pool blocks so
+  pool pressure delays requests in the FIFO instead of failing them.
+  `GET /metrics` gains `kipp_kv_pool_*` occupancy/reuse counters and
+  `kipp_prefix_tokens_reused_total`. The single-slot serial prefix cache
+  now serves only non-pooled (CUDA) models. Covered by `make test-server`,
+  including cross-request reuse, multi-choice determinism, mid-stream
+  disconnect release, and a tiny-pool pressure test.
+
 ## v0.0.2
 
 Expands Kipp from a single pinned checkpoint to the **Qwen3 dense family**

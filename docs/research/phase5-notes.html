@@ -34,13 +34,21 @@ read once per step across sequences. Gates prove batched output equals
 isolated output.</li>
 <li>The server runs a <code>poll()</code> event loop with FIFO admission, chunked prefill,
 batched decode, and disconnect cancellation.</li>
-<li><code>kipp_session_truncate</code> powers the server's single-slot serial prefix cache.</li>
-<li>CPU sessions use paged addressing. <code>src/kipp_kv_pool.c</code> implements and tests
-content-addressed block bookkeeping, but it is not connected to production
-sessions or the server.</li>
+<li><code>kipp_session_truncate</code> powers the server's single-slot serial prefix cache
+(now the non-pooled fallback path only).</li>
+<li>CPU and Metal sessions use paged addressing.</li>
 </ul>
-<p>Cross-session KV sharing, pooled backend slabs, and cache-pressure admission
-remain future work.</p>
+<p><strong>Delivered (v0.1.0-dev):</strong> cross-session KV sharing is in production on CPU
+and Metal. <code>kipp_model_open_pooled</code> gives every session a block table into
+one model-owned slab; finished sessions publish full blocks to the
+content-addressed pool (<code>src/kipp_kv_pool.c</code>), new sessions adopt matching
+prefixes with <code>kipp_session_match_prefix</code>, and the server admits requests
+under a worst-case block reservation so cache pressure delays admission
+instead of corrupting active sequences (the exhaustion/eviction/collision
+gates below are implemented as <code>--pooled-cpu</code> / <code>--pooled-metal</code> and the
+server-level pool tests). The design followed the nano-vllm notes below:
+immutable full shared blocks, private partial blocks, publish-at-finish
+instead of copy-on-write.</p>
 <h2>nano-vllm block manager</h2>
 <p>The design in <code>GeeeekExplorer/nano-vllm</code> is a useful small-scale reference:</p>
 <ul>

@@ -483,7 +483,7 @@ kernel void kipp_swiglu(device float *gate [[buffer(0)]],
 }
 
 /* One thread per element: stage FP32 activations as BF16 for the matrix
- * kernel below. */
+ * kernels below. */
 kernel void kipp_bf16_stage(device const float *input [[buffer(0)]],
                             device ushort *output [[buffer(1)]],
                             constant uint &count [[buffer(2)]],
@@ -493,12 +493,13 @@ kernel void kipp_bf16_stage(device const float *input [[buffer(0)]],
     }
 }
 
+
 #if defined(KIPP_ENABLE_BF16_MMA)
 /*
- * Batched-prefill projection using simdgroup matrix row_blocks. Each of the
- * four simdgroups in a threadgroup owns a 32-row x 8-token output tile and
+ * Batched-prefill projections using simdgroup matrices. Each of the four
+ * simdgroups in a threadgroup owns a 32-row x 16-token output tile and
  * walks the shared dimension in 8-wide steps: one transposed activation
- * row_block is reused against four weight row_blocks, so activation traffic
+ * fragment is reused against four weight fragments, so activation traffic
  * collapses compared with the vector kernel. Weights and staged activations
  * are BF16; accumulation is FP32.
  */
@@ -596,6 +597,426 @@ kernel void kipp_matmul_bf16(device const ushort *weight [[buffer(0)]],
                 simdgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
+    }
+}
+
+/*
+ * Quantized batched-prefill projections. Same threadgroup geometry as
+ * kipp_matmul_bf16 (four simdgroups, each owning a 32-row x 16-token output
+ * tile), but the shared dimension advances one 32-weight quantization block
+ * at a time: every lane dequantizes its own row's block into a threadgroup
+ * float tile once, and the tile is then swept with the same 8-wide simdgroup
+ * matrix fragments. Weight bytes are read exactly once per 16 tokens, so the
+ * dequantization cost no longer scales with the token count the way the
+ * vector kernels' does. Activations are read directly from the FP32 buffer
+ * (no BF16 staging), so the dequantized math matches the vector kernels and
+ * the CPU oracle up to reduction order.
+ *
+ * Both kernels assume params.rows % 32 == 0 and params.columns % 32 == 0:
+ * every quantized projection in the registry satisfies both.
+ */
+constant uint KIPP_MM_BLOCK = 32;
+/* +1 float of padding per staged row so the 32 lanes' dequant writes land in
+ * different threadgroup-memory banks. */
+constant uint KIPP_MM_STAGED_STRIDE = KIPP_MM_BLOCK + 1;
+constant uint KIPP_MM_Q8_BLOCK_BYTES = 34;
+constant uint KIPP_MM_A4_GROUP_BYTES = 20;
+
+kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
+                             device const float *input [[buffer(1)]],
+                             device float *output [[buffer(2)]],
+                             constant MatvecParams &params [[buffer(3)]],
+                             uint2 group_id [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float staged[KIPP_MM_SIMDGROUPS][64];
+    threadgroup float staged_weights[KIPP_MM_SIMDGROUPS]
+                                    [KIPP_MM_ROWS_PER_SIMDGROUP]
+                                    [KIPP_MM_STAGED_STRIDE];
+    uint row_base =
+        (group_id.x * KIPP_MM_SIMDGROUPS + group) * KIPP_MM_ROWS_PER_SIMDGROUP;
+    if (row_base >= params.rows) {
+        return;
+    }
+    uint token_base = group_id.y * KIPP_MM_TOKEN_TILE;
+    uint tile = min(KIPP_MM_TOKEN_TILE, params.token_count - token_base);
+    uint blocks = params.columns / KIPP_MM_BLOCK;
+
+    simdgroup_float8x8 accumulators[KIPP_MM_ROW_FRAGMENTS]
+                                   [KIPP_MM_TOKEN_FRAGMENTS];
+    for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
+        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+            accumulators[row_block][tf] = simdgroup_float8x8(0.0f);
+        }
+    }
+    uint token_blocks = (tile + 7u) / 8u;
+    for (uint block = 0; block < blocks; ++block) {
+        /* Lane l dequantizes row row_base + l's block. */
+        device const uchar *blk = weight +
+            (ulong(row_base + lane) * blocks + block) *
+                ulong(KIPP_MM_Q8_BLOCK_BYTES);
+        float d = kipp_fp16_bytes(blk);
+        device const char *qs = (device const char *)(blk + 2);
+        for (uint j = 0; j < KIPP_MM_BLOCK; ++j) {
+            staged_weights[group][lane][j] = d * float(qs[j]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        uint column = block * KIPP_MM_BLOCK;
+        for (uint sub = 0; sub < KIPP_MM_BLOCK / 8u; ++sub) {
+            simdgroup_float8x8 activation[KIPP_MM_TOKEN_FRAGMENTS];
+            for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+                if (tf < token_blocks) {
+                    simdgroup_load(activation[tf],
+                                   input + (ulong)(token_base + tf * 8u) *
+                                               params.columns +
+                                       column + sub * 8u,
+                                   params.columns, 0, true);
+                }
+            }
+            for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS;
+                 ++row_block) {
+                simdgroup_float8x8 weights;
+                simdgroup_load(
+                    weights,
+                    &staged_weights[group][row_block * 8u][sub * 8u],
+                    KIPP_MM_STAGED_STRIDE);
+                for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+                    if (tf < token_blocks) {
+                        simdgroup_multiply_accumulate(
+                            accumulators[row_block][tf], weights,
+                            activation[tf], accumulators[row_block][tf]);
+                    }
+                }
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
+        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+            uint sub_base = token_base + tf * 8u;
+            if (sub_base >= params.token_count) {
+                continue;
+            }
+            uint sub_tile = min(8u, params.token_count - sub_base);
+            if (sub_tile == 8u) {
+                simdgroup_store(accumulators[row_block][tf],
+                                output + (ulong)sub_base * params.rows +
+                                    row_base + row_block * 8u,
+                                params.rows, 0, true);
+            } else {
+                simdgroup_store(accumulators[row_block][tf], staged[group],
+                                8);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint index = lane; index < 64u; index += 32u) {
+                    uint row = index / 8u;
+                    uint token = index % 8u;
+                    if (token < sub_tile) {
+                        output[(ulong)(sub_base + token) * params.rows +
+                               row_base + row_block * 8u + row] =
+                            staged[group][index];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+
+kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
+                                device const float *input [[buffer(1)]],
+                                device float *output [[buffer(2)]],
+                                constant MatvecParams &params [[buffer(3)]],
+                                uint2 group_id
+                                    [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float staged[KIPP_MM_SIMDGROUPS][64];
+    threadgroup float staged_weights[KIPP_MM_SIMDGROUPS]
+                                    [KIPP_MM_ROWS_PER_SIMDGROUP]
+                                    [KIPP_MM_STAGED_STRIDE];
+    uint row_base =
+        (group_id.x * KIPP_MM_SIMDGROUPS + group) * KIPP_MM_ROWS_PER_SIMDGROUP;
+    if (row_base >= params.rows) {
+        return;
+    }
+    uint token_base = group_id.y * KIPP_MM_TOKEN_TILE;
+    uint tile = min(KIPP_MM_TOKEN_TILE, params.token_count - token_base);
+    uint groups = params.columns / KIPP_MM_BLOCK;
+
+    simdgroup_float8x8 accumulators[KIPP_MM_ROW_FRAGMENTS]
+                                   [KIPP_MM_TOKEN_FRAGMENTS];
+    for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
+        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+            accumulators[row_block][tf] = simdgroup_float8x8(0.0f);
+        }
+    }
+    uint token_blocks = (tile + 7u) / 8u;
+    for (uint quant_group = 0; quant_group < groups; ++quant_group) {
+        /* Lane l dequantizes row row_base + l's group: w = scale*q + bias. */
+        device const uchar *grp = weight +
+            (ulong(row_base + lane) * groups + quant_group) *
+                ulong(KIPP_MM_A4_GROUP_BYTES);
+        float scale = kipp_fp16_bytes(grp + 16);
+        float bias = kipp_fp16_bytes(grp + 18);
+        for (uint k = 0; k < KIPP_MM_BLOCK / 2u; ++k) {
+            uchar packed = grp[k];
+            staged_weights[group][lane][2u * k] =
+                scale * float(packed & 0x0fu) + bias;
+            staged_weights[group][lane][2u * k + 1u] =
+                scale * float(packed >> 4) + bias;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        uint column = quant_group * KIPP_MM_BLOCK;
+        for (uint sub = 0; sub < KIPP_MM_BLOCK / 8u; ++sub) {
+            simdgroup_float8x8 activation[KIPP_MM_TOKEN_FRAGMENTS];
+            for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+                if (tf < token_blocks) {
+                    simdgroup_load(activation[tf],
+                                   input + (ulong)(token_base + tf * 8u) *
+                                               params.columns +
+                                       column + sub * 8u,
+                                   params.columns, 0, true);
+                }
+            }
+            for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS;
+                 ++row_block) {
+                simdgroup_float8x8 weights;
+                simdgroup_load(
+                    weights,
+                    &staged_weights[group][row_block * 8u][sub * 8u],
+                    KIPP_MM_STAGED_STRIDE);
+                for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+                    if (tf < token_blocks) {
+                        simdgroup_multiply_accumulate(
+                            accumulators[row_block][tf], weights,
+                            activation[tf], accumulators[row_block][tf]);
+                    }
+                }
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
+        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+            uint sub_base = token_base + tf * 8u;
+            if (sub_base >= params.token_count) {
+                continue;
+            }
+            uint sub_tile = min(8u, params.token_count - sub_base);
+            if (sub_tile == 8u) {
+                simdgroup_store(accumulators[row_block][tf],
+                                output + (ulong)sub_base * params.rows +
+                                    row_base + row_block * 8u,
+                                params.rows, 0, true);
+            } else {
+                simdgroup_store(accumulators[row_block][tf], staged[group],
+                                8);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint index = lane; index < 64u; index += 32u) {
+                    uint row = index / 8u;
+                    uint token = index % 8u;
+                    if (token < sub_tile) {
+                        output[(ulong)(sub_base + token) * params.rows +
+                               row_base + row_block * 8u + row] =
+                            staged[group][index];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+
+/*
+ * Batched-prefill attention. One 32-thread threadgroup (a single simdgroup)
+ * owns an 8-query tile for one query head and streams the KV cache in
+ * 32-position tiles that coincide with KV blocks, so each tile costs one
+ * block-table lookup and then reads a physically contiguous range. Q K^T and
+ * P V run on the simdgroup matrix units with an online softmax between them
+ * (running per-query maximum and denominator, rescaled per tile); the scalar
+ * softmax step round-trips the 8x32 score tile through threadgroup memory,
+ * which with a single simdgroup needs only simdgroup_barrier. K and V
+ * fragments load directly from the BF16 cache; only the 8x128 query tile is
+ * staged (once, as bfloat). Each query head re-reads its KV head's tiles;
+ * sharing a tile across the 4 query heads of a KV head is future work.
+ *
+ * Decode and speculative-verify rounds keep kipp_flash_gqa: its per-token
+ * reduction order is the token-identity contract for speculation, and at one
+ * token the split-K kernel keeps more of the GPU busy.
+ */
+constant uint KIPP_FA_QUERIES = 8;
+constant uint KIPP_FA_KV_TILE = 32;
+constant uint KIPP_FA_SCORE_STRIDE = KIPP_FA_KV_TILE + 8;
+
+kernel void
+kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
+                       device const ushort *key_cache [[buffer(1)]],
+                       device const ushort *value_cache [[buffer(2)]],
+                       device float *output [[buffer(3)]],
+                       constant KvParams &params [[buffer(4)]],
+                       device const uint *block_table [[buffer(5)]],
+                       uint2 group_id [[threadgroup_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup bfloat q_tile[KIPP_FA_QUERIES * KIPP_HEAD_DIM];
+    threadgroup float scores[KIPP_FA_QUERIES * KIPP_FA_SCORE_STRIDE];
+    threadgroup bfloat probs[KIPP_FA_QUERIES * KIPP_FA_SCORE_STRIDE];
+    threadgroup float rescale[8 * 8];
+    threadgroup float staged_out[KIPP_FA_QUERIES * KIPP_HEAD_DIM];
+    threadgroup float maxima[KIPP_FA_QUERIES];
+    threadgroup float denominators[KIPP_FA_QUERIES];
+
+    uint head = group_id.x;
+    uint kv_head = head / (KIPP_Q_HEADS / KIPP_KV_HEADS);
+    uint tile_first = group_id.y * KIPP_FA_QUERIES;
+    uint tile_rows = min(KIPP_FA_QUERIES, params.token_count - tile_first);
+    const float scale = rsqrt(float(KIPP_HEAD_DIM));
+    ulong head_offset = ulong(kv_head) * KIPP_HEAD_DIM;
+    ulong query_stride = ulong(KIPP_Q_HEADS) * KIPP_HEAD_DIM;
+
+    /* Stage the query tile as bfloat once; ragged rows duplicate the last
+     * real query (their outputs are never stored). Zero the off-diagonal of
+     * the 8x8 rescale matrix once; the diagonal is rewritten per KV tile. */
+    for (uint index = lane; index < KIPP_FA_QUERIES * KIPP_HEAD_DIM;
+         index += 32u) {
+        uint row = index / KIPP_HEAD_DIM;
+        uint clamped = min(row, tile_rows - 1u);
+        q_tile[index] = bfloat(
+            query[(ulong(tile_first + clamped)) * query_stride +
+                  head * KIPP_HEAD_DIM + index % KIPP_HEAD_DIM]);
+    }
+    for (uint index = lane; index < 64u; index += 32u) {
+        rescale[index] = 0.0f;
+    }
+    if (lane < KIPP_FA_QUERIES) {
+        maxima[lane] = KIPP_FLT_LOWEST;
+        denominators[lane] = 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 out_acc[KIPP_HEAD_DIM / 8];
+    for (uint fragment = 0; fragment < KIPP_HEAD_DIM / 8; ++fragment) {
+        out_acc[fragment] = simdgroup_float8x8(0.0f);
+    }
+
+    /* The final tile can cover positions past the session's high-water
+     * mark. Those columns are masked out of the softmax, and their values
+     * are finite by construction: MTLBuffer allocations are documented
+     * zero-filled, and every later write stores a finite bf16, so the
+     * masked 0-weight x value products stay zero instead of poisoning the
+     * accumulator with NaN. */
+    uint last_query = params.start_position + tile_first + tile_rows - 1u;
+    uint kv_tiles = last_query / KIPP_FA_KV_TILE + 1u;
+    for (uint tile = 0; tile < kv_tiles; ++tile) {
+        uint tile_base = tile * KIPP_FA_KV_TILE;
+        /* One table lookup covers the whole tile: tile_base is
+         * block-aligned, so the 32 positions are physically contiguous. */
+        ulong kv_base =
+            kipp_kv_slot(params, block_table, tile_base) *
+            KIPP_KV_VALUES_PER_TOKEN;
+        device const bfloat *keys =
+            (device const bfloat *)key_cache + kv_base + head_offset;
+        device const bfloat *values =
+            (device const bfloat *)value_cache + kv_base + head_offset;
+
+        /* Scores = Q K^T over the tile, on the matrix units. */
+        simdgroup_float8x8 score_frag[KIPP_FA_KV_TILE / 8];
+        for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
+            score_frag[column] = simdgroup_float8x8(0.0f);
+        }
+        for (uint depth = 0; depth < KIPP_HEAD_DIM / 8; ++depth) {
+            simdgroup_bfloat8x8 q_frag;
+            simdgroup_load(q_frag, &q_tile[depth * 8u], KIPP_HEAD_DIM);
+            for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
+                simdgroup_bfloat8x8 k_frag;
+                /* Transposed load turns 8 cached positions x 8 dims into
+                 * the (dim, position) fragment Q K^T needs. */
+                simdgroup_load(k_frag,
+                               keys + (ulong)(column * 8u) *
+                                          KIPP_KV_VALUES_PER_TOKEN +
+                                   depth * 8u,
+                               KIPP_KV_VALUES_PER_TOKEN, 0, true);
+                simdgroup_multiply_accumulate(score_frag[column], q_frag,
+                                              k_frag, score_frag[column]);
+            }
+        }
+        for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
+            simdgroup_store(score_frag[column],
+                            &scores[column * 8u], KIPP_FA_SCORE_STRIDE);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Scalar online-softmax step: lane r owns query row r. */
+        if (lane < KIPP_FA_QUERIES) {
+            uint row = lane;
+            uint query_position =
+                params.start_position + tile_first + min(row, tile_rows - 1u);
+            float row_max = KIPP_FLT_LOWEST;
+            for (uint column = 0; column < KIPP_FA_KV_TILE; ++column) {
+                if (tile_base + column <= query_position) {
+                    row_max = max(row_max,
+                                  scores[row * KIPP_FA_SCORE_STRIDE + column] *
+                                      scale);
+                }
+            }
+            float previous = maxima[row];
+            float merged = max(previous, row_max);
+            float correction =
+                merged == previous ? 1.0f : exp(previous - merged);
+            float sum = 0.0f;
+            for (uint column = 0; column < KIPP_FA_KV_TILE; ++column) {
+                float weight = 0.0f;
+                if (tile_base + column <= query_position) {
+                    weight = exp(scores[row * KIPP_FA_SCORE_STRIDE + column] *
+                                     scale -
+                                 merged);
+                }
+                probs[row * KIPP_FA_SCORE_STRIDE + column] = bfloat(weight);
+                sum += weight;
+            }
+            maxima[row] = merged;
+            denominators[row] = denominators[row] * correction + sum;
+            rescale[row * 8u + row] = correction;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Rescale the running output by diag(correction), then accumulate
+         * P V for this tile. */
+        simdgroup_float8x8 diag;
+        simdgroup_load(diag, rescale, 8);
+        simdgroup_bfloat8x8 p_frag[KIPP_FA_KV_TILE / 8];
+        for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
+            simdgroup_load(p_frag[column], &probs[column * 8u],
+                           KIPP_FA_SCORE_STRIDE);
+        }
+        for (uint fragment = 0; fragment < KIPP_HEAD_DIM / 8; ++fragment) {
+            simdgroup_multiply(out_acc[fragment], diag, out_acc[fragment]);
+            for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
+                simdgroup_bfloat8x8 v_frag;
+                simdgroup_load(v_frag,
+                               values + (ulong)(column * 8u) *
+                                            KIPP_KV_VALUES_PER_TOKEN +
+                                   fragment * 8u,
+                               KIPP_KV_VALUES_PER_TOKEN);
+                simdgroup_multiply_accumulate(out_acc[fragment],
+                                              p_frag[column], v_frag,
+                                              out_acc[fragment]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Stage the tile's output and write the valid rows, dividing by each
+     * query's softmax denominator on the way out. */
+    for (uint fragment = 0; fragment < KIPP_HEAD_DIM / 8; ++fragment) {
+        simdgroup_store(out_acc[fragment], &staged_out[fragment * 8u],
+                        KIPP_HEAD_DIM);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint index = lane; index < tile_rows * KIPP_HEAD_DIM; index += 32u) {
+        uint row = index / KIPP_HEAD_DIM;
+        output[(ulong(tile_first + row)) * query_stride +
+               head * KIPP_HEAD_DIM + index % KIPP_HEAD_DIM] =
+            staged_out[index] / denominators[row];
     }
 }
 #endif

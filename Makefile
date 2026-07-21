@@ -1,8 +1,10 @@
 .PHONY: all cpu server server-metal server-cuda test test-tools test-sanitize \
 	tools-env model convert vectors chat-vectors test-model test-phase2 \
-	test-paged-cpu test-multilogit metal test-metal-ops \
-	test-multilogit-metal test-metal test-server cuda-spark cuda-generic \
-	test-cuda-ops test-cuda docs docs-check clean
+	test-paged-cpu test-pooled-cpu test-multilogit metal test-metal-ops \
+	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
+	test-server \
+	cuda-spark cuda-generic \
+	test-cuda-ops test-cuda docs docs-check paper-data paper-check clean
 
 BUILD_DIR := build
 TOOLS_DIR := tools
@@ -32,8 +34,10 @@ CUDA_GENERIC_ARCH_FLAGS ?= \
 CUDA_SPARK_ARCH_FLAGS ?= -gencode arch=compute_121,code=sm_121
 CORE_HEADERS := src/kipp.h src/kipp_backend.h src/kipp_checkpoints.h \
 	src/kipp_kv_pool.h src/kipp_unicode.inc
-CLI_OBJECTS := $(BUILD_DIR)/kipp_cli.o $(BUILD_DIR)/kipp_spec.o
-SERVER_OBJECTS := $(BUILD_DIR)/kipp_server.o $(BUILD_DIR)/kipp_chat.o
+CLI_OBJECTS := $(BUILD_DIR)/kipp_cli.o $(BUILD_DIR)/kipp_spec.o \
+	$(BUILD_DIR)/kipp_kv_pool.o
+SERVER_OBJECTS := $(BUILD_DIR)/kipp_server.o $(BUILD_DIR)/kipp_chat.o \
+	$(BUILD_DIR)/kipp_kv_pool.o
 TEST_SUPPORT_SOURCES := src/kipp_chat.c src/kipp_spec.c src/kipp_kv_pool.c
 
 all: cpu
@@ -95,6 +99,17 @@ $(BUILD_DIR)/kipp_test: src/kipp.c $(TEST_SUPPORT_SOURCES) \
 		src/kipp.c $(TEST_SUPPORT_SOURCES) \
 		tests/kipp_test.c $(LDLIBS) -o $@
 
+# Mutation-study binary: the CPU oracle with KIPP_FAULT-selected seeded
+# paging bugs (see kipp.c's KIPP_FAULT_INJECT block). Research tooling only —
+# never a production or default-test target.
+$(BUILD_DIR)/kipp_test_fault: src/kipp.c $(TEST_SUPPORT_SOURCES) \
+		$(CORE_HEADERS) src/kipp_chat.h \
+		src/kipp_spec.h src/kipp_kv_pool.h src/kipp_unicode.inc \
+		tests/kipp_test.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKIPP_TESTING -DKIPP_FAULT_INJECT \
+		src/kipp.c $(TEST_SUPPORT_SOURCES) \
+		tests/kipp_test.c $(LDLIBS) -o $@
+
 $(BUILD_DIR)/kipp_test_metal: src/kipp.c src/kipp_chat.c src/kipp.h \
 		src/kipp_backend.h src/kipp_checkpoints.h src/kipp_chat.h \
 		src/kipp_kv_pool.h src/metal/kipp_metal.h src/kipp_unicode.inc \
@@ -129,6 +144,13 @@ docs-check: tools-env
 test-tools: docs-check
 	uv run --project $(TOOLS_DIR) --python 3.12 \
 		python -m unittest tests/test_tooling.py
+	python3 tools/paper_data.py --check
+
+paper-data:
+	python3 tools/paper_data.py
+
+paper-check:
+	python3 tools/paper_data.py --check
 
 model: tools-env
 	tools/download_model.sh --checkpoint $(CHECKPOINT)
@@ -160,6 +182,9 @@ test-phase2: test-paged-cpu test-multilogit
 test-paged-cpu: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --paged-cpu $(MODEL_GGUF) $(VECTOR_DIR)
 
+test-pooled-cpu: $(BUILD_DIR)/kipp_test vectors
+	$(BUILD_DIR)/kipp_test --pooled-cpu $(MODEL_GGUF) $(VECTOR_DIR)
+
 test-multilogit: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --multilogit $(MODEL_GGUF) $(VECTOR_DIR)
 
@@ -171,7 +196,13 @@ test-metal-ops: $(BUILD_DIR)/kipp_test_metal
 test-multilogit-metal: $(BUILD_DIR)/kipp_test_metal vectors
 	$(BUILD_DIR)/kipp_test_metal --multilogit-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
-test-metal: test-metal-ops test-multilogit-metal
+test-paged-metal: $(BUILD_DIR)/kipp_test_metal vectors
+	$(BUILD_DIR)/kipp_test_metal --paged-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
+test-pooled-metal: $(BUILD_DIR)/kipp_test_metal vectors
+	$(BUILD_DIR)/kipp_test_metal --pooled-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
+test-metal: test-metal-ops test-multilogit-metal test-paged-metal
 	$(BUILD_DIR)/kipp_test_metal --phase3-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
 test-server: $(BUILD_DIR)/kipp-server-metal

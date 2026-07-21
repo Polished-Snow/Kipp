@@ -49,7 +49,24 @@ make test-server                            # OpenAI Completions + Chat Completi
 ```
 
 Convenience targets that wire the same gates to the default checkpoint:
-`make test-paged-cpu`, `make test-multilogit`, `make test-metal`.
+`make test-paged-cpu`, `make test-multilogit`, `make test-paged-metal`,
+`make test-metal`.
+
+## Mutation study (the paper's fault-detection matrix)
+
+`make build/kipp_test_fault` builds the CPU oracle with seeded KV-addressing
+bugs selected by the `KIPP_FAULT` environment variable (1 read-block,
+2 read-slot, 3 rollover, 4 swap-kv; 0/unset = no fault). For each fault, run
+the identity-mapped tolerance gate and the scramble gate on the same
+multi-block sequence:
+
+```bash
+KIPP_FAULT=<n> build/kipp_test_fault --fault-reference $M $V  # tolerance + argmax
+KIPP_FAULT=<n> build/kipp_test_fault --paged-cpu       $M $V  # scramble, bitwise
+```
+
+The fault build is research tooling only; production targets never define
+`KIPP_FAULT_INJECT`.
 
 ## Benchmarks
 

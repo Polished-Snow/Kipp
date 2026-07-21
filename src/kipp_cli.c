@@ -42,13 +42,17 @@ static int emit_token(const kipp_model *model, uint32_t token,
  * Greedy self-speculative decode: each step drafts the continuation via
  * prompt-lookup, verifies the whole draft in one multi-logit forward, and
  * accepts the longest greedy-matching prefix. The emitted sequence is exactly
- * the plain greedy sequence — only fewer forward passes produce it.
+ * the plain greedy sequence — only fewer forward passes produce it. With
+ * gate_enabled zero the adaptive gate is bypassed and every step drafts,
+ * which is the ungated baseline the speculation benchmark A/B needs.
  */
 static int run_spec_decode(kipp_model *model, kipp_session *session,
                            float *logits, const uint32_t *prompt,
                            size_t prompt_len, size_t decode_count,
-                           size_t *out_decoded, uint64_t *out_drafted,
-                           uint64_t *out_accepted, kipp_error *error) {
+                           int gate_enabled, size_t *out_decoded,
+                           uint64_t *out_drafted, uint64_t *out_accepted,
+                           uint64_t *out_draft_steps,
+                           uint64_t *out_plain_steps, kipp_error *error) {
     size_t capacity = prompt_len + decode_count + KIPP_CLI_MAX_DRAFT + 1;
     uint32_t *hist = malloc(capacity * sizeof(*hist));
     float *rows = malloc((size_t)(KIPP_CLI_MAX_DRAFT + 1) * KIPP_VOCAB_SIZE *
@@ -65,6 +69,8 @@ static int run_spec_decode(kipp_model *model, kipp_session *session,
     memcpy(hist, prompt, prompt_len * sizeof(*hist));
     size_t hlen = prompt_len;       /* committed tokens (prompt + emitted) */
     uint32_t next_tok = argmax_logits(logits); /* token for position hlen */
+    kipp_spec_gate gate;
+    kipp_spec_gate_init(&gate);
     int status = -1;
 
     while (*out_decoded < decode_count) {
@@ -78,10 +84,20 @@ static int run_spec_decode(kipp_model *model, kipp_session *session,
         if (*out_decoded >= decode_count) {
             break;
         }
-        size_t k = kipp_spec_prompt_lookup(hist, hlen, 3, 1,
-                                           KIPP_CLI_MAX_DRAFT, drafts);
+        /* When the gate has suspended drafting, even the history scan is
+         * skipped; both paths emit the exact greedy sequence, so gating only
+         * moves wall-clock. */
+        size_t k = 0;
+        if (!gate_enabled || kipp_spec_gate_should_draft(&gate)) {
+            k = kipp_spec_prompt_lookup(hist, hlen, 3, 1, KIPP_CLI_MAX_DRAFT,
+                                        drafts);
+        }
         if (k == 0) {
             /* No draft: a single ordinary step. */
+            if (gate_enabled) {
+                kipp_spec_gate_tick(&gate);
+            }
+            *out_plain_steps += 1;
             if (kipp_session_eval(session, &next_tok, 1, logits,
                                   KIPP_VOCAB_SIZE, error) != 0) {
                 goto done;
@@ -96,6 +112,7 @@ static int run_spec_decode(kipp_model *model, kipp_session *session,
             goto done;
         }
         *out_drafted += k;
+        *out_draft_steps += 1;
         /* Accept drafts while each equals the greedy argmax of its row. */
         size_t accepted = 0;
         int finished = 0;
@@ -130,6 +147,9 @@ static int run_spec_decode(kipp_model *model, kipp_session *session,
         if (kipp_session_truncate(session, keep, error) != 0) {
             goto done;
         }
+        if (gate_enabled) {
+            kipp_spec_gate_record(&gate, (uint32_t)k, (uint32_t)accepted);
+        }
         if (finished) {
             break;
         }
@@ -148,7 +168,7 @@ done:
 static void usage(const char *program) {
     fprintf(stderr,
             "Kipp %s\n"
-            "Usage: %s --model MODEL.gguf --prompt TEXT\n"
+            "Usage: %s --model MODEL.gguf (--prompt TEXT | --ppl FILE)\n"
             "  [--backend cpu|metal|cuda]  execution backend (default cpu)\n"
             "  [--decode N]                greedy/sampled tokens to generate\n"
             "  [--temperature F]           0 = greedy argmax (default)\n"
@@ -162,6 +182,14 @@ static void usage(const char *program) {
             "(default 1)\n"
             "  [--top N]                   final top-N logits to print "
             "(default 10)\n"
+            "  [--spec]                    greedy self-speculative decoding\n"
+            "  [--spec-gate on|off]        adaptive speculation gate "
+            "(default on)\n"
+            "  [--ppl FILE]                perplexity over LE uint32 tokens\n"
+            "  [--ppl-window N]            perplexity window length "
+            "(default 2048)\n"
+            "  [--ppl-limit N]             score at most N tokens "
+            "(0 = all)\n"
             "Decoding stops early when the model emits <|endoftext|>.\n",
             KIPP_VERSION, program);
 }
@@ -193,6 +221,166 @@ static double elapsed_seconds(struct timespec start, struct timespec finish) {
            (double)(finish.tv_nsec - start.tv_nsec) / 1000000000.0;
 }
 
+/*
+ * Tokens evaluated per multi-row call while scoring perplexity. Must not
+ * exceed the Metal multi-row token cap (KIPP_METAL_BATCH in
+ * src/metal/kipp_metal.m: multi-row logits require token_count <= 32).
+ */
+#define KIPP_CLI_PPL_CHUNK 32u
+
+/*
+ * Perplexity over a little-endian uint32 token file: non-overlapping windows
+ * of `window` tokens, a fresh session context per window, no burn-in. Each
+ * window scores every position whose target lies inside the same window, so
+ * a full window of W tokens scores W-1 targets. This protocol is simple and
+ * deterministic but is not numerically comparable to llama.cpp's default
+ * perplexity output, which skips a burn-in prefix per chunk.
+ */
+static int run_perplexity(kipp_model *model, const kipp_model_info *info,
+                          const char *path, uint32_t window, size_t limit) {
+    FILE *file = fopen(path, "rb");
+    uint8_t *raw = NULL;
+    uint32_t *stream = NULL;
+    float *logits = NULL;
+    kipp_session *session = NULL;
+    kipp_error error = {0};
+    struct timespec started;
+    struct timespec finished;
+    int status = -1;
+    if (file == NULL) {
+        fprintf(stderr, "kipp: ppl: open '%s': %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (fseek(file, 0L, SEEK_END) != 0) {
+        fprintf(stderr, "kipp: ppl: seek '%s': %s\n", path, strerror(errno));
+        goto done;
+    }
+    long file_size = ftell(file);
+    if (file_size < 0 || fseek(file, 0L, SEEK_SET) != 0) {
+        fprintf(stderr, "kipp: ppl: seek '%s': %s\n", path, strerror(errno));
+        goto done;
+    }
+    if (file_size == 0 || file_size % 4 != 0) {
+        fprintf(stderr, "kipp: ppl: '%s' is not a uint32 token file\n", path);
+        goto done;
+    }
+    size_t token_count = (size_t)file_size / 4;
+    raw = malloc((size_t)file_size);
+    if (raw == NULL ||
+        fread(raw, 1, (size_t)file_size, file) != (size_t)file_size) {
+        fprintf(stderr, "kipp: ppl: unable to read '%s'\n", path);
+        goto done;
+    }
+    if (limit != 0 && limit < token_count) {
+        token_count = limit;
+    }
+    if (token_count < 2) {
+        fprintf(stderr, "kipp: ppl: need at least two tokens to score\n");
+        goto done;
+    }
+    stream = malloc(token_count * sizeof(*stream));
+    if (stream == NULL) {
+        fprintf(stderr, "kipp: ppl: unable to allocate the token stream\n");
+        goto done;
+    }
+    for (size_t index = 0; index < token_count; ++index) {
+        const uint8_t *bytes = raw + index * 4;
+        stream[index] = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+                        ((uint32_t)bytes[2] << 16) |
+                        ((uint32_t)bytes[3] << 24);
+        if (stream[index] >= KIPP_VOCAB_SIZE) {
+            fprintf(stderr, "kipp: ppl: token %zu is out of range\n", index);
+            goto done;
+        }
+    }
+    logits = malloc((size_t)KIPP_CLI_PPL_CHUNK * KIPP_VOCAB_SIZE *
+                    sizeof(*logits));
+    if (logits == NULL) {
+        fprintf(stderr, "kipp: ppl: unable to allocate logits\n");
+        goto done;
+    }
+    if (kipp_session_create(model, window, &session, &error) != 0) {
+        fprintf(stderr, "kipp: ppl: session: %s\n", error.message);
+        goto done;
+    }
+
+    size_t window_total = (token_count + window - 1) / window;
+    size_t scored = 0;
+    double nll = 0.0;
+    (void)clock_gettime(CLOCK_MONOTONIC, &started);
+    for (size_t window_index = 0; window_index < window_total;
+         ++window_index) {
+        size_t window_start = window_index * window;
+        size_t window_length = token_count - window_start;
+        if (window_length > window) {
+            window_length = window;
+        }
+        if (window_length < 2) {
+            break; /* A one-token tail has nothing to score. */
+        }
+        if (kipp_session_reset(session, &error) != 0) {
+            fprintf(stderr, "kipp: ppl: reset: %s\n", error.message);
+            goto done;
+        }
+        for (size_t chunk_start = 0; chunk_start < window_length;
+             chunk_start += KIPP_CLI_PPL_CHUNK) {
+            size_t chunk_length = window_length - chunk_start;
+            if (chunk_length > KIPP_CLI_PPL_CHUNK) {
+                chunk_length = KIPP_CLI_PPL_CHUNK;
+            }
+            if (kipp_session_eval_n(session,
+                                    stream + window_start + chunk_start,
+                                    chunk_length, logits,
+                                    (uint32_t)chunk_length, &error) != 0) {
+                fprintf(stderr, "kipp: ppl: eval: %s\n", error.message);
+                goto done;
+            }
+            /* Row r predicts the token after chunk position r; its target is
+             * the next stream token, scored only when it stays inside this
+             * window. */
+            for (size_t row = 0; row < chunk_length; ++row) {
+                size_t target = chunk_start + row + 1;
+                if (target >= window_length) {
+                    continue;
+                }
+                const float *row_logits = logits + row * KIPP_VOCAB_SIZE;
+                float maximum = row_logits[0];
+                for (uint32_t token = 1; token < KIPP_VOCAB_SIZE; ++token) {
+                    if (row_logits[token] > maximum) {
+                        maximum = row_logits[token];
+                    }
+                }
+                double sum = 0.0;
+                for (uint32_t token = 0; token < KIPP_VOCAB_SIZE; ++token) {
+                    sum += exp((double)row_logits[token] - (double)maximum);
+                }
+                nll += (double)maximum + log(sum) -
+                       (double)row_logits[stream[window_start + target]];
+                ++scored;
+            }
+        }
+        fprintf(stderr, "ppl: window %u/%u ppl=%.4f\n",
+                (unsigned)(window_index + 1), (unsigned)window_total,
+                exp(nll / (double)scored));
+    }
+    (void)clock_gettime(CLOCK_MONOTONIC, &finished);
+    fprintf(stderr,
+            "KIPP_PPL backend=%s tokens=%zu scored=%zu window=%u "
+            "nll=%.9f ppl=%.6f seconds=%.3f\n",
+            kipp_backend_name(info->backend), token_count, scored, window,
+            nll, exp(nll / (double)scored),
+            elapsed_seconds(started, finished));
+    status = 0;
+
+done:
+    kipp_session_destroy(session);
+    free(logits);
+    free(stream);
+    free(raw);
+    (void)fclose(file);
+    return status;
+}
+
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = NULL;
@@ -203,6 +391,10 @@ int main(int argc, char **argv) {
     size_t top_k = 0;
     float min_p = 0.0f;
     int spec = 0;
+    int spec_gate = 1;
+    const char *ppl_path = NULL;
+    size_t ppl_window = 2048;
+    size_t ppl_limit = 0;
     uint64_t rng_state = 1;
     kipp_backend_kind backend = KIPP_BACKEND_CPU;
     kipp_model *model = NULL;
@@ -250,6 +442,29 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[index], "--spec") == 0) {
             spec = 1;
             continue;
+        } else if (strcmp(argv[index], "--spec-gate") == 0 &&
+                   index + 1 < argc) {
+            const char *mode = argv[++index];
+            if (strcmp(mode, "on") == 0) {
+                spec_gate = 1;
+            } else if (strcmp(mode, "off") == 0) {
+                spec_gate = 0;
+            } else {
+                usage(argv[0]);
+                goto cleanup;
+            }
+            continue;
+        } else if (strcmp(argv[index], "--ppl") == 0 && index + 1 < argc) {
+            ppl_path = argv[++index];
+        } else if (strcmp(argv[index], "--ppl-window") == 0 &&
+                   index + 1 < argc &&
+                   parse_count(argv[++index], 1u << 20, &ppl_window) == 0 &&
+                   ppl_window >= 2) {
+            continue;
+        } else if (strcmp(argv[index], "--ppl-limit") == 0 &&
+                   index + 1 < argc &&
+                   parse_count(argv[++index], SIZE_MAX, &ppl_limit) == 0) {
+            continue;
         } else if (strcmp(argv[index], "--seed") == 0 && index + 1 < argc) {
             size_t seed = 0;
             if (parse_count(argv[++index], SIZE_MAX, &seed) != 0 ||
@@ -278,8 +493,15 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
     }
-    if (model_path == NULL || prompt == NULL) {
+    if (model_path == NULL || (prompt == NULL && ppl_path == NULL)) {
         usage(argv[0]);
+        goto cleanup;
+    }
+    if (ppl_path != NULL &&
+        (prompt != NULL || decode_count != 0 || spec)) {
+        fprintf(stderr,
+                "kipp: --ppl cannot be combined with --prompt, --decode, or "
+                "--spec\n");
         goto cleanup;
     }
     if (kipp_model_open_backend(model_path, backend, &model, &error) != 0) {
@@ -290,6 +512,19 @@ int main(int argc, char **argv) {
     kipp_model_info info;
     if (kipp_model_get_info(model, &info) != 0) {
         fprintf(stderr, "kipp: unable to read model info\n");
+        goto cleanup;
+    }
+    if (ppl_path != NULL) {
+        if (ppl_window > info.context_length) {
+            fprintf(stderr, "kipp: --ppl-window must be between 2 and %u\n",
+                    info.context_length);
+            goto cleanup;
+        }
+        if (run_perplexity(model, &info, ppl_path, (uint32_t)ppl_window,
+                           ppl_limit) != 0) {
+            goto cleanup;
+        }
+        exit_code = 0;
         goto cleanup;
     }
     if (kipp_tokenize(model, prompt, &tokens, &error) != 0) {
@@ -339,6 +574,8 @@ int main(int argc, char **argv) {
     size_t decoded_count = 0;
     uint64_t spec_drafted = 0;
     uint64_t spec_accepted = 0;
+    uint64_t spec_draft_steps = 0;
+    uint64_t spec_plain_steps = 0;
     if (decode_count != 0 && spec) {
         if (temperature > 0.0f) {
             fprintf(stderr,
@@ -348,8 +585,9 @@ int main(int argc, char **argv) {
         fputs("generated\t", stdout);
         (void)clock_gettime(CLOCK_MONOTONIC, &started);
         if (run_spec_decode(model, session, logits, tokens.data, tokens.count,
-                            decode_count, &decoded_count, &spec_drafted,
-                            &spec_accepted, &error) != 0) {
+                            decode_count, spec_gate, &decoded_count,
+                            &spec_drafted, &spec_accepted, &spec_draft_steps,
+                            &spec_plain_steps, &error) != 0) {
             fprintf(stderr, "kipp: spec decode: %s\n", error.message);
             goto cleanup;
         }
@@ -431,11 +669,15 @@ int main(int argc, char **argv) {
             decoded_count, decode_seconds);
     if (spec) {
         fprintf(stderr,
-                "KIPP_SPEC drafted=%llu accepted=%llu accept_rate=%.3f\n",
+                "KIPP_SPEC drafted=%llu accepted=%llu accept_rate=%.3f "
+                "draft_steps=%llu plain_steps=%llu\n",
                 (unsigned long long)spec_drafted,
                 (unsigned long long)spec_accepted,
-                spec_drafted == 0 ? 0.0
-                                  : (double)spec_accepted / (double)spec_drafted);
+                spec_drafted == 0
+                    ? 0.0
+                    : (double)spec_accepted / (double)spec_drafted,
+                (unsigned long long)spec_draft_steps,
+                (unsigned long long)spec_plain_steps);
     }
     exit_code = 0;
 

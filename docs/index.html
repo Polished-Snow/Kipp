@@ -58,9 +58,11 @@ presented as validated. Kipp runs
 smaller Q4-class option, with ~1.6–2× faster decode and larger checkpoints
 under Apple's Metal single-buffer cap. The server speaks the OpenAI
 <strong>Completions and Chat Completions</strong> subset (SSE streaming, batched
-multi-sequence decode, serial prefix reuse), a full sampling surface
+multi-sequence decode), a full sampling surface
 (temperature, top-p, top-k, min-p, penalties, logit_bias, seed), and a
-Prometheus <code>/metrics</code> endpoint.</p>
+Prometheus <code>/metrics</code> endpoint — with <strong>cross-request KV prefix caching</strong>
+on CPU/Metal through a content-addressed block pool, gated bitwise
+against unshared evaluation.</p>
 </blockquote>
 <h2>What is Kipp?</h2>
 <p>Kipp is a small, <strong>hand-written Qwen3 inference engine</strong> for local hardware. Most engines try to run everything; Kipp deliberately runs <em>one pinned model family</em>, and aims to run it well enough that you can read the entire engine in an afternoon.</p>

@@ -254,9 +254,28 @@ the core drive both backends are the next Phase 5 steps.
 
 Sessions support truncation back to a prefix of their timeline
 (`kipp_session_truncate`), which is the primitive behind the server's
-serial prefix reuse. Cross-session prefix sharing, persistence, and
-eviction through the block pool remain future Phase 5 work and do not change
-the backend contract.
+serial prefix reuse.
+
+Cross-session prefix sharing is available on the CPU and Metal backends
+behind `kipp_model_open_pooled`: the backend model owns one shared KV slab
+(host memory on CPU, a shared `MTLBuffer` pair on Metal), pooled sessions
+map their block tables onto it through the eval-item `block_table` field,
+and a finished session's full 32-token blocks are published to the
+content-addressed pool (`src/kipp_kv_pool.c`) at reset/destroy
+("publish-at-finish") so a later session can adopt a matching prefix with
+`kipp_session_match_prefix` instead of re-evaluating it. Shared blocks are
+always complete and immutable; the block being appended to is always
+private, which is what keeps `kipp_session_truncate` — speculative rollback
+— away from shared state. On Metal the pooled path changes no shader code:
+sessions bind the model pool buffers with the pool stride, and the
+`kipp_kv_write`/`kipp_flash_gqa` kernels resolve the same per-item block
+table they always have. The `--pooled-cpu` and `--pooled-metal` gates prove
+pooled identity, shared-prefix and batched mixed evaluation bitwise-equal
+to unshared runs on the same backend (Metal additionally within the
+standard `1e-4` of the CPU oracle), clean pool-exhaustion failure,
+truncation into the private tail, and eviction. Server integration,
+persistence, and cache-pressure admission remain future Phase 5 work and do
+not change the backend contract.
 
 ### SSD streaming
 
@@ -389,12 +408,24 @@ admitted while the total choice count fits the batch limit; each scheduler
 step evaluates one prompt chunk (chunked prefill, 32 tokens) or one decode
 token per active choice through `kipp_eval_batch`, so concurrent requests
 read the weights once per step. Slow or disconnected clients are cancelled
-without disturbing other requests. A single cached session plus its
-evaluated token timeline provides serial prefix reuse: when an idle
-single-choice request shares a prefix with the timeline, the session is
-rolled back with `kipp_session_truncate` and only the suffix is prefilled.
-Multi-entry prefix caching and production KV block pooling remain future
-reviewed work and must not change this API surface.
+without disturbing other requests.
+
+On CPU and Metal the server opens the model pooled by default
+(`--kv-pool-mib` overrides the pool size, which defaults to the
+checkpoint's context length; `--kv-pool-mib 0` disables). Every choice of
+every request gets a pooled session that adopts the longest published
+prefix of its prompt at admission (`kipp_session_match_prefix`), so
+cross-request — and cross-choice — prefix reuse needs no cache slot and no
+rollback bookkeeping: finished or cancelled requests publish their full
+blocks on release, and the published pool is the cache. Admission reserves
+worst-case pool blocks (the new request's unmatched blocks plus every
+active choice's remaining budget) before committing; under pool pressure a
+request simply stays in the FIFO, so exhaustion delays admission and can
+never corrupt active sequences. `GET /metrics` exposes pool occupancy and
+reuse counters. On CUDA (non-pooled), the previous single-slot serial
+prefix cache remains: an idle single-choice request sharing a prefix with
+the cached timeline is rolled back with `kipp_session_truncate` and only
+the suffix is prefilled.
 
 Greedy self-speculative decoding is available (CLI `--spec`): each step
 drafts the continuation with a prompt-lookup n-gram matcher
