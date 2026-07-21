@@ -22,10 +22,6 @@
 % unless a macro's comment says otherwise.
 % ============================================================
 \input{generated/results-macros}
-% Hand-maintained macros not bound to a committed results JSON:
-\newcommand{\PrefillQEightOld}{215}  % HAND: pre-MMA vector-kernel prefill, same host (scratch run, not committed)
-\newcommand{\PrefillAffineOld}{239}  % HAND: pre-MMA vector-kernel prefill, same host (scratch run, not committed)
-\newcommand{\MetalNmse}{6\times10^{-7}} % HAND: measured by the --phase3-metal gate; gate output, not JSON-bound
 
 % --- Shared figure style: Okabe-Ito palette, one pgfplots style ---
 \definecolor{kippblue}{HTML}{0072B2}
@@ -598,13 +594,17 @@ stages activations as BF16 and walks 32-row by 16-token output tiles with
 FP32 accumulation. The quantized MMA kernels dequantize each 32-weight block
 into a threadgroup tile once per 16 tokens and run the same fragment loop,
 reading activations directly in FP32, so the dequantization cost no longer
-scales with token count. This removes the quantized-prefill regression of
-earlier revisions (\Cref{sec:eval-ablation}). Attention is a streaming
-online-softmax kernel in the FlashAttention lineage
-\citep{dao2022flashattention,dao2023flashdecoding}: eight simdgroups per
-(head, token) each scan every eighth source position through the block
-table, and partial softmaxes merge in threadgroup memory. No score matrix is
-materialized.
+scales with token count; prefill remains slower under quantization, because
+dequantization adds arithmetic to a compute-bound phase
+(\Cref{sec:eval-throughput}). Attention comes in two shapes, both in the
+FlashAttention lineage
+\citep{dao2022flashattention,dao2023flashdecoding}. Decode uses a split-K
+streaming online-softmax kernel: eight simdgroups per (head, token) each
+scan every eighth source position through the block table, and partial
+softmaxes merge in threadgroup memory; no score matrix is materialized.
+Prefill uses a tiled simdgroup-matrix flash kernel whose 32-position KV
+tiles coincide with cache blocks, added late in development; it currently
+dominates prefill cost (\Cref{sec:eval-ablation}).
 
 The CUDA backend is smaller, and we state its scope exactly: contiguous KV,
 BF16 weights only, final-row logits only, materialized-score attention,
@@ -634,7 +634,7 @@ safe. Greedy speculative output is token-identical to non-speculative greedy
 by construction, and a gate asserts it.
 
 On a bandwidth-bound engine, speculation at low acceptance is a net loss
-(\Cref{sec:bg}): ungated prompt-lookup slows open-ended decoding to
+(\Cref{sec:bg}): ungated prompt-lookup slows grounded decoding to
 $\SpecSpeedupGrounded\times$ (\Cref{tab:spec}). Kipp therefore gates drafting
 adaptively (\Cref{alg:gate}). An exponential moving average of per-verify
 acceptance suspends drafting when it falls below a threshold, and a periodic
@@ -696,6 +696,17 @@ engine commit, hardware, and model revision in every result file. Earlier
 Kipp releases were benchmarked on a base M5 (10-core GPU); all numbers in
 this paper were re-measured on the M5~Max, and the committed result files
 self-describe their hardware.
+
+\paragraph{Measurement protocol}
+Apple-silicon GPU clocks are demand-scaled. Short bursts launched against an
+idle GPU measure a fraction of sustained throughput --- we observed
+several-fold gaps and large run-to-run swings before controlling for it
+% HAND: DVFS calibration measured 2-5x below sustained with ~3x run-to-run
+% HAND: swings; protocol details in bench/README.md.
+--- so a burst benchmark on a consumer SoC can silently report the ramp, not
+the engine. Every number in this paper is sustained steady-state: idle
+machine, multi-minute warm-up, back-to-back single-session measurement, and
+a MAD-based acceptance bound, as documented in \code{bench/README.md}.
 
 For serving experiments we use the standard load metrics
 \citep{zhong2024distserve}: time to first token (TTFT), time per output
@@ -815,21 +826,25 @@ swap-kv      & $\FaultNmseSwapKv$      & flipped & caught  & \emph{missed} \\
 \label{sec:eval-throughput}
 \Cref{tab:perf} reports decode and prefill throughput by weight scheme.
 Decode is bandwidth-bound, so quantization scales it as it shrinks the
-weight bytes streamed per token. Prefill is compute-bound. With the
-quantized MMA kernels of \Cref{sec:impl-kernels}, quantized prefill tracks
-the BF16 matrix path instead of regressing to a vector kernel; the
-regression and its removal are quantified in \Cref{sec:eval-ablation}.
+weight bytes streamed per token. Prefill is compute-bound and moves the
+other way: quantized prefill trails BF16 (\PrefillQEight{} and
+\PrefillAffine{} vs.\ \PrefillBF~tok/s), because dequantization adds
+arithmetic to a phase where bandwidth no longer dominates, and the whole
+phase is currently bounded by the attention-prefill kernel rather than the
+matmuls (\Cref{sec:eval-ablation}).
 
 Speed is only half the tradeoff. \Cref{fig:quality} plots each scheme's
 WikiText-2 perplexity against its decode throughput, which is the plot a
 deployment decision actually needs: how much quality each streamed byte
-buys.
-% PHASE2: once ppl-4b.json lands, add one prose sentence quoting
-% \PplBF/\PplQEight/\PplAffine and the percentage deltas.
+buys. Q8\_0 is quality-free at this precision of measurement
+(\PplQEight{} vs.\ \PplBF{} perplexity, $+\PplDeltaQEightPct\%$) while
+lifting decode from \DecodeBF{} to \DecodeQEight~tok/s; affine4 pays
+$+\PplDeltaAffinePct\%$ perplexity (\PplAffine) for the fastest decode of
+the three (\DecodeAffineFour~tok/s).
 
 \begin{table}[t]\centering\small
 \caption{Throughput (tok/s), Qwen3-4B, Apple M5~Max Metal, median of 5.
-Median absolute deviations are ${\le}1.1$ tok/s throughout (per-run
+Median absolute deviations are ${\le}0.2$ tok/s throughout (per-run
 distributions in the committed result files).}
 \label{tab:perf}
 \begin{tabular}{lrr}
@@ -848,12 +863,16 @@ affine4  & \DecodeAffineFour & \PrefillAffine \\
 \begin{axis}[kippplot,
   xlabel={decode throughput (tok/s)},
   ylabel={WikiText-2 perplexity},
-  xmin=50, xmax=145, ymin=8, ymax=13,
+  xmin=40, xmax=150, ymin=7.5, ymax=8.5,
 ]
-% PHASE2: quant-ppl.dat arrives with ppl-4b.json; then enable:
-% PHASE2: \addplot+[only marks, mark size=2.4pt, nodes near coords,
-% PHASE2:   point meta=explicit symbolic]
-% PHASE2:   table[x=decode_tps, y=ppl, meta=scheme] {data/quant-ppl.dat};
+\addplot+[only marks, mark size=2.4pt]
+  table[x=decode_tps, y=ppl] {data/quant-ppl.dat};
+\node[font=\scriptsize, anchor=south, yshift=2pt]
+  at (axis cs:\DecodeBF,\PplBF) {BF16};
+\node[font=\scriptsize, anchor=south, yshift=2pt]
+  at (axis cs:\DecodeQEight,\PplQEight) {Q8\_0};
+\node[font=\scriptsize, anchor=south, yshift=2pt]
+  at (axis cs:\DecodeAffineFour,\PplAffine) {affine4};
 \end{axis}
 \end{tikzpicture}
 \caption{Quality--speed tradeoff by weight scheme (Qwen3-4B, M5~Max Metal):
@@ -870,18 +889,29 @@ Decode throughput on bandwidth-bound hardware should scale inversely with
 the bytes streamed per token, independent of which checkpoint streams them.
 \Cref{fig:modelsize} checks this across the family (0.6B, 4B, 8B), so the
 4B results of \Cref{sec:eval-throughput} can be read as representative
-rather than cherry-picked.
+rather than cherry-picked: BF16 decode falls from \DecodeZeroSixBBF{}
+through \DecodeBF{} to \DecodeEightBBF~tok/s as parameters grow
+$0.6\to4\to8$B, and Q8\_0 halves the streamed bytes at 8B for
+\DecodeEightBQEight~tok/s.
 
 \begin{figure}[t]\centering
 \begin{tikzpicture}
 \begin{axis}[kippplot,
-  xmode=log, log ticks with fixed point,
+  xmode=log, ymode=log, log ticks with fixed point,
   xlabel={parameters (billions)}, ylabel={tok/s},
-  xmin=0.4, xmax=12, ymin=0, ymax=650,
+  xmin=0.4, xmax=12,
+  legend columns=2,
+  legend style={at={(0.5,1.02)}, anchor=south},
 ]
-% PHASE2: model-size.dat arrives with the 0.6B/8B sweep; then enable:
-% PHASE2: decode and prefill series, bf16 and q8_0, e.g.
-% PHASE2: \addplot table[x=params_b, y=decode] {data/model-size.dat};
+% Every coordinate below is a generated macro bound to model-size.dat's
+% source JSONs (06b-*, 4b-*, 8b-* decode/prefill).
+\addplot coordinates {(0.6,\DecodeZeroSixBBF) (4,\DecodeBF)
+  (8,\DecodeEightBBF)};
+\addplot coordinates {(0.6,\PrefillZeroSixBBF) (4,\PrefillBF)
+  (8,\PrefillEightBBF)};
+\addplot coordinates {(4,\DecodeQEight) (8,\DecodeEightBQEight)};
+\addplot coordinates {(4,\PrefillQEight) (8,\PrefillEightBQEight)};
+\legend{decode BF16, prefill BF16, decode Q8\_0, prefill Q8\_0}
 \end{axis}
 \end{tikzpicture}
 \caption{Throughput across the Qwen3 dense family (M5~Max Metal). Decode
@@ -896,11 +926,11 @@ parameter count.}
 \Cref{fig:ctx} reports throughput against prompt length (Q8\_0, 32-token
 decode, median of 3; \code{bench/results/ctx-*.json}). Decode degrades
 gracefully, from \CtxDecodeShort{} to \CtxDecodeLongest~tok/s between a 3-
-and a 3{,}200-token context, as the per-step KV read grows against the fixed
-weight stream. Prefill rises steeply once the matrix kernels amortize (the
-3-token point is dominated by fixed per-evaluation cost), peaks near
-\CtxPrefillPeak~tok/s, and eases at long context where per-layer KV re-reads
-in attention begin to dominate the projections.
+and a 12{,}800-token context, as the per-step KV read grows against the
+fixed weight stream. Prefill peaks early, near \CtxPrefillPeak~tok/s at a
+200-token prompt, and then falls steadily with context: the tiled
+attention-prefill kernel's cost grows quadratically with prompt length and
+comes to dominate the projections (\Cref{sec:eval-ablation}).
 
 \begin{figure}[t]\centering
 \begin{tikzpicture}
@@ -914,13 +944,13 @@ in attention begin to dominate the projections.
   table[x=tokens, y=decode, y error=decode_mad] {data/ctx-scaling.dat};
 \addplot+[error bars/.cd, y dir=both, y explicit]
   table[x=tokens, y=prefill, y error=prefill_mad] {data/ctx-scaling.dat};
-% PHASE2: the re-run extends ctx-scaling.dat with 6400- and 12800-token rows.
 \legend{decode, prefill}
 \end{axis}
 \end{tikzpicture}
 \caption{Context scaling (Qwen3-4B Q8\_0, M5~Max Metal; error bars show
-MAD). Decode falls as the per-step KV read grows; prefill peaks once the
-matrix kernels amortize and eases as attention's KV re-reads grow.}
+MAD). Decode falls as the per-step KV read grows; prefill peaks at short
+context and falls as the attention-prefill kernel's quadratic cost comes to
+dominate.}
 \Description{Line plot of decode and prefill throughput against prompt
 length on a log axis.}
 \label{fig:ctx}
@@ -939,18 +969,21 @@ single-stream rate (sampled decoding, median of 3;
 \BatchChoicesTpsEight~tok/s aggregate; $1/2/4/8$ independent connections
 deliver \BatchConnsTpsOne, \BatchConnsTpsTwo, \BatchConnsTpsFour, and
 \BatchConnsTpsEight.
-Throughput roughly doubles before flattening where per-step scheduling and
-chunked prefill begin to compete with decode; the widening gap to the ideal
-line is that scheduling cost made visible.
+Parallel choices scale to nearly $2\times$ at $n{=}4$ and then \emph{drop}
+at $n{=}8$: each additional choice adds per-step CPU-side sampling work in
+the single-threaded scheduler, the GPU idles longer between batched steps,
+and the demand-scaled clocks of \Cref{sec:eval-setup} sag in response --- a
+serving-on-consumer-SoC effect a fixed-clock datacenter GPU would not show.
+The widening gap to the ideal line is that scheduling cost made visible.
 
 \begin{figure}[t]\centering
 \begin{tikzpicture}
 \begin{axis}[kippplot,
   xlabel={concurrently decoding sequences $n$},
   ylabel={aggregate tok/s},
-  xtick={1,2,4,8}, xmin=0.6, xmax=8.4, ymin=0, ymax=340,
+  xtick={1,2,4,8}, xmin=0.6, xmax=8.4, ymin=0, ymax=200,
   legend columns=1,
-  legend style={at={(0.03,0.97)}, anchor=north west},
+  legend style={at={(0.97,0.03)}, anchor=south east},
 ]
 \addplot table[x=n, y=choices_tps] {data/server-batch.dat};
 \addplot table[x=n, y=connections_tps] {data/server-batch.dat};
@@ -959,8 +992,9 @@ line is that scheduling cost made visible.
 \end{axis}
 \end{tikzpicture}
 \caption{Batch scaling on the pooled Q8\_0 server (M5~Max). The dashed line
-is ideal linear scaling from the single-stream rate; the widening gap is
-per-step scheduling and chunked-prefill overhead.}
+is ideal linear scaling from the single-stream rate. Scheduling overhead
+widens the gap, and at $n{=}8$ per-step CPU-side sampling stalls the GPU
+long enough for demand-scaled clocks to sag.}
 \Description{Line plot of aggregate throughput against number of concurrent
 sequences, with a dashed ideal-scaling reference.}
 \label{fig:batch}
@@ -975,35 +1009,50 @@ and goodput under a fixed SLO (\Cref{fig:load};
 \code{bench/results/load.json}). This is the view a capacity planner needs:
 the offered rate at which tail latency leaves the knee, and how much of the
 offered load still meets its SLO beyond it.
-% PHASE2: once load.json lands, quote the peak sustainable rate and the
-% PHASE2: p99 TTFT knee in prose here via the \Load* macros.
+
+The verdict for this workload (32-request bursts of 348-token prompts) is
+blunt: a single consumer-SoC GPU saturates below the lowest offered rate we
+test. Aggregate output tops out near \LoadPeakTps~tok/s, median TTFT is
+already \LoadTtftPFiftyLow~ms at $0.5$~req/s, p99 TTFT grows to
+\LoadTtftPNinetyNineHigh~s at \LoadRateHigh~req/s, and goodput under the
+default SLO collapses to \LoadGoodputHigh{} beyond the lowest rate. TPOT
+stays modest throughout (\Cref{fig:load}, right): once a request starts
+decoding it flows at batched-decode speed, so the latency is
+queueing-dominated, not decode-dominated. The system behaves exactly as the
+batch-scaling analysis predicts --- admission control and the FIFO queue
+protect correctness and steady per-token latency, and time to first token
+absorbs the overload.
 
 \begin{figure*}[t]\centering
 \begin{tikzpicture}
 \begin{axis}[kippplot, width=0.44\textwidth,
-  xlabel={offered rate (req/s)}, ylabel={TTFT (ms)},
-  xmin=0.4, xmax=4.2, ymin=0, ymax=4000,
+  xlabel={offered rate (req/s)}, ylabel={TTFT (s)},
+  xmin=0.4, xmax=4.2, ymin=0, ymax=120,
+  legend columns=3,
+  legend style={at={(0.97,0.03)}, anchor=south east},
 ]
-% PHASE2: load-latency.dat arrives with load.json; then enable:
-% PHASE2: \addplot table[x=rate, y=ttft_p50] {data/load-latency.dat};
-% PHASE2: \addplot table[x=rate, y=ttft_p90] {data/load-latency.dat};
-% PHASE2: \addplot table[x=rate, y=ttft_p99] {data/load-latency.dat};
-% PHASE2: \legend{p50, p90, p99}
+\addplot table[x=rate, y=ttft_p50] {data/load-latency.dat};
+\addplot table[x=rate, y=ttft_p90] {data/load-latency.dat};
+\addplot table[x=rate, y=ttft_p99] {data/load-latency.dat};
+\legend{p50, p90, p99}
 \end{axis}
 \end{tikzpicture}\hfill
 \begin{tikzpicture}
 \begin{axis}[kippplot, width=0.44\textwidth,
   xlabel={offered rate (req/s)}, ylabel={TPOT (ms)},
-  xmin=0.4, xmax=4.2, ymin=0, ymax=400,
+  xmin=0.4, xmax=4.2, ymin=0, ymax=500,
+  legend columns=2,
+  legend style={at={(0.97,0.03)}, anchor=south east},
 ]
-% PHASE2: \addplot table[x=rate, y=tpot_p50] {data/load-latency.dat};
-% PHASE2: \addplot table[x=rate, y=tpot_p99] {data/load-latency.dat};
-% PHASE2: \addplot table[x=rate, y=goodput] {data/load-latency.dat}; (2nd axis)
-% PHASE2: \legend{p50, p99}
+\addplot table[x=rate, y expr=\thisrow{tpot_p50}*1000] {data/load-latency.dat};
+\addplot table[x=rate, y expr=\thisrow{tpot_p99}*1000] {data/load-latency.dat};
+\legend{p50, p99}
 \end{axis}
 \end{tikzpicture}
 \caption{Serving under open-loop Poisson load (Qwen3-4B Q8\_0, pooled
-server, M5~Max): TTFT and TPOT percentiles against offered request rate.}
+server, M5~Max): TTFT and TPOT percentiles against offered request rate.
+TTFT grows with queue depth while TPOT holds nearly flat --- the overloaded
+server queues, it does not degrade decode.}
 \Description{Two panels of latency percentiles against offered request
 rate.}
 \label{fig:load}
@@ -1048,17 +1097,22 @@ Eviction and revival & bitwise after LRU eviction \\
 \label{sec:eval-spec}
 \Cref{tab:spec} and \Cref{fig:spec} report acceptance rate $\alpha$, block
 efficiency (accepted tokens per target forward), and wall-clock speedup
-across four workloads, with and without adaptive gating. Ungated
-prompt-lookup lifts copy-heavy decode from \SpecBaseRep{} to
-\SpecDecodeRep~tok/s ($\SpecSpeedupRep\times$) at $\alpha{=}1.0$. However,
-it slows code to $\SpecSpeedupCode\times$ and open-ended text to as little
-as $\SpecSpeedupGrounded\times$: the $k{+}1$-token verify does not amortize
+across four workloads, with and without adaptive gating. The A/B is
+paired: for each workload the harness measures plain decode, ungated
+speculation, and gated speculation adjacently within one session, so both
+speedup columns share a single baseline. Ungated prompt-lookup lifts
+copy-heavy decode from \SpecBaseRep{} to \SpecDecodeRep~tok/s
+($\SpecSpeedupRep\times$) at $\alpha{=}1.0$. However, it slows code to
+$\SpecSpeedupCode\times$ and grounded text to as little as
+$\SpecSpeedupGrounded\times$: the $k{+}1$-token verify does not amortize
 weight streaming at small draft batch, so each speculative step costs close
 to $k{+}1$ decodes while advancing by only accepted${}+1$ tokens. The
-adaptive gate suspends drafting on exactly those workloads, and its duty
-cycle (the fraction of steps that draft) makes the mechanism visible. In
-every configuration the emitted tokens are identical to greedy decoding;
-speculation changes only the wall clock.
+adaptive gate suspends drafting on exactly those workloads --- its duty
+cycle (the fraction of steps that draft) makes the mechanism visible ---
+and pulls every losing workload back toward parity, with a floor of
+$\GatedSpeedupChat\times$, while keeping the copy-heavy win
+($\GatedSpeedupRep\times$). In every configuration the emitted tokens are
+identical to greedy decoding; speculation changes only the wall clock.
 
 \begin{table}[t]\centering\small
 \caption{Prompt-lookup speculation by workload (Qwen3-4B Q8\_0, M5~Max,
@@ -1115,41 +1169,51 @@ and gated, with a parity line at one.}
 \label{sec:eval-llamacpp}
 We compare against llama.cpp \citep{llamacpp2023gguf} on identical hardware
 and the same pinned Qwen3-4B revision, converted independently with
-llama.cpp's own tooling and matched at 348 prefill tokens and 64 decode
-tokens (\Cref{tab:llamacpp}; the commit and exact commands are recorded in
-\code{bench/results/llamacpp-qwen3-4b.json}). The result cuts both ways. On
-decode, the phase that dominates serving cost, Kipp is faster: \DecodeBF{}
-vs.\ \LlamaDecodeBF~tok/s at BF16 and \DecodeQEight{} vs.\
-\LlamaDecodeQEight{} at 8-bit, with Kipp's affine4 scheme reaching
-\DecodeAffineFour. The verification discipline costs nothing where it
-matters most. On prefill, llama.cpp is about $\LlamaPrefillRatioBF\times$
-faster (\LlamaPrefillBF{} vs.\ \PrefillBF~tok/s at BF16), reflecting years
-of kernel engineering (larger tiles, threadgroup-level pipelining, autotuned
-dispatch) that Kipp's readable single-kernel-per-op design does not attempt.
-Kipp is not the fastest prefill engine and does not try to be; its scope is
-one pinned family with no autotuning, and we present this number as the
-measured price of a readable, verifiable prefill path. Two caveats on
-fairness: \code{llama-bench} reports means (with prefill standard deviations
-of several hundred tok/s at BF16) while Kipp reports medians, and the 4-bit
-schemes differ (llama.cpp Q4\_0 is scale-only; affine4 carries a bias), so
-the 4-bit rows are close cousins rather than twins.
-% PHASE2: the llama.cpp re-run adds a Q4_0 row; replace the n/a cells with
-% PHASE2: \LlamaDecodeQFour / \LlamaPrefillQFour.
+llama.cpp's own tooling, at the pinned llama.cpp commit recorded with the
+exact commands in \code{bench/results/llamacpp-qwen3-4b.json}
+(\code{llama-bench}, 2{,}048-token prefill, 256-token decode, five
+repetitions). \Cref{tab:llamacpp} pairs llama.cpp's numbers with Kipp's
+decode benchmark and Kipp's matched 2{,}048-token prefill. The result cuts
+both ways. On decode, the phase that dominates serving cost, Kipp is faster
+in every matched scheme, about $\LlamaDecodeRatioQEight\times$ at 8-bit
+(\DecodeQEight{} vs.\ \LlamaDecodeQEight~tok/s), and its affine4 outruns
+llama.cpp's Q4\_0 (\DecodeAffineFour{} vs.\ \LlamaDecodeQFour). The
+verification discipline costs nothing where it matters most. On prefill the
+loss is heavy: llama.cpp is about $\LlamaPrefillRatioBF\times$ faster at
+BF16 (\LlamaPrefillBF{} vs.\ \PrefillTwoKBF~tok/s at 2{,}048 tokens) and
+more at the quantized schemes, reflecting years of kernel engineering
+(larger tiles, threadgroup-level pipelining, autotuned dispatch) that
+Kipp's readable single-kernel-per-op design does not attempt --- and,
+concretely, Kipp's attention-prefill bottleneck
+(\Cref{sec:eval-ablation}). Kipp is not the fastest prefill engine and does
+not try to be; its scope is one pinned family with no autotuning, and we
+present this number as the measured price of a readable, verifiable prefill
+path today. Three caveats on fairness. \code{llama-bench} reports
+mean$\pm$stddev while Kipp reports median$\pm$MAD. We quote llama.cpp's
+best stable session of the day; repeated sessions under accumulated thermal
+load measured up to a third lower,
+% HAND: repeated llama-bench sessions measured up to ~35% lower under
+% HAND: accumulated thermal load; best stable session quoted.
+so the comparison is conservative in llama.cpp's favor everywhere Kipp
+wins. And the 4-bit schemes differ (llama.cpp Q4\_0 is scale-only; affine4
+carries a bias), so that column is close cousins rather than twins.
 
 \begin{table}[t]\centering\small
-\caption{llama.cpp head-to-head (Qwen3-4B, M5~Max Metal, 348-token prefill,
-64-token decode; tok/s). llama.cpp = mean of 5 (\code{llama-bench}); Kipp =
-median of 5.}
+\caption{llama.cpp head-to-head (Qwen3-4B, M5~Max Metal; tok/s). Decode:
+Kipp median of 5 (348-token prompt, 64-token decode) vs.\
+\code{llama-bench} mean of 5 ($n{=}256$). Prefill: matched 2{,}048-token
+prompt on both. llama.cpp Q4\_0 is compared against Kipp affine4 (schemes
+differ; see text).}
 \label{tab:llamacpp}
 \begin{tabular}{lrrrr}
 \toprule
-& \multicolumn{2}{c}{Decode} & \multicolumn{2}{c}{Prefill} \\
+& \multicolumn{2}{c}{Decode} & \multicolumn{2}{c}{Prefill (2k)} \\
 \cmidrule(lr){2-3}\cmidrule(lr){4-5}
 Weights & Kipp & llama.cpp & Kipp & llama.cpp \\
 \midrule
-BF16    & \textbf{\DecodeBF} & \LlamaDecodeBF & \PrefillBF & \textbf{\LlamaPrefillBF} \\
-Q8\_0   & \textbf{\DecodeQEight} & \LlamaDecodeQEight & \PrefillQEight & \textbf{\LlamaPrefillQEight} \\
-affine4 & \textbf{\DecodeAffineFour} & n/a & \PrefillAffine & n/a \\
+BF16    & \textbf{\DecodeBF} & \LlamaDecodeBF & \PrefillTwoKBF & \textbf{\LlamaPrefillBF} \\
+Q8\_0   & \textbf{\DecodeQEight} & \LlamaDecodeQEight & \PrefillTwoKQEight & \textbf{\LlamaPrefillQEight} \\
+affine4 / Q4\_0 & \textbf{\DecodeAffineFour} & \LlamaDecodeQFour & \PrefillTwoKAffine & \textbf{\LlamaPrefillQFour} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1164,17 +1228,25 @@ never present RSS as the total memory needed to run the model.
 
 \subsection{Ablations}
 \label{sec:eval-ablation}
-\paragraph{Quantized prefill: vector vs.\ MMA} Before the quantized MMA
-kernels, quantized prefill re-dequantized each weight block once per token in
-a vector kernel and slowed under quantization: on the same host, Q8\_0
-prefilled at \PrefillQEightOld~tok/s and affine4 at \PrefillAffineOld,
-against BF16's \PrefillBF. The MMA kernels dequantize each block once per
-16-token tile, lifting Q8\_0 to \PrefillQEight{} ($2.3\times$) and affine4
-to \PrefillAffine{} ($2.2\times$), on par with the BF16 matrix path's
-\PrefillBF. % HAND: the 2.3x/2.2x ratios derive from \PrefillQEight/\PrefillQEightOld and \PrefillAffine/\PrefillAffineOld
-The gates that admitted the change are the same lattice as every other
-feature: exact arg\,max, per-scheme NMSE, bitwise scramble.
-\paragraph{Verify-path reduction order} This change also produced a
+\paragraph{Prefill is attention-dominated} Late in development we replaced
+the split-K streaming attention kernel on the prefill path with the tiled
+simdgroup-matrix flash kernel of \Cref{sec:impl-kernels}. A binary-level
+A/B on the same host measured the new kernel roughly a third slower at a
+348-token prompt,
+% HAND: ~35% at 348 tokens, binary-level A/B; not part of the committed
+% HAND: benchmark set.
+and its cost grows with context, which is why prefill peaks at short
+prompts and then falls (\Cref{fig:ctx}) and why quantized prefill trails
+BF16 (\Cref{tab:perf}): the phase is bounded by attention, not by the
+matmuls that quantization touches. We report this plainly rather than
+quoting the faster superseded kernel; the tiled kernel is what ships,
+because its block-aligned KV tiles are what the paged and pooled gates
+exercise. Optimizing prefill attention --- larger tiles, pipelined loads,
+or reinstating split-K under the same gates --- is the engine's clearest
+future-work item. Every kernel change in this line was admitted through the
+same lattice as any other feature: exact arg\,max, per-scheme NMSE, bitwise
+scramble.
+\paragraph{Verify-path reduction order} The MMA work also produced a
 cautionary result. Routing speculative verify rounds through the matrix
 kernels broke the spec-equals-greedy gate, because the different summation
 order flipped near-tie arg\,maxes. Verify rounds now force the vector
@@ -1317,8 +1389,8 @@ engine can adopt for the cost of a reversed block table and a
 \section*{Artifact Availability}
 Kipp is open source under the MIT license:\par
 \noindent\url{https://github.com/Polished-Snow/Kipp}\par
-\noindent This paper was built from commit \texttt{<commit>} of that
-repository. An archived artifact with a DOI will accompany the final
+\noindent This paper was built from commit \texttt{4cb3e5e} of that
+repository (branch \code{paper/verifiable-paged-attention}). An archived artifact with a DOI will accompany the final
 version. \code{REPRODUCE.md} in the repository
 documents the full build, gate, and benchmark reproduction path, and
 \Cref{app:artifact} maps each claim in this paper to the command that checks
