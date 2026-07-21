@@ -1,0 +1,59 @@
+{
+  "description": "llama.cpp head-to-head on identical hardware and the same pinned Qwen3-4B-Base HF revision, converted independently from the same safetensors. Reps use p=2048/n=256 so each measurement is long enough to hold sustained GPU clocks; Kipp prefill at the matched 2048-token prompt is in 4b-*-prefill2k.json. llama-bench reports mean+stddev (Kipp files report median+MAD). Q4_0 is scale-only 4-bit gs32 vs Kipp's scale+bias affine4_gs32 - closest match, not identical. We quote llama.cpp's best stable session of the day (GPU pre-warmed, stddev <= 6%); repeated sessions under accumulated thermal load measured up to 35% lower. Quoting the best llama.cpp figures is conservative for every comparison drawn in the paper.",
+  "llamacpp": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "commit": "178a6c44937154dc4c4eff0d166f4a044c4fceba",
+    "build": "cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release",
+    "command": "llama-bench -m <gguf> -p 2048 -n 256 -r 5 -o json"
+  },
+  "hardware": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "processor": "Apple M5 Max",
+    "gpu_cores": 40,
+    "unified_memory_bytes": 137438953472
+  },
+  "results": {
+    "bf16": {
+      "prefill": {
+        "avg_tokens_per_second": 2183.2,
+        "stddev": 133.9,
+        "n_prompt": 2048,
+        "n_gen": 0
+      },
+      "decode": {
+        "avg_tokens_per_second": 39.9,
+        "stddev": 0.7,
+        "n_prompt": 0,
+        "n_gen": 256
+      }
+    },
+    "q8_0": {
+      "prefill": {
+        "avg_tokens_per_second": 2505.9,
+        "stddev": 42.6,
+        "n_prompt": 2048,
+        "n_gen": 0
+      },
+      "decode": {
+        "avg_tokens_per_second": 64.3,
+        "stddev": 1.4,
+        "n_prompt": 0,
+        "n_gen": 256
+      }
+    },
+    "q4_0": {
+      "prefill": {
+        "avg_tokens_per_second": 2536.6,
+        "stddev": 39.0,
+        "n_prompt": 2048,
+        "n_gen": 0
+      },
+      "decode": {
+        "avg_tokens_per_second": 96.9,
+        "stddev": 3.0,
+        "n_prompt": 0,
+        "n_gen": 256
+      }
+    }
+  }
+}

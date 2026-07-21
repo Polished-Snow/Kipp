@@ -1,0 +1,52 @@
+{
+  "description": "Wall-clock cost of each correctness gate, single run, idle machine, Qwen3-4B bf16.",
+  "engine_commit": "1ca49c3a76b2532d290b7b6b67eb63b272d61304",
+  "hardware": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "chip": "Apple M5 Max"
+  },
+  "gates": {
+    "model": {
+      "verdict": "PASS",
+      "seconds": 11.6
+    },
+    "multilogit": {
+      "verdict": "PASS",
+      "seconds": 15.4
+    },
+    "phase2-model": {
+      "verdict": "PASS",
+      "seconds": 49.6
+    },
+    "paged-cpu": {
+      "verdict": "PASS",
+      "seconds": 340.8
+    },
+    "pooled-cpu": {
+      "verdict": "PASS",
+      "seconds": 1378.5
+    },
+    "metal-operators": {
+      "verdict": "PASS",
+      "seconds": 0.4
+    },
+    "phase3-metal": {
+      "verdict": "PASS",
+      "seconds": 35.4
+    },
+    "paged-metal": {
+      "verdict": "PASS",
+      "seconds": 4.3
+    },
+    "multilogit-metal": {
+      "verdict": "PASS",
+      "seconds": 13.4
+    },
+    "pooled-metal": {
+      "verdict": "PASS",
+      "seconds": 180.9
+    }
+  },
+  "total_seconds": 2030.3,
+  "metal_full_logit_nmse": 2.95937271e-08
+}

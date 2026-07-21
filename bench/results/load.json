@@ -1,0 +1,132 @@
+{
+  "description": "Open-loop Poisson serving load against the OpenAI endpoint; streamed TTFT/TPOT with percentiles and goodput under the stated SLO.",
+  "engine": {
+    "backend": "metal",
+    "binary": "build/kipp-server-metal",
+    "commit": "9506fd1b3ea1b4d404ff271af12ffbfeed663797",
+    "dirty": false,
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
+  },
+  "hardware": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "processor": "Apple M5 Max",
+    "gpu_cores": 40,
+    "unified_memory_bytes": 137438953472
+  },
+  "model": {
+    "artifact_bytes": 4642894144,
+    "checkpoint": "qwen3-4b-base",
+    "repository": "Qwen/Qwen3-4B-Base",
+    "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+    "format": "GGUF-v3 Kipp Qwen3 subset",
+    "sha256": "e81b9066347d9e3ab1c22058ac7de5792a6a78f41ce408d187421b620de0bc96",
+    "scheme": "q8_0"
+  },
+  "configuration": {
+    "requests_per_rate": 32,
+    "prompt_words": 180,
+    "max_tokens": 64,
+    "slo_ttft_ms": 2000.0,
+    "slo_tpot_ms": 200.0,
+    "seed": 1234
+  },
+  "sweeps": [
+    {
+      "request_rate_per_s": 0.5,
+      "requests": 32,
+      "output_tokens_per_s": 18.73,
+      "ttft_s": {
+        "mean": 20.4521,
+        "p50": 20.56,
+        "p90": 39.2124,
+        "p99": 42.7079
+      },
+      "tpot_s": {
+        "mean": 0.2421,
+        "p50": 0.2346,
+        "p90": 0.347,
+        "p99": 0.4324
+      },
+      "e2e_s": {
+        "mean": 35.7017,
+        "p50": 37.905,
+        "p90": 51.1456,
+        "p99": 53.2739
+      },
+      "goodput_fraction": 0.031
+    },
+    {
+      "request_rate_per_s": 1.0,
+      "requests": 32,
+      "output_tokens_per_s": 16.25,
+      "ttft_s": {
+        "mean": 51.5969,
+        "p50": 51.8632,
+        "p90": 89.7765,
+        "p99": 93.3056
+      },
+      "tpot_s": {
+        "mean": 0.2824,
+        "p50": 0.2843,
+        "p90": 0.3808,
+        "p99": 0.4449
+      },
+      "e2e_s": {
+        "mean": 69.388,
+        "p50": 79.8906,
+        "p90": 100.2287,
+        "p99": 104.4348
+      },
+      "goodput_fraction": 0.0
+    },
+    {
+      "request_rate_per_s": 2.0,
+      "requests": 32,
+      "output_tokens_per_s": 15.59,
+      "ttft_s": {
+        "mean": 63.3623,
+        "p50": 72.6852,
+        "p90": 107.2557,
+        "p99": 108.5106
+      },
+      "tpot_s": {
+        "mean": 0.2196,
+        "p50": 0.2332,
+        "p90": 0.2712,
+        "p99": 0.3347
+      },
+      "e2e_s": {
+        "mean": 77.1975,
+        "p50": 90.5914,
+        "p90": 117.9598,
+        "p99": 120.0501
+      },
+      "goodput_fraction": 0.0
+    },
+    {
+      "request_rate_per_s": 4.0,
+      "requests": 32,
+      "output_tokens_per_s": 19.42,
+      "ttft_s": {
+        "mean": 60.075,
+        "p50": 72.4707,
+        "p90": 93.6604,
+        "p99": 93.9055
+      },
+      "tpot_s": {
+        "mean": 0.1512,
+        "p50": 0.1806,
+        "p90": 0.2338,
+        "p99": 0.2655
+      },
+      "e2e_s": {
+        "mean": 69.5987,
+        "p50": 83.6483,
+        "p90": 98.532,
+        "p99": 98.9474
+      },
+      "goodput_fraction": 0.0
+    }
+  ]
+}

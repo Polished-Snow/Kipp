@@ -26,13 +26,13 @@
     "decode": 256,
     "runs": 3,
     "warmup_runs": 1,
-    "gate": "off"
+    "gate": "on"
   },
   "workloads": {
     "repetitive": {
-      "baseline_decode_tps": 37.07,
-      "spec_decode_tps": 116.97,
-      "speedup": 3.155,
+      "baseline_decode_tps": 39.31,
+      "spec_decode_tps": 101.88,
+      "speedup": 2.591,
       "accept_rate": 1.0,
       "block_efficiency": 4.0,
       "drafted": 192,
@@ -42,40 +42,40 @@
       "draft_duty": 1.0
     },
     "code": {
-      "baseline_decode_tps": 42.1,
-      "spec_decode_tps": 27.42,
-      "speedup": 0.651,
-      "accept_rate": 0.149,
-      "block_efficiency": 1.567,
-      "drafted": 511,
-      "accepted": 76,
-      "draft_steps": 68,
-      "plain_steps": 66,
-      "draft_duty": 0.507
+      "baseline_decode_tps": 51.02,
+      "spec_decode_tps": 49.83,
+      "speedup": 0.977,
+      "accept_rate": 0.194,
+      "block_efficiency": 1.094,
+      "drafted": 93,
+      "accepted": 18,
+      "draft_steps": 12,
+      "plain_steps": 180,
+      "draft_duty": 0.062
     },
     "grounded": {
-      "baseline_decode_tps": 41.21,
-      "spec_decode_tps": 25.15,
-      "speedup": 0.61,
-      "accept_rate": 0.03,
-      "block_efficiency": 1.087,
-      "drafted": 361,
-      "accepted": 11,
-      "draft_steps": 48,
-      "plain_steps": 78,
-      "draft_duty": 0.381
+      "baseline_decode_tps": 82.42,
+      "spec_decode_tps": 69.98,
+      "speedup": 0.849,
+      "accept_rate": 0.0,
+      "block_efficiency": 1.0,
+      "drafted": 30,
+      "accepted": 0,
+      "draft_steps": 5,
+      "plain_steps": 132,
+      "draft_duty": 0.036
     },
     "chat": {
-      "baseline_decode_tps": 97.63,
-      "spec_decode_tps": 61.47,
-      "speedup": 0.63,
-      "accept_rate": 0.037,
+      "baseline_decode_tps": 98.0,
+      "spec_decode_tps": 83.11,
+      "speedup": 0.848,
+      "accept_rate": 0.091,
       "block_efficiency": 1.069,
-      "drafted": 54,
+      "drafted": 22,
       "accepted": 2,
-      "draft_steps": 7,
-      "plain_steps": 22,
-      "draft_duty": 0.241
+      "draft_steps": 3,
+      "plain_steps": 26,
+      "draft_duty": 0.103
     }
   }
 }

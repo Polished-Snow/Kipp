@@ -1,0 +1,95 @@
+{
+  "description": "Wikitext-2 test perplexity per weight scheme. Non-overlapping windows, fresh session per window, every position scored except each window's first token, no burn-in \u2014 not comparable to llama.cpp's perplexity tool.",
+  "engine": {
+    "backend": "metal",
+    "binary": "build/kipp-metal",
+    "commit": "1ca49c3a76b2532d290b7b6b67eb63b272d61304",
+    "dirty": false,
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
+  },
+  "hardware": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "processor": "Apple M5 Max",
+    "gpu_cores": 40,
+    "unified_memory_bytes": 137438953472
+  },
+  "data": {
+    "path": "bench/data/wikitext2-test.tokens",
+    "sha256": "999e4053bac19f6b028e6615fbb8a9f29c6b6ebc1f91a7da9e5c7f401fb784e7",
+    "token_count": 298938
+  },
+  "configuration": {
+    "window": 2048,
+    "limit": 0,
+    "chunk": 32,
+    "scoring": "all positions except each window's first token; non-overlapping windows; no burn-in"
+  },
+  "models": {
+    "bf16": {
+      "artifact_bytes": 8049127712,
+      "checkpoint": "qwen3-4b-base",
+      "repository": "Qwen/Qwen3-4B-Base",
+      "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+      "format": "GGUF-v3 Kipp Qwen3 subset",
+      "sha256": "9fac72eb6658d7829f497ff2c790ceaf51a71f8b150cd800e750913018044085",
+      "scheme": "bf16"
+    },
+    "q8_0": {
+      "artifact_bytes": 4642894144,
+      "checkpoint": "qwen3-4b-base",
+      "repository": "Qwen/Qwen3-4B-Base",
+      "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+      "format": "GGUF-v3 Kipp Qwen3 subset",
+      "sha256": "e81b9066347d9e3ab1c22058ac7de5792a6a78f41ce408d187421b620de0bc96",
+      "scheme": "q8_0"
+    },
+    "affine4_gs32": {
+      "artifact_bytes": 3053318496,
+      "checkpoint": "qwen3-4b-base",
+      "repository": "Qwen/Qwen3-4B-Base",
+      "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+      "format": "GGUF-v3 Kipp Qwen3 subset",
+      "sha256": "33868c6b1317c61954d203b27d8b8b6c94e653ff74c88d5942c248756455a7b2",
+      "scheme": "affine4_gs32"
+    }
+  },
+  "results": {
+    "bf16": {
+      "tokens": 298938,
+      "tokens_scored": 298792,
+      "window": 2048,
+      "nll": 611112.046527206,
+      "ppl": 7.731291,
+      "seconds": 3959.955,
+      "windows": 146
+    },
+    "q8_0": {
+      "tokens": 298938,
+      "tokens_scored": 298792,
+      "window": 2048,
+      "nll": 611183.077838519,
+      "ppl": 7.733129,
+      "seconds": 3455.929,
+      "windows": 146
+    },
+    "affine4_gs32": {
+      "tokens": 298938,
+      "tokens_scored": 298792,
+      "window": 2048,
+      "nll": 627618.249582172,
+      "ppl": 8.170409,
+      "seconds": 3720.959,
+      "windows": 146
+    }
+  },
+  "verify": {
+    "model": "kipp-qwen3-0.6b-base-bf16.gguf",
+    "tokens": 1024,
+    "cpu_ppl": 8.193116,
+    "metal_ppl": 8.193114,
+    "rel_diff": 2.4410737017266155e-07,
+    "tolerance": 0.001,
+    "pass": true
+  }
+}
