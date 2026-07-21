@@ -506,6 +506,11 @@ def generate(loaded):
         macros.macro("GateCostTotal", minutes, "gate-costs.json",
                      f"total_seconds {costs['total_seconds']} -> minutes",
                      commit)
+        # Metal full-logit NMSE as reported by the --phase3-metal gate run.
+        nmse = costs.get("metal_full_logit_nmse")
+        if nmse is not None:
+            macros.macro("MetalNmse", fmt_nmse(nmse),
+                         "gate-costs.json", "metal_full_logit_nmse", commit)
 
     outputs["generated/results-macros.tex"] = macros.text()
     return outputs, macros.count
