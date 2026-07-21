@@ -2,7 +2,7 @@
   "engine": {
     "backend": "metal",
     "binary": "build/kipp-metal",
-    "commit": "9506fd1b3ea1b4d404ff271af12ffbfeed663797",
+    "commit": "c50eede72f0057cff7adf4ad91952574ccaf540c",
     "dirty": false,
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
@@ -26,13 +26,14 @@
     "decode": 256,
     "runs": 3,
     "warmup_runs": 1,
-    "gate": "on"
+    "gate": "on",
+    "paired_baseline": true
   },
   "workloads": {
     "repetitive": {
-      "baseline_decode_tps": 39.31,
-      "spec_decode_tps": 101.88,
-      "speedup": 2.591,
+      "baseline_decode_tps": 55.92,
+      "spec_decode_tps": 177.43,
+      "speedup": 3.173,
       "accept_rate": 1.0,
       "block_efficiency": 4.0,
       "drafted": 192,
@@ -42,9 +43,9 @@
       "draft_duty": 1.0
     },
     "code": {
-      "baseline_decode_tps": 51.02,
-      "spec_decode_tps": 49.83,
-      "speedup": 0.977,
+      "baseline_decode_tps": 52.51,
+      "spec_decode_tps": 46.89,
+      "speedup": 0.893,
       "accept_rate": 0.194,
       "block_efficiency": 1.094,
       "drafted": 93,
@@ -54,9 +55,9 @@
       "draft_duty": 0.062
     },
     "grounded": {
-      "baseline_decode_tps": 82.42,
-      "spec_decode_tps": 69.98,
-      "speedup": 0.849,
+      "baseline_decode_tps": 70.94,
+      "spec_decode_tps": 63.04,
+      "speedup": 0.889,
       "accept_rate": 0.0,
       "block_efficiency": 1.0,
       "drafted": 30,
@@ -66,9 +67,9 @@
       "draft_duty": 0.036
     },
     "chat": {
-      "baseline_decode_tps": 98.0,
-      "spec_decode_tps": 83.11,
-      "speedup": 0.848,
+      "baseline_decode_tps": 98.07,
+      "spec_decode_tps": 78.89,
+      "speedup": 0.804,
       "accept_rate": 0.091,
       "block_efficiency": 1.069,
       "drafted": 22,
