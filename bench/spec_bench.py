@@ -68,61 +68,82 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--decode", type=int, default=64)
     ap.add_argument("--runs", type=int, default=3)
-    ap.add_argument("--gate", choices=("on", "off"), default="on",
+    ap.add_argument("--gate", choices=("on", "off", "both"), default="both",
                     help="adaptive speculation gate (--spec-gate) for the "
-                         "speculative runs; 'off' always drafts")
+                         "speculative runs; 'off' always drafts; 'both' "
+                         "measures ungated and gated adjacently per run "
+                         "against one shared baseline (drift-immune A/B) "
+                         "and writes both output files")
     ap.add_argument("--output", default="bench/results/spec.json")
+    ap.add_argument("--output-gated", default="bench/results/spec-gated.json",
+                    help="gated-half output when --gate both")
     args = ap.parse_args()
 
-    results = {}
+    modes = ["off", "on"] if args.gate == "both" else [args.gate]
+    results = {mode: {} for mode in modes}
     for name, prompt in WORKLOADS.items():
-        base_s, spec_s, accepts = [], [], []
+        base_s = []
+        spec_s = {mode: [] for mode in modes}
+        accepts = {mode: [] for mode in modes}
         # Discarded warm-up so GPU clock ramp does not depress the first
         # measured baseline (matches tools/bench.py's policy).
         run(args.binary, args.backend, args.model, prompt, args.decode, False)
         for _ in range(args.runs):
             b = run(args.binary, args.backend, args.model, prompt, args.decode, False)
-            sp = run(args.binary, args.backend, args.model, prompt, args.decode,
-                     True, args.gate)
             base_s.append(b["decode_seconds"] / b["decode_tokens"])
-            spec_s.append(sp["decode_seconds"] / sp["decode_tokens"])
-            accepts.append(sp)
-        last = accepts[-1]
-        forwards = max(1, last["decode_tokens"] - last["accepted"])
-        accept_rate = (last["accepted"] / last["drafted"]) if last["drafted"] else 0.0
-        steps = last["draft_steps"] + last["plain_steps"]
-        draft_duty = (last["draft_steps"] / steps) if steps else 0.0
+            # Every mode of a run is measured adjacent to its baseline so a
+            # slow drift in machine state cannot skew the A/B.
+            for mode in modes:
+                sp = run(args.binary, args.backend, args.model, prompt,
+                         args.decode, True, mode)
+                spec_s[mode].append(sp["decode_seconds"] / sp["decode_tokens"])
+                accepts[mode].append(sp)
         base_tps = 1.0 / statistics.median(base_s)
-        spec_tps = 1.0 / statistics.median(spec_s)
-        results[name] = {
-            "baseline_decode_tps": round(base_tps, 2),
-            "spec_decode_tps": round(spec_tps, 2),
-            "speedup": round(spec_tps / base_tps, 3),
-            "accept_rate": round(accept_rate, 3),
-            "block_efficiency": round(last["decode_tokens"] / forwards, 3),
-            "drafted": last["drafted"], "accepted": last["accepted"],
-            "draft_steps": last["draft_steps"],
-            "plain_steps": last["plain_steps"],
-            "draft_duty": round(draft_duty, 3),
-        }
-        print(f"{name:12s} base={base_tps:5.1f}  spec={spec_tps:5.1f}  "
-              f"speedup={results[name]['speedup']:.2f}x  "
-              f"alpha={accept_rate:.2f}  blk_eff={results[name]['block_efficiency']:.2f}  "
-              f"duty={draft_duty:.2f}")
+        for mode in modes:
+            last = accepts[mode][-1]
+            forwards = max(1, last["decode_tokens"] - last["accepted"])
+            accept_rate = (last["accepted"] / last["drafted"]) if last["drafted"] else 0.0
+            steps = last["draft_steps"] + last["plain_steps"]
+            draft_duty = (last["draft_steps"] / steps) if steps else 0.0
+            spec_tps = 1.0 / statistics.median(spec_s[mode])
+            results[mode][name] = {
+                "baseline_decode_tps": round(base_tps, 2),
+                "spec_decode_tps": round(spec_tps, 2),
+                "speedup": round(spec_tps / base_tps, 3),
+                "accept_rate": round(accept_rate, 3),
+                "block_efficiency": round(last["decode_tokens"] / forwards, 3),
+                "drafted": last["drafted"], "accepted": last["accepted"],
+                "draft_steps": last["draft_steps"],
+                "plain_steps": last["plain_steps"],
+                "draft_duty": round(draft_duty, 3),
+            }
+            print(f"{name:12s} gate={mode:3s} base={base_tps:5.1f}  "
+                  f"spec={spec_tps:5.1f}  "
+                  f"speedup={results[mode][name]['speedup']:.2f}x  "
+                  f"alpha={accept_rate:.2f}  "
+                  f"blk_eff={results[mode][name]['block_efficiency']:.2f}  "
+                  f"duty={draft_duty:.2f}")
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    report = {
-        "engine": _provenance.engine_metadata(args.binary, args.backend, root),
-        "hardware": _provenance.hardware_metadata(args.backend),
-        "model": _provenance.model_metadata(args.model),
-        "configuration": {"decode": args.decode, "runs": args.runs,
-                          "warmup_runs": 1, "gate": args.gate},
-        "workloads": results,
-    }
-    pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"\nwrote {args.output}", file=sys.stderr)
+    outputs = {"off": args.output, "on": args.output}
+    if args.gate == "both":
+        outputs = {"off": args.output, "on": args.output_gated}
+    for mode in modes:
+        report = {
+            "engine": _provenance.engine_metadata(args.binary, args.backend,
+                                                  root),
+            "hardware": _provenance.hardware_metadata(args.backend),
+            "model": _provenance.model_metadata(args.model),
+            "configuration": {"decode": args.decode, "runs": args.runs,
+                              "warmup_runs": 1, "gate": mode,
+                              "paired_baseline": args.gate == "both"},
+            "workloads": results[mode],
+        }
+        path = pathlib.Path(outputs[mode])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"wrote {path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
