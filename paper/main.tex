@@ -69,16 +69,18 @@ block table and requires bitwise-identical logits. A mutation study shows
 why tolerance-based reference testing is not enough: of four seeded,
 realistic KV-addressing faults, a block-rollover bug measures NMSE of
 exactly $0$ against the reference---invisible to any tolerance, however
-tight---and only the scramble gate catches it, while three value-corrupting
-faults never flip the arg\,max and fall only to a tight NMSE bound. The two
-gate families are complementary, and the study also repaired a blind spot in
+tight---and only the scramble gate catches it, while two read-side faults
+never flip the arg\,max and fall only to a tight NMSE bound, and a fourth
+is gross corruption any check catches. The two gate families are
+complementary, and the study also repaired a blind spot in
 our own gate. We embody the discipline in Kipp, a hand-written C11 engine
 for the Qwen3 dense family whose byte-stable scalar oracle gates two GPU
 backends and every feature: 8- and 4-bit quantization, simdgroup-matrix
 prefill, continuous batching, adaptive speculation, and pooled KV sharing.
 Kipp wins bandwidth-bound decode against llama.cpp on identical hardware,
 prefix reuse cuts time to first token by $\PrefixSpeedup\times$, and every
-number in this paper is bound to a committed, re-runnable artifact.
+benchmark number in this paper is bound to a committed, re-runnable
+artifact.
 \end{abstract}
 
 \maketitle
@@ -103,8 +105,9 @@ this for granted, whether they migrate running requests between instances
 \citep{lee2024infinigen}, ship KV between prefill and decode clusters
 \citep{qin2025mooncake}, persist it across conversation turns
 \citep{gao2024cachedattention}, or share it across calls
-\citep{zheng2024sglang}. \Cref{tab:survey} surveys ten such systems; none
-tests placement invariance. However, the indirection they all depend on, a
+\citep{zheng2024sglang}. Of the systems \Cref{tab:survey} surveys, ten
+relocate KV through an indirection and none tests placement invariance
+(the eleventh, vAttention, sidesteps the indirection by construction). However, the indirection they all depend on, a
 per-access \code{block\_table[pos>>5]*32 + (pos\&31)} lookup replicated
 independently in every backend's write and read kernels, is exactly where
 off-by-one and stride bugs hide. Such bugs are silent. They corrupt a few
@@ -125,7 +128,7 @@ paper makes the following contributions.
   \item We evaluate paging-test adequacy by mutation. Seeding \FaultCount{}
   realistic, asymmetric KV-addressing bugs shows that the detection pattern
   splits exactly along the proposition's hypotheses: placement-commuting
-  faults are caught only by reference tolerance, three of them without ever
+  faults are caught only by reference testing, two of them without ever
   flipping the arg\,max, and the placement-coupled rollover fault, which
   measures NMSE of exactly $0$ against the reference, is caught only by the
   scramble gate. The study also exposed a blind spot in our own gate and
@@ -140,9 +143,10 @@ paper makes the following contributions.
   admitted through the same gates, and evaluated end to end, from
   microbenchmarks and quantization quality to serving under load and a
   same-hardware llama.cpp comparison (\Cref{sec:impl,sec:eval}).
-  \item We bind every number in this paper to a committed result file
-  produced by the repository's harness, and every correctness claim to a
-  gate command listed in the artifact appendix.
+  \item We bind every benchmark number in this paper to a committed result
+  file produced by the repository's harness, and every correctness claim
+  to a gate command listed in the artifact appendix; the two out-of-band
+  measurements are marked as such where they appear.
 \end{enumerate}
 
 We are explicit about what is not new. Attention is invariant to a
@@ -393,8 +397,12 @@ block table and once by a reversed block table.}
 \subsection{The gate lattice}
 \label{sec:vpa-lattice}
 The scramble gate is one node in a lattice of gates that every change must
-pass (\Cref{fig:lattice}). Pinned reference vectors anchor the CPU oracle
-bitwise. The paged gates anchor both backends' KV addressing bitwise. The
+pass (\Cref{fig:lattice}). Pinned FP32 reference vectors anchor the CPU
+oracle at exact arg\,max and NMSE $\le 5\times10^{-5}$ (the oracle's own
+BF16 KV-storage contract rules out bitwise equality with an FP32
+reference; what \emph{is} bitwise is the oracle's stability across engine
+versions, \Cref{sec:oracle}). The paged gates anchor both backends' KV
+addressing bitwise. The
 cross-backend gates anchor Metal and CUDA to the oracle at exact arg\,max and
 NMSE $\le 10^{-4}$, and the speculation gate requires speculative output to
 be token-identical to plain greedy decoding. A feature is not merged until
@@ -417,7 +425,7 @@ engine change is tenable because the gates are fast (\Cref{tab:gatecost}).
   \node[gate, fill=kipporange!22] (cuda) at (3.9,-1.2) {CUDA};
   \node[gate, fill=kippblue!14] (pagedm) at (6.3,-0.1) {paged Metal\\(scramble)};
   \node[gate, fill=kippgreen!16] (spec) at (6.3,1.0) {speculative\\decode};
-  \draw[->] (vec) -- node[crit] {bitwise} (cpu);
+  \draw[->] (vec) -- node[crit] {arg\,max, $5{\cdot}10^{-5}$} (cpu);
   \draw[->] (cpu) -- node[crit, pos=0.55] {bitwise} (pagedc);
   \draw[->] (cpu) -- node[crit] {arg\,max, $10^{-4}$} (metal);
   \draw[->] (cpu) -- node[crit, pos=0.6] {arg\,max, $10^{-4}$} (cuda);
@@ -720,8 +728,10 @@ but its absolute values are not comparable to llama.cpp's
 
 \subsection{Correctness gates}
 \label{sec:eval-correct}
-\Cref{tab:correct} summarizes the gates. The CPU oracle reproduces the pinned
-reference logits bit for bit. Metal matches the oracle at exact arg\,max and
+\Cref{tab:correct} summarizes the gates. The CPU oracle matches the pinned
+FP32 reference vectors at exact arg\,max and NMSE $\le 5\times10^{-5}$,
+and is byte-stable across engine versions
+(\Cref{sec:oracle}). Metal matches the oracle at exact arg\,max and
 NMSE near $\MetalNmse$, and paged KV is bitwise identical to a
 contiguous cache under an adversarially scrambled block table on both
 backends, for all three weight schemes.
@@ -733,7 +743,8 @@ backends, for all three weight schemes.
 \toprule
 Gate & Result \\
 \midrule
-CPU vs.\ pinned reference        & bitwise identical \\
+CPU vs.\ pinned FP32 reference   & arg\,max exact, NMSE ${\le}5{\cdot}10^{-5}$ \\
+CPU vs.\ its own prior releases  & bitwise identical \\
 Metal vs.\ CPU oracle            & arg\,max exact, NMSE $\MetalNmse$ \\
 CUDA vs.\ CPU oracle (A100)$^a$  & arg\,max exact, NMSE ${\le}10^{-6}$ \\
 Paged vs.\ contiguous (CPU)      & bitwise, scrambled table \\
@@ -778,11 +789,13 @@ The detection pattern partitions the faults along the lines of
 The placement-commuting faults (read-block, read-slot, swap-kv) corrupt the
 same logical positions under every block table, so both scramble runs
 compute identical wrong logits and the bitwise gate passes. The proposition
-predicts this: the scramble gate cannot see them. The tolerance gate catches
-all three, but only through its NMSE bound. The read-side faults corrupt
-the logits at NMSE near $10^{-2}$ without flipping the final arg\,max, so a
-gate that checked arg\,max alone, a common lightweight regression test,
-would have passed every mutant except swap-kv.
+predicts this: the scramble gate cannot see them. Reference testing catches
+all three, but in two distinct ways. The read-side faults corrupt the
+logits at NMSE near $10^{-2}$ \emph{without} flipping the final arg\,max
+--- only the NMSE bound sees them --- so a gate that checked arg\,max
+alone, a common lightweight regression test, would have passed every
+mutant except swap-kv, whose gross corruption (NMSE
+$\FaultNmseSwapKv$, arg\,max flipped) any check catches.
 
 The rollover fault is the mirror image. Its misaddressed write lands on
 exactly the right byte under the identity table, so the reference comparison
@@ -844,7 +857,8 @@ the three (\DecodeAffineFour~tok/s).
 
 \begin{table}[t]\centering\small
 \caption{Throughput (tok/s), Qwen3-4B, Apple M5~Max Metal, median of 5.
-Median absolute deviations are ${\le}0.2$ tok/s throughout (per-run
+Median absolute deviations are ${\le}0.2$ tok/s except BF16 decode
+($0.67$) (per-run
 distributions in the committed result files).}
 \label{tab:perf}
 \begin{tabular}{lrr}
@@ -969,6 +983,11 @@ single-stream rate (sampled decoding, median of 3;
 \BatchChoicesTpsEight~tok/s aggregate; $1/2/4/8$ independent connections
 deliver \BatchConnsTpsOne, \BatchConnsTpsTwo, \BatchConnsTpsFour, and
 \BatchConnsTpsEight.
+The two series differ even at $n{=}1$ because they measure different
+aggregates: parallel choices share one prompt's prefill across the batch,
+while concurrent connections each pay their own prefill inside the
+measured window, so the connections series sits lower at every $n$ (the
+ideal-linear reference is therefore anchored on the choices series).
 Parallel choices scale to nearly $2\times$ at $n{=}4$ and then \emph{drop}
 at $n{=}8$: each additional choice adds per-step CPU-side sampling work in
 the single-threaded scheduler, the GPU idles longer between batched steps,
@@ -987,7 +1006,7 @@ The widening gap to the ideal line is that scheduling cost made visible.
 ]
 \addplot table[x=n, y=choices_tps] {data/server-batch.dat};
 \addplot table[x=n, y=connections_tps] {data/server-batch.dat};
-\addplot[dashed, gray, domain=1:8, samples=2] {\BatchChoicesTpsOne*x};
+\addplot[dashed, gray, domain=1:2.55, samples=2] {\BatchChoicesTpsOne*x};
 \legend{parallel choices, concurrent connections, ideal linear}
 \end{axis}
 \end{tikzpicture}
@@ -1013,8 +1032,10 @@ offered load still meets its SLO beyond it.
 The verdict for this workload (32-request bursts of 348-token prompts) is
 blunt: a single consumer-SoC GPU saturates below the lowest offered rate we
 test. Aggregate output tops out near \LoadPeakTps~tok/s, median TTFT is
-already \LoadTtftPFiftyLow~ms at $0.5$~req/s, p99 TTFT grows to
-\LoadTtftPNinetyNineHigh~s at \LoadRateHigh~req/s, and goodput under the
+already \LoadTtftPFiftyLow~ms at $0.5$~req/s, p99 TTFT peaks at
+\LoadTtftPNinetyNinePeak~s at \LoadRatePeakTtft~req/s before settling to
+\LoadTtftPNinetyNineHigh~s at \LoadRateHigh~req/s (the burst drains before
+the highest rate's window closes), and goodput under the
 default SLO collapses to \LoadGoodputHigh{} beyond the lowest rate. TPOT
 stays modest throughout (\Cref{fig:load}, right): once a request starts
 decoding it flows at batched-decode speed, so the latency is
@@ -1100,7 +1121,10 @@ efficiency (accepted tokens per target forward), and wall-clock speedup
 across four workloads, with and without adaptive gating. The A/B is
 paired: for each workload the harness measures plain decode, ungated
 speculation, and gated speculation adjacently within one session, so both
-speedup columns share a single baseline. Ungated prompt-lookup lifts
+speedup columns share a single baseline (the $2.6\%$ gap between the two
+mechanically identical repetitive configurations, $\SpecSpeedupRep\times$
+vs.\ $\GatedSpeedupRep\times$ at duty $1.0$, bounds residual run-to-run
+variance). Ungated prompt-lookup lifts
 copy-heavy decode from \SpecBaseRep{} to \SpecDecodeRep~tok/s
 ($\SpecSpeedupRep\times$) at $\alpha{=}1.0$. However, it slows code to
 $\SpecSpeedupCode\times$ and grounded text to as little as
@@ -1188,14 +1212,21 @@ concretely, Kipp's attention-prefill bottleneck
 (\Cref{sec:eval-ablation}). Kipp is not the fastest prefill engine and does
 not try to be; its scope is one pinned family with no autotuning, and we
 present this number as the measured price of a readable, verifiable prefill
-path today. Three caveats on fairness. \code{llama-bench} reports
+path today. Four caveats on fairness. \code{llama-bench} reports
 mean$\pm$stddev while Kipp reports median$\pm$MAD. We quote llama.cpp's
-best stable session of the day; repeated sessions under accumulated thermal
-load measured up to a third lower,
+best stable session of the day: its sub-100-ms dispatches are maximally
+sensitive to the demand-scaled clocks of \Cref{sec:eval-setup}, so its
+sessions varied by up to a third under accumulated thermal load
+(measured out of band; marked as such in the source)
 % HAND: repeated llama-bench sessions measured up to ~35% lower under
 % HAND: accumulated thermal load; best stable session quoted.
-so the comparison is conservative in llama.cpp's favor everywhere Kipp
-wins. And the 4-bit schemes differ (llama.cpp Q4\_0 is scale-only; affine4
+while Kipp's protocol-warmed medians hold to under $1\%$ --- quoting
+llama.cpp's best strengthens the baseline everywhere it competes. The
+decode configurations differ (64- vs.\ 256-token generations), but
+batch-one decode rate is insensitive at these depths --- our context sweep
+moves only from \CtxDecodeShort{} to \CtxDecodeTwoHundred~tok/s between 3
+and 200 tokens of context --- so both measure the same steady rate. And the 4-bit schemes
+differ (llama.cpp Q4\_0 is scale-only; affine4
 carries a bias), so that column is close cousins rather than twins.
 
 \begin{table}[t]\centering\small
@@ -1374,17 +1405,17 @@ Kipp shows that the placement invariance every paged inference system relies
 on can be a tested contract rather than an assumption, and that the stakes
 are measurable by mutation. A realistic block-rollover bug is bitwise
 invisible to every identity-mapped reference test, yet a scramble gate that
-costs seconds on GPU catches it immediately, while value-corrupting bugs
-sail past arg\,max checks and fall only to a tight NMSE bound. The gates are
-complementary, each with mutants that only it catches, and the mutation
+costs seconds on GPU catches it immediately, while read-side corruption
+sails past arg\,max checks and falls only to a tight NMSE bound. The gates
+are complementary, each with mutants that only it catches, and the mutation
 study repaired a blind spot in the gate itself. A byte-stable scalar oracle
 holds real GPU backends to exact arg\,max, and every feature in the engine,
 from quantization and MMA prefill to batching, adaptive speculation, and
 pooled KV sharing, landed through the same lattice. The result is a small,
-continuously verifiable engine whose correctness, and every number in this
-paper, is reproducible by re-execution --- and a discipline that any paged
-engine can adopt for the cost of a reversed block table and a
-\code{memcmp}.
+continuously verifiable engine whose correctness, and every benchmark
+number in this paper, is reproducible by re-execution --- and a discipline
+that any paged engine can adopt for the cost of a reversed block table and
+a \code{memcmp}.
 
 \section*{Artifact Availability}
 Kipp is open source under the MIT license:\par
@@ -1413,7 +1444,7 @@ committed result file. Build and gate commands (see also
 make cpu metal server-metal      # binaries
 make test test-sanitize          # hermetic units + ASan/UBSan
 # model gates (direct; $M = GGUF, $V = pinned vectors):
-build/kipp_test        --model         $M $V   # bitwise vs reference
+build/kipp_test        --model         $M $V   # argmax + NMSE<=5e-5
 build/kipp_test        --paged-cpu     $M $V   # scramble, bitwise
 build/kipp_test        --multilogit    $M $V
 build/kipp_test        --phase2-model  $M $V

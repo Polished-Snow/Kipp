@@ -5,6 +5,34 @@ BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
 ## Unreleased
 
+### Paper revision: measurement, quality, and provenance (2026-07-21)
+- **CLI `--ppl` perplexity mode**: wikitext-2 perplexity over LE-uint32
+  token files (non-overlapping windows, 32-token multi-row chunks,
+  double-precision log-sum-exp). CPU and Metal agree to ~1e-4 relative;
+  `bench/ppl_bench.py` measures all three weight schemes and verifies the
+  backends against each other.
+- **CLI `--spec-gate on|off`** makes ungated speculation reproducible;
+  `bench/spec_bench.py --gate both` measures a drift-immune paired A/B
+  (baseline, ungated, gated adjacent within each run).
+- **`bench/_provenance.py`**: every bench script now records the same
+  engine/hardware/model block, with model identity read from the GGUF
+  manifest; the dirty flag excludes results and derived paper data.
+- **`tools/paper_data.py`** + `make paper-data` / `make paper-check`:
+  bench/results JSONs are the single source for the paper's macros and
+  pgfplots data; `paper-check` (wired into `test-tools`) fails on missing,
+  uncommitted, modified, or incoherent inputs and on generated-file drift.
+- **GPU steady-state measurement protocol** documented in `bench/README.md`
+  and `REPRODUCE.md`; all committed numbers re-measured under it on the
+  M5 Max, including new evals: perplexity per scheme, a 0.6B/4B/8B
+  model-size sweep, context scaling to 12,800 tokens, open-loop serving
+  load, and a matched llama.cpp head-to-head (pinned commit, 2,048-token
+  prefill, Q4_0 point).
+- **Paper** rebuilt on `acmart` with every number macro-bound to committed
+  results; new survey, LoC, and pooled-gate tables; quality-vs-speed,
+  model-size, and serving-load figures; honest ablation of the tiled
+  flash-prefill attention kernel (slower than the split-K path it
+  replaced; optimizing it is named future work).
+
 ### Cross-request KV prefix sharing (CPU + Metal)
 - **Pooled models** (`kipp_model_open_pooled`, CPU and Metal backends): all
   sessions

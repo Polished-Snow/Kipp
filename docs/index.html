@@ -54,8 +54,9 @@ strict validation, per-checkpoint pinned revisions and hashes, one shared
 forward pass. Validated checkpoints run on the CPU oracle plus <strong>Metal</strong> on
 Apple M5 or <strong>CUDA</strong> on an NVIDIA A100; registry-only entries are not
 presented as validated. Kipp runs
-<strong>BF16, Q8_0, and 4-bit affine</strong> weights — from near-lossless Q8 to a
-smaller Q4-class option, with ~1.6–2× faster decode and larger checkpoints
+<strong>BF16, Q8_0, and 4-bit affine</strong> weights — from near-lossless Q8
+(+0.02% wikitext-2 perplexity) to a smaller Q4-class option (+5.7%),
+with ~1.6–2.2× faster decode and larger checkpoints
 under Apple's Metal single-buffer cap. The server speaks the OpenAI
 <strong>Completions and Chat Completions</strong> subset (SSE streaming, batched
 multi-sequence decode), a full sampling surface

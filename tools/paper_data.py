@@ -262,6 +262,13 @@ def generate(loaded):
                      fmt_tps(loaded[last]["decode_tokens_per_second"]["median"]),
                      last, "decode_tokens_per_second.median",
                      result_commit(loaded[last]))
+        if "ctx-200.json" in loaded:
+            macros.macro(
+                "CtxDecodeTwoHundred",
+                fmt_tps(loaded["ctx-200.json"]
+                        ["decode_tokens_per_second"]["median"]),
+                "ctx-200.json", "decode_tokens_per_second.median",
+                result_commit(loaded["ctx-200.json"]))
         peak_name = max(
             ctx_names,
             key=lambda n: loaded[n]["prefill_tokens_per_second"]["median"])
@@ -388,8 +395,16 @@ def generate(loaded):
                      "prefix-reuse.json", "cold_prompt_ms / 1000", commit)
         macros.macro("PrefixWarmMs", f"{prefix['warm_prompt_ms']:.0f}",
                      "prefix-reuse.json", "warm_prompt_ms", commit)
-        macros.macro("PrefixSpeedup", fmt_tps(prefix["ttft_speedup"]),
-                     "prefix-reuse.json", "ttft_speedup", commit)
+        # Recomputed from the two displayed operands (not the JSON's own
+        # ttft_speedup) so the quoted ratio always divides exactly from the
+        # numbers the paper shows next to it.
+        displayed_cold_ms = round(prefix["cold_prompt_ms"] / 1000, 1) * 1000
+        displayed_warm_ms = round(prefix["warm_prompt_ms"])
+        macros.macro("PrefixSpeedup",
+                     f"{displayed_cold_ms / displayed_warm_ms:.0f}",
+                     "prefix-reuse.json",
+                     "cold_prompt_ms / warm_prompt_ms (displayed operands)",
+                     commit)
 
     # Serving under load.
     if "load.json" in loaded:
@@ -410,6 +425,13 @@ def generate(loaded):
         macros.macro("LoadTtftPNinetyNineHigh",
                      f"{high['ttft_s']['p99']:.1f}",
                      "load.json", "highest-rate ttft_s.p99 (s)", commit)
+        worst = max(sweeps, key=lambda s: s["ttft_s"]["p99"])
+        macros.macro("LoadTtftPNinetyNinePeak",
+                     f"{worst['ttft_s']['p99']:.1f}",
+                     "load.json", "max ttft_s.p99 across rates (s)", commit)
+        macros.macro("LoadRatePeakTtft",
+                     f"{worst['request_rate_per_s']:g}",
+                     "load.json", "rate of max ttft_s.p99", commit)
         macros.macro("LoadGoodputHigh",
                      fmt_ratio(high["goodput_fraction"]),
                      "load.json", "highest-rate goodput_fraction", commit)

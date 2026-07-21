@@ -19,9 +19,12 @@ must never silently diverge from it.
 - **Model family + registry**: strict per-checkpoint revision/shape
   validation; BF16 reference path byte-identical to v0.0.1.
 - **Quantization**: Q8_0 and 4-bit affine (gs32) on the seven per-layer
-  projections; CPU + Metal. Quantized **simdgroup-matrix (MMA) prefill
-  kernels** close the old vector-kernel prefill regression (~2.3× lift,
-  parity with BF16 prefill).
+  projections; CPU + Metal. Quality is measured (wikitext-2 PPL 7.731 /
+  7.733 / 8.170 for bf16/q8_0/affine4 via the CLI `--ppl` mode). Note:
+  **prefill is currently attention-dominated** — the tiled flash-prefill
+  kernel added 2026-07-20 trails the split-K path it replaced (~35% at 348
+  tokens) and quantized prefill trails BF16 (218/297 vs 355 tok/s);
+  reported honestly in the paper's ablations, optimization is open work.
 - **Serving**: OpenAI Completions + Chat Completions, full sampling pack,
   logprobs, timings, Prometheus `/metrics` (now including KV-pool gauges).
 - **Paged KV (delivered)**: CPU and Metal address KV through per-session
@@ -34,12 +37,13 @@ must never silently diverge from it.
   immutable shared full blocks, publish-at-finish, content-addressed pool
   with memcmp verification. Server default for CPU/Metal (`--kv-pool-mib`);
   reservation-based admission; gates `--pooled-cpu` / `--pooled-metal`
-  (six bitwise cases each). Measured 211× TTFT on a repeated 6.9k-token
-  prompt.
+  (six bitwise cases each). Measured 576× TTFT on a repeated 6.9k-token
+  prompt (prefix-reuse.json).
 - **Speculative decoding**: prompt-lookup + **adaptive gating**
   (`kipp_spec_gate`): token-identical to greedy (gated; verify rounds force
-  vector kernels — MMA reduction order flips near-tie argmaxes), 2.2× on
-  repetitive text, ≥0.85× elsewhere.
+  vector kernels — MMA reduction order flips near-tie argmaxes). Paired
+  A/B (`spec_bench.py --gate both`, drift-immune shared baseline): gated
+  3.17× on repetitive text, floor 0.80× elsewhere.
 - **Mutation study**: `build/kipp_test_fault` (KIPP_FAULT=1..4) +
   `--fault-reference`; results in `bench/results/faults.json` — tolerance
   and scramble gates are complementary; the rollover fault has NMSE exactly
@@ -47,13 +51,18 @@ must never silently diverge from it.
 
 ## Paper (`paper/`)
 
-Full systems-paper structure (11 sections): Proposition 1
-(placement invariance, H1–H3), scramble-gate walkthrough + gate-lattice
-figures, mutation-study detection matrix (§7.3, the centerpiece), llama.cpp
-head-to-head (Kipp wins decode, loses prefill 6.6×), context scaling,
-batching, prefix sharing, gate costs. Every number is a macro bound to a
-committed `bench/results/*.json` (rule in `paper/README.md`). Compiles with
-`tectonic main.tex`.
+Revised 2026-07-21 to acmart [sigconf,nonacm] (12 pages, `tectonic
+main.tex`): Proposition 1 (placement invariance), scramble-gate + gate-
+lattice figures, mutation-study matrix (§7.3, the centerpiece), a
+KV-relocation survey table (11 systems), and a 13-subsection evaluation:
+gates, mutation, quant speed+quality (PPL), model-size sweep, context,
+batch, serving-under-load, prefix sharing (576×), paired speculation A/B,
+matched llama.cpp head-to-head (decode ~1.5× Kipp, prefill ~7.9× llama at
+2,048 tokens incl. Q4_0), memory, honest flash-prefill ablation. Every
+number is generated into `paper/generated/results-macros.tex` +
+`paper/data/*.dat` by `tools/paper_data.py` from committed
+`bench/results/*.json`; `make paper-check` (in `test-tools`) enforces it.
+Measure only via the GPU steady-state protocol in `bench/README.md`.
 
 ## Working rules
 

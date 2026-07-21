@@ -433,8 +433,9 @@ drafts the continuation with a prompt-lookup n-gram matcher
 and accepts the longest greedy-matching prefix — rolling the KV back with
 `kipp_session_truncate` for rejected drafts. The emitted sequence is exactly
 the plain greedy sequence (a gated invariant); it just takes fewer forward
-passes (measured ~1.9x on repetitive/structured content, multiplicative with
-quantization).
+passes (measured ~3.2x on repetitive/copy-heavy content with the adaptive
+gate, which also holds low-acceptance workloads at 0.80x or better; see
+`bench/results/spec-gated.json`).
 
 The v1 server does not claim support for Anthropic Messages, tools,
 structured output, embeddings, multimodal input, authentication, TLS,
