@@ -28,3 +28,10 @@ pdfLaTeX, and compile. No custom class files are required.
 Re-run the harness (see `../bench/README.md`), then update the macros at the
 top of `main.tex` — the prose and tables read them, so numbers stay
 single-sourced.
+
+**The rule: a macro may cite only a committed `bench/results/*.json`.** Every
+macro carries a trailing comment naming its source file; a macro whose source
+is uncommitted (or marked `STALE`) must not survive to a released draft.
+Result files record the engine commit and hardware, so a hardware change
+(e.g. the M5 → M5 Max move) is visible in the provenance chain rather than
+silently mixed into the tables.

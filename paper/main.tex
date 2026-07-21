@@ -1,173 +1,355 @@
-\documentclass[10pt,twocolumn]{article}
+\documentclass[sigconf,nonacm,screen]{acmart}
+\settopmatter{printfolios=true}
 
-% --- Packages (all standard; compiles on Overleaf with pdfLaTeX) ---
-\usepackage[margin=0.85in]{geometry}
-\usepackage{amsmath,amssymb}
-\usepackage{booktabs}
-\usepackage{graphicx}
-\usepackage{xcolor}
-\usepackage{listings}
-\usepackage{microtype}
+% --- Packages beyond acmart's own (acmart loads amsmath/amsthm, natbib,
+% --- hyperref, graphicx, xcolor, booktabs, microtype) ---
 \usepackage{balance}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.16}
-\usepackage[numbers,sort&compress]{natbib}
-\usepackage[hidelinks]{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,arrows.meta,calc}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
 \usepackage{cleveref}
 
-% --- Single source of truth for measured numbers (from bench/results/) ---
-% Apple M5, Qwen3-4B, Metal, greedy, median of 5 (decode 64) / 5 (prefill).
-\newcommand{\DecodeBF}{12.6}
-\newcommand{\DecodeQEight}{20.7}
-\newcommand{\DecodeAffineFour}{26.9}
-\newcommand{\PrefillBF}{143}
-\newcommand{\PrefillQEight}{35}
-\newcommand{\PrefillAffine}{32}
-\newcommand{\PeakRSS}{41}
-% Speculative decoding (bench/spec_bench.py + controlled A/B, Q8_0 4B, M5):
-\newcommand{\SpecDecodeRep}{41.9}   % spec decode tok/s, repetitive (was 21.7)
-\newcommand{\SpecSpeedupRep}{1.93}  % spec wall-clock speedup, repetitive
-\newcommand{\SpecSpeedupCode}{0.88} % spec speedup, code (hurts)
-\newcommand{\SpecSpeedupChat}{0.55} % spec speedup, open-ended (hurts most)
+% ============================================================
+% Measured numbers. RULE: a macro may cite only a committed
+% bench/results/*.json. The generated file is produced by
+% `make paper-data` and verified byte-identical by
+% `make paper-check`; hand edits to it do not survive.
+% Hardware: Apple M5 Max (40-core GPU, 128 GB unified memory)
+% unless a macro's comment says otherwise.
+% ============================================================
+\input{generated/results-macros}
+% Hand-maintained macros not bound to a committed results JSON:
+\newcommand{\PrefillQEightOld}{215}  % HAND: pre-MMA vector-kernel prefill, same host (scratch run, not committed)
+\newcommand{\PrefillAffineOld}{239}  % HAND: pre-MMA vector-kernel prefill, same host (scratch run, not committed)
+\newcommand{\MetalNmse}{6\times10^{-7}} % HAND: measured by the --phase3-metal gate; gate output, not JSON-bound
+
+% --- Shared figure style: Okabe-Ito palette, one pgfplots style ---
+\definecolor{kippblue}{HTML}{0072B2}
+\definecolor{kipporange}{HTML}{E69F00}
+\definecolor{kippgreen}{HTML}{009E73}
+\definecolor{kippverm}{HTML}{D55E00}
+\definecolor{kipppurple}{HTML}{CC79A7}
+\pgfplotscreateplotcyclelist{kippcycle}{%
+  {kippblue, mark=*},
+  {kipporange, mark=square*},
+  {kippgreen, mark=triangle*},
+  {kippverm, mark=diamond*},
+  {kipppurple, mark=pentagon*}}
+\pgfplotsset{kippplot/.style={
+  width=\columnwidth, height=4.6cm, tick align=inside,
+  ymajorgrids, grid style={gray!25},
+  legend style={draw=none, font=\footnotesize},
+  cycle list name=kippcycle,
+  every axis plot/.append style={line width=0.9pt, mark size=1.6pt}}}
 
 \lstset{basicstyle=\ttfamily\footnotesize,breaklines=true,frame=single,
         columns=fullflexible,keepspaces=true}
 \newcommand{\code}[1]{\texttt{\small #1}}
 
-\title{\textbf{Kipp: Oracle-Gated, Placement-Invariant Paged\\
-Attention for Verifiable LLM Inference}}
-\author{David Khachatryan Johansson\\ \small \texttt{david@cortify.io}}
-\date{\today}
-
 \begin{document}
-\maketitle
+
+\title{Kipp: Oracle-Gated, Placement-Invariant Paged Attention for
+Verifiable LLM Inference}
+\author{David Khachatryan Johansson}
+\affiliation{%
+  \institution{Cortify}
+  \city{Stockholm}
+  \country{Sweden}}
+\email{david@cortify.io}
 
 \begin{abstract}
-We introduce \textbf{Kipp}, a hand-written C11 inference engine for the pinned
-Qwen3 dense model family with a scalar CPU reference oracle and
-correctness-gated Apple~Metal and NVIDIA~CUDA backends. Modern serving systems
-adopted \emph{paged} key--value (KV) caches to eliminate memory fragmentation,
-and in doing so came to \emph{rely} on a subtle correctness property: that the
-physical placement of KV blocks does not affect the model's output. That
-property is universally assumed and never tested. Kipp turns it into a
-machine-checked contract. Its paged-attention kernels are written to be
-\emph{physical-placement invariant}, and a gate reverses (scrambles) each
-sequence's block table and asserts the generated logits are
-\emph{bitwise-identical} to the identity mapping---an adversarial test that
-catches KV-addressing bugs which tolerance-based reference comparisons miss.
-A deliberately scalar CPU oracle, held byte-stable across refactors, serves as
-a \emph{hard} regression gate rather than a soft baseline: every GPU backend
-must match it to identical arg\,max within $10^{-4}$ NMSE. On an Apple~M5, Kipp
-decodes Qwen3-4B at \DecodeBF{}~tok/s in BF16, \DecodeQEight{}~tok/s at 8-bit,
-and \DecodeAffineFour{}~tok/s at 4-bit, in $\sim$\PeakRSS{}~MB of resident
-memory, and reaches \SpecDecodeRep{}~tok/s ($\SpecSpeedupRep\times$) on
-copy-heavy text via prompt-lookup speculation that is token-identical to
-greedy decoding. We do not claim to be the fastest engine; we claim an engine
-whose paging, prefix reuse, and speculative rollback are correct by continuous
-construction, and every number is reproducible by re-execution.
+Paged key--value (KV) caches are standard in LLM serving, and every system
+that relocates cache blocks at runtime---for prefix sharing, migration,
+spilling, or speculative rollback---relies on an assumption none of them
+tests: the physical placement of KV blocks must not change the model's
+output. We turn that assumption into a machine-checked contract. Placement
+invariance is stated as a proposition whose hypotheses map to real bug
+classes and enforced by a \emph{scramble gate} that reverses a sequence's
+block table and requires bitwise-identical logits. A mutation study shows
+why tolerance-based reference testing is not enough: of four seeded,
+realistic KV-addressing faults, a block-rollover bug measures NMSE of
+exactly $0$ against the reference---invisible to any tolerance, however
+tight---and only the scramble gate catches it, while three value-corrupting
+faults never flip the arg\,max and fall only to a tight NMSE bound. The two
+gate families are complementary, and the study also repaired a blind spot in
+our own gate. We embody the discipline in Kipp, a hand-written C11 engine
+for the Qwen3 dense family whose byte-stable scalar oracle gates two GPU
+backends and every feature: 8- and 4-bit quantization, simdgroup-matrix
+prefill, continuous batching, adaptive speculation, and pooled KV sharing.
+Kipp wins bandwidth-bound decode against llama.cpp on identical hardware,
+prefix reuse cuts time to first token by $\PrefixSpeedup\times$, and every
+number in this paper is bound to a committed, re-runnable artifact.
 \end{abstract}
+
+\maketitle
 
 \section{Introduction}
 \label{sec:intro}
-Large language model (LLM) serving is dominated by the cost of the
-key--value (KV) cache. \citet{kwon2023pagedattention} observed that reserving
+Serving a large language model (LLM) is dominated by the cost of the
+key-value (KV) cache. \citet{kwon2023pagedattention} observed that reserving
 a contiguous KV region per request wastes $60$--$80\%$ of KV memory to
 internal and external fragmentation, and introduced \emph{PagedAttention}:
 store KV in fixed-size blocks and give each sequence a \emph{block table}
-mapping logical positions to arbitrary physical blocks, exactly as an
-operating system pages virtual memory. Paging is now standard
-\citep{kwon2023pagedattention,zheng2024sglang}; it underpins prefix sharing,
-live block migration, and speculative-decode rollback.
+that maps logical positions to arbitrary physical blocks, exactly as an
+operating system pages virtual memory. Paging is now standard practice
+\citep{kwon2023pagedattention,zheng2024sglang,miao2024servingsurvey}, and it
+underpins prefix sharing, live block migration, and speculative-decode
+rollback.
 
-Paging rests on an unstated assumption: \emph{where} a block physically lives
-must not change \emph{what} the model computes. Systems that relocate KV
-blocks at runtime---for load balancing \citep{kwon2023pagedattention}, cache
-sharing \citep{zheng2024sglang}, or memory defragmentation---treat this
-placement-invariance as safe by construction and never test it. Yet the
-indirection it depends on (a per-access \code{block\_table[pos>>5]*32 +
-(pos\&31)} lookup, replicated across every backend and kernel) is precisely
-where off-by-one and stride bugs hide, and such bugs are \emph{silent}: they
-corrupt a few positions without crashing, and a tolerance-based comparison to
-a reference forward pass---the standard test---can mask them as numerical
-noise.
+Paging rests on an unstated assumption: where a block physically lives must
+not change what the model computes. Systems that relocate KV at runtime take
+this for granted, whether they migrate running requests between instances
+\citep{sun2024llumnix}, spill cache entries between GPU and host memory
+\citep{lee2024infinigen}, ship KV between prefill and decode clusters
+\citep{qin2025mooncake}, persist it across conversation turns
+\citep{gao2024cachedattention}, or share it across calls
+\citep{zheng2024sglang}. \Cref{tab:survey} surveys ten such systems; none
+tests placement invariance. However, the indirection they all depend on, a
+per-access \code{block\_table[pos>>5]*32 + (pos\&31)} lookup replicated
+independently in every backend's write and read kernels, is exactly where
+off-by-one and stride bugs hide. Such bugs are silent. They corrupt a few
+positions without crashing, and a tolerance-based comparison to a reference
+forward pass, which is the standard test, can mask them as numerical noise
+(\Cref{sec:silent}).
 
-Kipp takes the opposite stance. We make placement-invariance an explicit,
-adversarially-tested \emph{contract}. Concretely, this paper contributes:
+Kipp takes the opposite stance: correctness properties that serving systems
+rely on should be adversarially tested, continuously, on every backend. This
+paper makes the following contributions.
 
 \begin{enumerate}\itemsep2pt
-  \item \textbf{A placement-invariance gate} (\Cref{sec:vpa}): we reverse each
-  sequence's block table and assert the output logits are \emph{bitwise}
-  identical to the identity mapping. This is a cheap, backend-agnostic
-  adversarial test for a class of paging bugs that reference comparisons miss,
-  stated with the precise scope under which invariance holds.
-  \item \textbf{An oracle-gated backend discipline} (\Cref{sec:oracle}): a
-  scalar CPU forward pass, held byte-identical across the engine's evolution,
-  is used as a \emph{hard} gate; Metal and CUDA must match it at identical
-  arg\,max within $10^{-4}$ NMSE. This inverts the common assumption that
-  optimized GPU kernels are ``never bitwise-equal'' to a reference.
-  \item \textbf{A small, readable, verifiable engine} (\Cref{sec:impl,sec:eval}):
-  $\sim$8\,k lines of C11 core (plus $\sim$3\,k for the Metal and CUDA
-  backends) running the Qwen3 dense family across CPU, Metal, and CUDA, with
-  8- and 4-bit quantization, continuous batching, an OpenAI-compatible server,
-  and prompt-lookup speculation---at real, reproducible throughput, in tens of
-  megabytes of RAM.
+  \item We state placement invariance as a proposition with explicit
+  hypotheses, each of which corresponds to a real bug class, and realize it
+  as a \emph{scramble gate}: reverse a sequence's block table and require the
+  output logits to be bitwise identical to the identity mapping
+  (\Cref{sec:vpa}).
+  \item We evaluate paging-test adequacy by mutation. Seeding \FaultCount{}
+  realistic, asymmetric KV-addressing bugs shows that the detection pattern
+  splits exactly along the proposition's hypotheses: placement-commuting
+  faults are caught only by reference tolerance, three of them without ever
+  flipping the arg\,max, and the placement-coupled rollover fault, which
+  measures NMSE of exactly $0$ against the reference, is caught only by the
+  scramble gate. The study also exposed a blind spot in our own gate and
+  drove its fix (\Cref{sec:eval-faults}).
+  \item We hold a scalar CPU forward pass byte-identical across the engine's
+  evolution and use it as a hard gate: Metal and CUDA must match its
+  arg\,max exactly and stay within $10^{-4}$ NMSE (\Cref{sec:oracle}).
+  \item We build and evaluate the engine itself (\Cref{tab:loc}): a C11 core
+  running the Qwen3 dense family with 8- and 4-bit quantization,
+  simdgroup-matrix prefill, continuous batching, an OpenAI-compatible
+  server, and prompt-lookup speculation with adaptive gating, every feature
+  admitted through the same gates, and evaluated end to end, from
+  microbenchmarks and quantization quality to serving under load and a
+  same-hardware llama.cpp comparison (\Cref{sec:impl,sec:eval}).
+  \item We bind every number in this paper to a committed result file
+  produced by the repository's harness, and every correctness claim to a
+  gate command listed in the artifact appendix.
 \end{enumerate}
 
-We are explicit about what is \emph{not} new. Attention is invariant to a
-permutation of stored KV under a matching permutation of the causal mask; this
-is folklore and has been treated formally in recent KV-quantization work. Zero
-memmove during speculative rollback is standard paged-cache behavior
-\citep{leviathan2023speculative}. Our contribution is not the property but the
-\emph{engineering discipline of testing it}, and the artifact that results.
+We are explicit about what is not new. Attention is invariant to a
+permutation of stored KV under a matching permutation of the causal mask;
+this is folklore and has been treated formally in recent KV-quantization
+work. Zero-copy speculative rollback is standard paged-cache behavior
+\citep{leviathan2023speculative}. Our contribution is the engineering
+discipline of testing the assumption, the measurement of what existing test
+regimes miss, and the artifact that results.
 
 \section{Background}
 \label{sec:bg}
-\paragraph{The Qwen3 dense family.} Kipp targets a fixed registry of pinned
-Qwen3 dense checkpoints (0.6B--32B, base and instruct). The family shares
-head dimension $128$, $8$ KV heads, vocabulary $151{,}936$, RMSNorm
-$\epsilon=10^{-6}$, NEOX rotary embeddings, grouped-query attention, and
-SwiGLU MLPs; only depth, width, head count, and rope~$\theta$ vary. Fixing the
-family (rather than accepting arbitrary GGUF files) is what makes exact,
-per-checkpoint validation tractable.
 
-\paragraph{Paged KV cache.} A sequence's KV is stored in physical blocks of
-$B{=}32$ positions. A per-sequence \emph{block table} $\pi$ maps logical block
-$b$ to a physical block $\pi(b)$; position $p$ resolves to physical slot
-$\pi(\lfloor p/B\rfloor)\cdot B + (p \bmod B)$. The identity table
-$\pi(b){=}b$ reproduces a contiguous cache byte-for-byte. Prefix sharing, block
-migration, and rollback are all realized by editing $\pi$, never by moving KV
-bytes.
+\subsection{Transformer inference and the KV cache}
+Autoregressive inference has two phases with opposite bottlenecks.
+\emph{Prefill} evaluates the whole prompt at once and is compute-bound, since
+every weight is reused across all prompt tokens. \emph{Decode} produces one
+token per step and is bandwidth-bound: each step streams every weight from
+memory to produce a single token, so throughput tracks bytes per weight.
+This is why weight quantization accelerates decode but not prefill
+(\Cref{sec:eval-throughput}). Each generated token appends a key and value
+vector per layer to the KV cache, which grows linearly with context and
+persists across steps.
+
+Kipp targets a fixed registry of pinned Qwen3 dense checkpoints
+(0.6B--32B, base and instruct) \citep{yang2025qwen3}. The family shares
+head dimension $128$, eight KV heads \citep{ainslie2023gqa}, a vocabulary
+of $151{,}936$, RMSNorm $\epsilon=10^{-6}$, NEOX rotary embeddings
+\citep{su2024rope}, grouped-query attention, and SwiGLU MLPs; only depth,
+width, query-head count, and rope~$\theta$ vary. Fixing the family, rather than accepting
+arbitrary GGUF files, is what makes exact per-checkpoint validation
+tractable.
+
+\subsection{Paged KV caches and the OS analogy}
+Kipp stores a sequence's KV in physical blocks of $B{=}32$ positions. A
+per-sequence \emph{block table} $\pi$ maps logical block $b$ to a physical
+block $\pi(b)$; position $p$ resolves to physical slot
+$\pi(\lfloor p/B\rfloor)\cdot B + (p \bmod B)$. The analogy to OS paging is
+exact: blocks are pages, the block table is a page table, and logical
+positions are virtual addresses. The identity table $\pi(b){=}b$ reproduces a
+contiguous cache byte for byte. Prefix sharing, block migration, and rollback
+are all realized by editing $\pi$, never by moving KV bytes. The analogy also
+suggests the missing test. An OS would not ship an MMU whose translation path
+had only ever been exercised with identity mappings, yet that is how paged
+LLM engines are tested today.
+
+\subsection{Speculation on bandwidth-bound hardware}
+Because decode streams every weight per step, a $k{+}1$-token speculative
+verify forward is nearly free on compute-bound hardware but costs close to
+$k{+}1$ decode steps when weight streaming dominates
+\citep{leviathan2023speculative,saxena2023promptlookup}. Speculation is
+therefore a net loss at low acceptance, which motivates the adaptive gate of
+\Cref{sec:impl-spec}. The same arithmetic makes batched decode scale:
+one weight read serves every concurrently decoding sequence
+\citep{yu2022orca}, which \Cref{sec:eval-batching} measures.
+
+\section{The Silent-Corruption Problem}
+\label{sec:silent}
+The KV indirection is two instructions, but several distinct bug classes
+live in it:
+
+\begin{itemize}\itemsep2pt
+  \item \emph{Block-index errors}: an off-by-one in the logical-block
+  computation reads a neighboring block's KV.
+  \item \emph{Slot errors}: an off-by-one within the block shifts every
+  source position by one slot.
+  \item \emph{Rollover errors}: the first position after a block boundary is
+  addressed relative to the previous block, one past its end.
+  \item \emph{Binding errors}: key and value stores, or their strides, are
+  swapped in one kernel's argument list.
+\end{itemize}
+
+Three properties make these bugs dangerous. First, they are silent. The
+wrong address is still a valid slot, so no bounds are violated, nothing
+crashes, and generation continues fluently; attention's softmax dilutes a few
+corrupted source positions into a plausible output distribution. Second,
+they are masked by tolerance. The standard test compares final logits to a
+reference within a numerical tolerance chosen to absorb legitimate
+reduction-order and quantization noise, and a bug that corrupts a few
+positions can land within or near that band, indistinguishable from noise.
+Third, some are invisible under the identity mapping. A rollover bug that
+writes position $32b$ ``one past the end of block $b{-}1$'' lands on exactly
+the right byte when blocks are laid out contiguously. Under the identity
+table every happy-path test passes bitwise, and the bug only corrupts once a
+scheduler actually relocates a block. \Cref{sec:eval-faults} demonstrates
+each of these behaviors with seeded faults.
+
+The exposure grows with exactly the features that make paging valuable:
+cross-request prefix sharing backs the same physical block with many
+sequences, defragmentation compacts live blocks with zero recompute, and
+speculative rollback drops rejected blocks by unlinking. Each new feature
+adds code that manipulates $\pi$. None of it is exercised by tests that only
+ever run the identity mapping. \Cref{tab:survey} makes the claim auditable:
+across ten widely used systems that relocate or reuse KV at runtime, we
+found no test of placement invariance as a property.
+
+\begin{table}[t]\centering\small
+\caption{Systems that relocate or reuse KV at runtime, and whether their
+test suites check placement invariance as a property. Based on inspection of
+each system's public repository and test suite as of July 2026; we welcome
+corrections.}
+\label{tab:survey}
+\begin{tabular}{@{}lp{3.55cm}c@{}}
+\toprule
+System & KV relocation / reuse & Tests inv.? \\
+\midrule
+vLLM \citep{kwon2023pagedattention} & block-table paging, prefix sharing & no \\
+SGLang \citep{zheng2024sglang} & radix-tree prefix sharing & no \\
+TensorRT-LLM \citep{nvidia2023tensorrtllm} & paged KV, block reuse & no \\
+TGI \citep{huggingface2023tgi} & paged KV & no \\
+llama.cpp \citep{llamacpp2023gguf} & unified KV cells, defrag moves & no \\
+Mooncake \citep{qin2025mooncake} & prefill$\to$decode KV transfer & no \\
+InfiniGen \citep{lee2024infinigen} & GPU--host KV spilling & no \\
+Llumnix \citep{sun2024llumnix} & live request + cache migration & no \\
+CachedAttention \citep{gao2024cachedattention} & cross-turn KV persistence & no \\
+vAttention \citep{prabhu2025vattention} & contiguous virtual KV, demand paging & n/a$^{a}$ \\
+\midrule
+Kipp (this work) & block-table paging, pooled prefix sharing &
+  \textbf{yes}$^{b}$ \\
+\bottomrule
+\multicolumn{3}{@{}l}{\scriptsize $^a$ Avoids table indirection by
+construction (contiguous virtual addresses).} \\
+\multicolumn{3}{@{}l}{\scriptsize $^b$ Bitwise scramble gate on CPU and
+Metal (\Cref{sec:vpa-gate}).}
+\end{tabular}
+\end{table}
 
 \section{Placement-Invariant Paged Attention}
 \label{sec:vpa}
-\paragraph{The property.} Let a sequence occupy logical positions
-$0,\dots,L-1$. For any permutation $\pi$ of the physical blocks that is applied
-consistently to both KV \emph{writes} and \emph{reads}, the attention output
-for every query position is unchanged, because attention at position $p$ is a
-mask-weighted reduction over the \emph{set} of source positions $\{0,\dots,p\}$
-and each source's key/value is read from wherever $\pi$ placed it. Placement
-enters only the address, never the value or the reduction order. Hence the
-final logits are identical---and, since the reduction order is fixed,
-\emph{bitwise} identical, not merely close.
 
-\paragraph{Scope (stated precisely).} Invariance holds for the \emph{physical
-placement of retained KV}: reordering which physical block holds a given
-\emph{logical} position. It does \emph{not} hold for reordering the logical
-positions themselves---rotary embeddings and the causal mask are
-position-dependent---nor is the triangular prefill mask invariant to permuting
-\emph{columns} of the score matrix. We test and claim only physical-placement
-invariance. This distinction is what keeps the contract honest.
+\subsection{The invariance property}
+\label{sec:vpa-prop}
 
-\paragraph{The gate.} We realize the contract as an adversarial test
-(\Cref{lst:gate}). We build a sequence spanning several blocks, evaluate it
-under the identity table, then \emph{reverse} the block table (a non-identity
-permutation that relocates every logical block to a different physical block)
-and re-evaluate. The final logits must be \code{memcmp}-equal. Because a
+\begin{proposition}[Physical-placement invariance]
+\label{prop:invariance}
+Fix a sequence of logical positions $0,\dots,L-1$ with token embeddings,
+rotary phases, and causal mask defined on logical positions. Let the KV cache
+be stored in physical blocks of $B$ slots addressed through a block table,
+and let $\pi,\pi'$ be any two injective maps from logical blocks to physical
+blocks. Suppose:
+\begin{itemize}\itemsep1pt
+  \item[\textbf{H1}] the same map is applied to every KV \emph{write} and
+  every KV \emph{read} (the address is
+  $\pi(\lfloor p/B\rfloor)\cdot B + (p\bmod B)$, and nothing else in the
+  kernel depends on the physical address);
+  \item[\textbf{H2}] rotary embeddings and the causal mask are computed from
+  logical positions only; and
+  \item[\textbf{H3}] the attention reduction enumerates source positions
+  in a fixed logical order, with a fixed summation order and the same
+  floating-point operations, independent of $\pi$.
+\end{itemize}
+Then for every query position the attention output, and hence the final
+logits, computed under $\pi$ and $\pi'$ are bitwise identical.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Under H1 the bytes written for logical position $p$ and the bytes read for
+$p$ coincide regardless of $\pi$: read$\,\circ\,$write is the identity on
+logical positions, so by H2 the sequence of (key, value, phase, mask) tuples
+entering attention at any query position is equal as an indexed sequence,
+not merely as a set. By H3 the reduction consumes that sequence in the same
+order with the same operations, and floating-point evaluation is a
+deterministic function of operand bits and operation order, so every
+intermediate value is bit-equal. Induction over layers extends equality to
+the final logits.
+\end{proof}
+
+Each hypothesis is load-bearing, and each corresponds to a real bug class.
+Violating H1 on one side of the indirection is exactly the fault family of
+\Cref{sec:silent}; a mapping error applied consistently to both sides is a
+harmless relocation, which is why our mutation study must (and does) seed
+one-sided faults. H2 fails if any kernel derives a rotary phase or mask
+bound from a physical address. H3 is the batch-invariance axis of
+\citet{he2025defeating}. The proposition does not require determinism across
+batch sizes, only that placement not perturb the reduction; the two axes are
+orthogonal, and a kernel can satisfy either without the other.
+
+\subsection{Scope, stated precisely}
+Invariance holds for the physical placement of retained KV, that is, for
+which physical block holds a given logical position. It does not hold for
+reordering the logical positions themselves, since rotary embeddings and the
+causal mask are position-dependent. Nor is the triangular prefill mask
+invariant to permuting columns of the score matrix. We test and claim only
+physical-placement invariance. This distinction is what keeps the contract
+honest.
+
+\subsection{The scramble gate}
+\label{sec:vpa-gate}
+We realize the contract as an adversarial test (\Cref{lst:gate},
+\Cref{fig:scramble}). The gate builds a sequence spanning several blocks,
+evaluates it under the identity table, then reverses the block table (a
+non-identity permutation that relocates every logical block) and re-evaluates
+the same tokens. The final logits must be \code{memcmp}-equal. In the
+terminology of software testing this is a metamorphic test
+\citep{chen2018metamorphic}: the block-table permutation is a metamorphic
+relation whose expected effect on the output is exactly zero. Because a
 scrambled table exercises the addressing arithmetic with a mapping that no
-happy-path test would produce, the gate localizes stride/offset bugs that a
-reference-NMSE comparison reports as $10^{-3}$ ``noise.'' We ran exactly this
-gate to validate Kipp's Metal paging: it passes at bitwise equality on both
-CPU and Metal (\Cref{sec:eval}).
+happy-path test would produce, the gate tests the contrapositive of
+\Cref{prop:invariance}. Any bitwise difference falsifies one of H1--H3 and
+localizes a bug that a reference-NMSE comparison could report as $10^{-3}$
+``noise.'' The gate runs on both the CPU oracle (\code{--paged-cpu}) and the
+Metal backend (\code{--paged-metal}); it is cheap (\Cref{sec:oracle}) and
+backend-agnostic.
 
 \begin{lstlisting}[caption={The placement-invariance gate (paraphrased).},
                    label={lst:gate}]
@@ -177,80 +359,361 @@ eval(scrambled_session, tokens -> logits_B)
 assert memcmp(logits_A, logits_B) == 0   // bitwise, not tolerance
 \end{lstlisting}
 
-\paragraph{Why it matters.} Placement-invariance is the correctness premise of
-every paged system's most valuable features: cross-request prefix sharing (the
-same physical block backs many sequences), defragmentation (compact live
-blocks with zero recompute), and speculative rollback (drop rejected blocks by
-unlinking, no memmove). Turning the premise into a passing gate makes those
-features correct-by-testing rather than correct-by-assumption.
+\begin{figure}[t]\centering
+\begin{tikzpicture}[
+  blk/.style={draw, minimum width=0.72cm, minimum height=0.5cm,
+              font=\scriptsize, inner sep=1pt},
+  lbl/.style={font=\scriptsize}, >=Stealth]
+  % identity physical row (above), logical row (middle), reversed (below):
+  % arrows fan out from the logical row without crossing any node row.
+  \node[lbl] at (-1.15,1.1) {$\pi=\mathrm{id}$};
+  \foreach \i/\c in {0/kippblue!18,1/kippgreen!20,2/kipporange!28,3/kippverm!18} {
+    \node[blk, fill=\c] (P\i) at (\i*0.85, 1.1) {$\i$};
+  }
+  \node[lbl] at (-1.15,0) {logical};
+  \foreach \i/\c in {0/kippblue!18,1/kippgreen!20,2/kipporange!28,3/kippverm!18} {
+    \node[blk, fill=\c] (L\i) at (\i*0.85, 0) {$b_\i$};
+    \draw[->, gray] (L\i.north) -- (P\i.south);
+  }
+  \node[lbl] at (-1.15,-1.25) {$\pi=\mathrm{rev}$};
+  \foreach \i/\j/\c in {0/3/kippblue!18,1/2/kippgreen!20,2/1/kipporange!28,3/0/kippverm!18} {
+    \node[blk, fill=\c] (R\i) at (\j*0.85, -1.25) {$\j$};
+    \draw[->, gray] (L\i.south) to[out=-90, in=90, looseness=0.7]
+      (R\i.north);
+  }
+  \node[lbl, align=center] at (1.3,-2.05)
+    {same tokens, same logical order, relocated bytes\\
+     $\Rightarrow$ \code{memcmp}(logits) $= 0$};
+\end{tikzpicture}
+\caption{The scramble gate. The same four logical blocks are evaluated under
+the identity table and under a reversed table that relocates every block;
+color tracks the logical block. A correct engine produces bitwise-identical
+logits, and any one-sided addressing bug produces a bitwise difference.}
+\Description{Diagram of four logical KV blocks mapped once by the identity
+block table and once by a reversed block table.}
+\label{fig:scramble}
+\end{figure}
+
+\subsection{The gate lattice}
+\label{sec:vpa-lattice}
+The scramble gate is one node in a lattice of gates that every change must
+pass (\Cref{fig:lattice}). Pinned reference vectors anchor the CPU oracle
+bitwise. The paged gates anchor both backends' KV addressing bitwise. The
+cross-backend gates anchor Metal and CUDA to the oracle at exact arg\,max and
+NMSE $\le 10^{-4}$, and the speculation gate requires speculative output to
+be token-identical to plain greedy decoding. A feature is not merged until
+the whole lattice is green on real hardware. Re-running the lattice on every
+engine change is tenable because the gates are fast (\Cref{tab:gatecost}).
+
+\begin{figure}[t]\centering
+\begin{tikzpicture}[
+  gate/.style={draw, rounded corners=1pt, align=center,
+               font=\scriptsize, inner sep=3pt},
+  crit/.style={font=\tiny\itshape, midway, fill=white, inner sep=1pt},
+  key/.style={draw, minimum width=0.28cm, minimum height=0.28cm, inner sep=0pt},
+  >=Stealth]
+  % Left-to-right: anchoring vectors -> oracle -> backends -> derived gates.
+  % Fill encodes the criterion class of the node's incoming edge.
+  \node[gate, fill=kippblue!14] (vec) at (0,0) {pinned\\vectors};
+  \node[gate, fill=kippblue!14] (cpu) at (1.75,0) {CPU\\oracle};
+  \node[gate, fill=kippblue!14] (pagedc) at (3.9,1.0) {paged CPU\\(scramble)};
+  \node[gate, fill=kipporange!22] (metal) at (3.9,-0.1) {Metal};
+  \node[gate, fill=kipporange!22] (cuda) at (3.9,-1.2) {CUDA};
+  \node[gate, fill=kippblue!14] (pagedm) at (6.3,-0.1) {paged Metal\\(scramble)};
+  \node[gate, fill=kippgreen!16] (spec) at (6.3,1.0) {speculative\\decode};
+  \draw[->] (vec) -- node[crit] {bitwise} (cpu);
+  \draw[->] (cpu) -- node[crit, pos=0.55] {bitwise} (pagedc);
+  \draw[->] (cpu) -- node[crit] {arg\,max, $10^{-4}$} (metal);
+  \draw[->] (cpu) -- node[crit, pos=0.6] {arg\,max, $10^{-4}$} (cuda);
+  \draw[->] (metal) -- node[crit] {bitwise} (pagedm);
+  \draw[->] (pagedc) -- node[crit, yshift=8pt, fill=none] {token-identical} (spec);
+  % criterion-class legend
+  \node[key, fill=kippblue!14]  (k1) at (0.1,-1.35) {};
+  \node[font=\tiny, right=1pt of k1] (k1t) {bitwise};
+  \node[key, fill=kipporange!22, right=8pt of k1t] (k2) {};
+  \node[font=\tiny, right=1pt of k2] (k2t) {arg\,max + NMSE};
+  \node[key, fill=kippgreen!16, below=4pt of k1] (k3) {};
+  \node[font=\tiny, right=1pt of k3] {token-identical};
+\end{tikzpicture}
+\caption{The gate lattice, left to right from anchor to derived gates. Every
+edge is a machine-checked comparison; node fill encodes the criterion class
+of its incoming edge. A change merges only when the lattice is green on real
+hardware. CUDA's node covers its actual scope: contiguous KV, BF16 weights,
+final-row logits.}
+\Description{Directed graph of correctness gates from pinned vectors through
+the CPU oracle to backend and derived gates.}
+\label{fig:lattice}
+\end{figure}
 
 \section{Oracle-Gated Determinism}
 \label{sec:oracle}
-Kipp keeps a scalar CPU forward pass whose BF16 output is \emph{byte-identical}
-across the engine's entire evolution---the same logits, bit for bit, as the
-first release. It is deliberately un-optimized: its only job is to be a stable
-\emph{oracle}. Every other backend is gated against it. For Metal and CUDA we
-require (i) identical arg\,max at prefill and every checked decode position and
-(ii) NMSE $\le 10^{-4}$ against the oracle. Quantized weight schemes are gated
-the same way against the BF16 oracle.
+Kipp keeps a scalar CPU forward pass whose BF16 output is byte-identical
+across the engine's entire evolution: the same logits, bit for bit, as the
+first release. It is deliberately un-optimized. Its only job is to be a
+stable oracle. Every other backend is gated against it, with identical
+arg\,max at prefill and every checked decode position, and full-logit NMSE
+at most $10^{-4}$. Quantized weight schemes are gated the same way against
+the BF16 oracle, with exact arg\,max and a scheme-appropriate NMSE bound.
 
-This inverts a common assumption in the kernel-verification literature---that
-optimized GPU kernels are essentially never bitwise-equal to a reference, so
-one must ``model floats as reals'' and check within tolerance. We instead use a
-scalar reference held byte-stable as a \emph{hard} gate, and show a real
-multi-backend engine can hold its GPU paths to \emph{exact arg\,max} (and near
-machine-precision NMSE) against it. This is complementary to
-\emph{batch}-invariance work \citep{he2025defeating}, which fixes determinism
-along the reduction-order/batch-size axis; placement-invariance is an
-orthogonal spatial axis---a kernel can be batch-invariant yet
-placement-sensitive, or vice versa.
+The kernel-verification literature commonly assumes that optimized GPU
+kernels are essentially never bitwise-equal to a reference, so one must
+``model floats as reals'' and check within tolerance. Floating-point
+summation is indeed non-associative, and reduction-order differences are a
+documented source of irreproducibility in both HPC and deep learning
+\citep{shanmugavelu2024fpna}. We invert the assumption instead of accepting
+it: a scalar reference held byte-stable serves as a hard gate, and a real
+multi-backend engine holds its GPU paths to exact arg\,max and near
+machine-precision NMSE against it. The discipline is differential testing
+\citep{mckeeman1998differential}, applied across backends as CRADLE applies
+it across deep-learning frameworks \citep{pham2019cradle}, with one twist:
+the reference is not another implementation but a frozen, readable version
+of this one, which makes every deviation attributable.
 
-\section{Implementation}
+Verification is cheap enough to run continuously. \Cref{tab:gatecost} lists
+the wall-clock cost of each gate on the evaluation machine. The entire
+lattice costs about \GateCostTotalMinutes{}~minutes, dominated by the scalar
+oracle's paged and pooled gates; every GPU-side gate runs in seconds to a
+few minutes.
+
+\begin{table}[t]\centering\small
+\caption{Gate costs (Qwen3-4B, bf16, single run, idle machine). ``bitwise''
+= \code{memcmp}-equal full-vocabulary logits. Values from
+\code{bench/results/gate-costs.json}.}
+\label{tab:gatecost}
+\begin{tabular}{llr}
+\toprule
+Gate & Criterion & Cost (s) \\
+\midrule
+\code{--model} (CPU vs.\ pinned)        & NMSE $\le 5{\cdot}10^{-5}$, arg\,max & \GateCostModel \\
+\code{--multilogit}                     & bitwise                              & \GateCostMultilogit \\
+\code{--phase2-model} (KV cache)        & NMSE $\le 10^{-6}$, arg\,max         & \GateCostPhaseTwoModel \\
+\code{--paged-cpu} (scramble)           & bitwise                              & \GateCostPagedCpu \\
+\code{--pooled-cpu} (sharing)           & bitwise                              & \GateCostPooledCpu \\
+\code{--metal-operators}                & exact per-kernel                     & \GateCostMetalOperators \\
+\code{--phase3-metal} (Metal vs.\ CPU)  & NMSE $\le 10^{-4}$, arg\,max         & \GateCostPhaseThreeMetal \\
+\code{--paged-metal} (scramble)         & bitwise                              & \GateCostPagedMetal \\
+\code{--multilogit-metal}               & NMSE $\le 10^{-4}$, arg\,max         & \GateCostMultilogitMetal \\
+\code{--pooled-metal} (sharing)         & bitwise + oracle NMSE                & \GateCostPooledMetal \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Engine Design and Implementation}
 \label{sec:impl}
-Kipp is $\sim$8\,k lines of C11 (with $\sim$3\,k more for the Metal and CUDA
-backends), Objective-C confined to the Metal bridge and CUDA to its kernels. Weights are \code{mmap}-ed from a GGUF-style container
-and never fully copied into RAM, so a 4B model serves in
-$\sim$\PeakRSS{}~MB of resident memory. The forward pass is a single readable
-function; backends implement one \code{eval} contract and share the core's
-tokenizer, sampler, KV paging, and lifecycle.
 
-\paragraph{Paged KV.} Both the CPU oracle and the Metal backend address KV
-through the per-sequence block table of \Cref{sec:vpa}; the physical store is
-rounded up to whole blocks. The block-table lookup is a two-instruction
-address computation in the attention read/write kernels, and is the only place
-placement enters. A GPU-free block pool implements content-addressed blocks
-with reference counts and an LRU free list for future cross-request sharing.
+\subsection{Architecture}
+Kipp is small enough to read (\Cref{tab:loc}, \Cref{fig:arch}); Objective-C
+is confined to the Metal bridge and CUDA to its kernels. A single core owns
+strict GGUF validation against a compiled-in checkpoint registry, the native
+Qwen tokenizer, sampling, session lifecycle, and the scalar reference
+forward pass. Backends implement one synchronous \code{eval} contract
+(append tokens to a session, produce logits for the last $n$ positions) and
+own their weight representation, activation scratch, and KV storage. The
+loader \code{mmap}s weights from a GGUF-style container and never copies
+them fully into RAM, so a 4B model serves in about \PeakRSS~MB of resident
+memory. No backend falls back to another, and a model outside the registry
+is rejected rather than accommodated.
 
-\paragraph{Quantization.} The seven per-layer projections are stored as
-either Q8\_0 (8-bit, 34-byte blocks) or a 4-bit affine scheme (group size 32,
-$w=\text{scale}\cdot q+\text{bias}$); embeddings, the LM head, and norms stay
-BF16. Both are bit-accurate between the CPU and Metal implementations.
+\begin{table}[t]\centering\small
+\caption{Implementation size by component (\code{wc -l}, July 2026).}
+\label{tab:loc}
+\begin{tabular}{@{}llr@{}}
+\toprule
+Component & Language & Lines \\
+\midrule
+Core: loader, tokenizer, oracle, sessions, & & \\
+\quad block pool, chat, speculation & C11 & 5{,}370 \\ % wc -l, 2026-07-21
+Metal backend (bridge + kernels) & ObjC + MSL & 3{,}128 \\ % wc -l, 2026-07-21
+CUDA backend & CUDA C++ & 1{,}587 \\ % wc -l, 2026-07-21
+Server & C11 & 3{,}017 \\ % wc -l, 2026-07-21
+CLI & C11 & 694 \\ % wc -l, 2026-07-21
+Tests and gates & C11 + Python & 3{,}602 \\ % wc -l, 2026-07-21
+Benchmark harness & Python & 1{,}346 \\ % wc -l, 2026-07-21
+\bottomrule
+\end{tabular}
+\end{table}
 
-\paragraph{Speculative decoding.} A draft-model-free prompt-lookup matcher
-\citep{saxena2023promptlookup} proposes the continuation from the longest
-recent $n$-gram match; a single multi-logit forward verifies the whole draft,
-the longest greedy-matching prefix is accepted, and rejected drafts are
-dropped by truncating the KV back---the paged, no-memmove rollback that
-placement-invariance makes safe. Greedy speculative output is token-identical
-to non-speculative greedy by construction.
+\begin{figure}[t]\centering
+\begin{tikzpicture}[
+  box/.style={draw, rounded corners=1pt, align=center, font=\scriptsize,
+              inner sep=3pt},
+  core/.style={box, fill=kippblue!8}, be/.style={box, fill=kipporange!12},
+  gatebox/.style={box, fill=kippgreen!10}, >=Stealth]
+  \node[core, minimum width=6.6cm] (server)
+    {OpenAI server (3.0\,kLoC): completions, chat, SSE, metrics\\
+     FIFO scheduler, chunked prefill, continuous batching};
+  \node[core, minimum width=6.6cm, below=0.28cm of server] (corec)
+    {C11 core (5.4\,kLoC): registry-validated GGUF loader, tokenizer,\\
+     sampler, sessions, paged-KV block tables, block pool};
+  \node[be, below left=0.5cm and -2.35cm of corec] (cpu)
+    {CPU oracle\\ \emph{scalar, byte-stable}};
+  \node[be, right=0.28cm of cpu] (metal)
+    {Metal (3.1\,kLoC)\\ \emph{paged, quantized, MMA}};
+  \node[be, right=0.28cm of metal] (cuda)
+    {CUDA (1.6\,kLoC)\\ \emph{contiguous, BF16}};
+  \node[gatebox, minimum width=6.6cm, below=1.5cm of corec] (gates)
+    {gate lattice (\Cref{fig:lattice}): bitwise + arg\,max + NMSE,\\
+     run on real hardware before any feature is ``done''};
+  \draw[->] (server) -- (corec);
+  \draw[->] (corec.south -| cpu) -- (cpu.north);
+  \draw[->] (corec.south -| metal) -- (metal.north);
+  \draw[->] (corec.south -| cuda) -- (cuda.north);
+  \draw[->] (cpu.south) -- (gates.north -| cpu);
+  \draw[->] (metal.south) -- (gates.north -| metal);
+  \draw[->] (cuda.south) -- (gates.north -| cuda);
+\end{tikzpicture}
+\caption{Kipp's architecture. One core drives three backends through a
+single \code{eval} contract, and every backend answers to the gate lattice.}
+\Description{Layer diagram: server above a C11 core above three backends,
+all feeding a gate-lattice box.}
+\label{fig:arch}
+\end{figure}
 
-\paragraph{Serving.} A single-threaded event loop implements the OpenAI
-Completions and Chat Completions APIs with continuous batching
-\citep{yu2022orca}, chunked prefill, a native Qwen3 ChatML renderer, a full
-sampling pack, generated-token log-probabilities, and Prometheus metrics.
+\subsection{Paged KV manager and block pool}
+\label{sec:impl-paged}
+Both the CPU oracle and the Metal backend address KV through the per-sequence
+block table of \Cref{sec:vpa}. The physical store is a whole number of
+32-position blocks, and the block-table lookup is a two-instruction address
+computation in the attention read and write kernels; it is the only place
+placement enters. Cross-request sharing builds on a content-addressed block
+pool with chained hashes verified by exact token comparison, reference
+counts, and an LRU free list with revival. Hash collisions can never alias,
+because every hit is confirmed by \code{memcmp} over the block's tokens. The
+sharing discipline is deliberately simple: shared blocks are immutable,
+complete 32-token blocks, the block being appended to is always private, and
+a session publishes its blocks to the pool only when it finishes. No
+copy-on-write is needed, and speculative rollback can never land inside a
+shared block by construction. Sessions of a pooled model borrow one
+model-owned physical slab and carry only a block table and token timeline,
+so adopting a cached prefix is a block-table edit. The whole mechanism is
+gated bitwise against private-slab sessions on both backends
+(\Cref{sec:eval-prefix}).
+
+\subsection{Kernels}
+\label{sec:impl-kernels}
+The Metal backend has three matmul families. Single-token decode uses a
+token-tiled simdgroup matvec with one simdgroup per output row and coalesced
+loads. Batched prefill uses simdgroup-matrix (MMA) kernels. The BF16 kernel
+stages activations as BF16 and walks 32-row by 16-token output tiles with
+FP32 accumulation. The quantized MMA kernels dequantize each 32-weight block
+into a threadgroup tile once per 16 tokens and run the same fragment loop,
+reading activations directly in FP32, so the dequantization cost no longer
+scales with token count. This removes the quantized-prefill regression of
+earlier revisions (\Cref{sec:eval-ablation}). Attention is a streaming
+online-softmax kernel in the FlashAttention lineage
+\citep{dao2022flashattention,dao2023flashdecoding}: eight simdgroups per
+(head, token) each scan every eighth source position through the block
+table, and partial softmaxes merge in threadgroup memory. No score matrix is
+materialized.
+
+The CUDA backend is smaller, and we state its scope exactly: contiguous KV,
+BF16 weights only, final-row logits only, materialized-score attention,
+correctness-gated against the oracle on cloud A100s (\Cref{tab:correct}).
+CUDA paging is future work. No Metal code bends to accommodate CUDA or vice
+versa.
+
+\subsection{Quantization}
+\label{sec:impl-quant}
+The seven per-layer projections are stored as either Q8\_0 (8-bit, 34-byte
+blocks: fp16 scale, 32 int8 values) or a 4-bit affine scheme (20-byte groups:
+16 packed nibbles, fp16 scale, fp16 bias; $w=\text{scale}\cdot q+\text{bias}$)
+\citep{frantar2023gptq,lin2024awq,llamacpp2023gguf}. We call the latter
+scheme \emph{affine4} (4-bit affine, group size 32) throughout. Embeddings,
+the LM head, and norms stay BF16. Both schemes are bit-accurate between the
+CPU and Metal implementations, and quantized artifacts pass the same gate
+lattice as BF16, including the scramble gates.
+
+\subsection{Speculative decoding with adaptive gating}
+\label{sec:impl-spec}
+A draft-model-free prompt-lookup matcher \citep{saxena2023promptlookup}
+proposes the continuation from the longest recent $n$-gram match. A single
+multi-logit forward verifies the whole draft, the longest greedy-matching
+prefix is accepted, and rejected drafts are dropped by truncating the KV
+back. This is the paged, zero-copy rollback that placement invariance makes
+safe. Greedy speculative output is token-identical to non-speculative greedy
+by construction, and a gate asserts it.
+
+On a bandwidth-bound engine, speculation at low acceptance is a net loss
+(\Cref{sec:bg}): ungated prompt-lookup slows open-ended decoding to
+$\SpecSpeedupGrounded\times$ (\Cref{tab:spec}). Kipp therefore gates drafting
+adaptively (\Cref{alg:gate}). An exponential moving average of per-verify
+acceptance suspends drafting when it falls below a threshold, and a periodic
+probe re-enables it when the text becomes repetitive again. Adapting
+speculation effort to observed acceptance follows SpecDec++
+\citep{huang2025specdecpp}, which tunes the draft length online, and BiLD
+\citep{kim2023bild}, which uses threshold policies between models; Kipp's
+policy is simpler in that it stops drafting entirely and probes. Gating only
+chooses between ``draft and verify'' and ``plain decode step.'' Both emit
+the greedy sequence, so the token-identity invariant is untouched.
+
+\begin{algorithm}[t]
+\caption{Adaptive speculation gating (per decode step)}
+\label{alg:gate}
+\begin{algorithmic}[1]
+\State $\textit{ema} \gets 0.5$;\ \ $\textit{active} \gets \textbf{true}$;\ \
+       $\textit{idle} \gets 0$
+\For{each decode step}
+  \If{$\textit{active}$ \textbf{or} $\textit{idle} \ge P$}
+     \Comment{$P{=}32$ tokens between probes}
+    \State draft $k$ tokens; verify; accept prefix $a$
+    \State $\textit{ema} \gets \tfrac{1}{2}\textit{ema} + \tfrac{1}{2}(a/k)$;
+           \ \ $\textit{idle} \gets 0$
+    \If{probing \textbf{and} $a/k \ge 0.5$}
+       \State $\textit{active} \gets \textbf{true}$;\ \
+              $\textit{ema} \gets a/k$
+    \ElsIf{$\textit{ema} < 0.2$}
+       \State $\textit{active} \gets \textbf{false}$
+    \EndIf
+  \Else
+    \State plain decode step;\ \ $\textit{idle} \gets \textit{idle} + 1$
+  \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Serving}
+\label{sec:impl-serving}
+A single-threaded \code{poll()} event loop implements the OpenAI Completions
+and Chat Completions APIs with continuous batching \citep{yu2022orca},
+chunked prefill \citep{agrawal2024sarathi}, a native Qwen3 ChatML renderer,
+the full sampling surface, generated-token log-probabilities, and Prometheus
+metrics. Multiple choices and concurrent requests decode through one batched
+eval per step, so each step reads the weights once for all active sequences.
+The scheduler admits requests FIFO with capacity-based backpressure, and
+holds streamed bytes back while they could still grow into a stop string.
 
 \section{Evaluation}
 \label{sec:eval}
-\paragraph{Setup.} Apple M5 (10 GPU cores, 24\,GB unified memory), Qwen3-4B,
-greedy decoding, one discarded warm-up and five measured subprocess runs per
-configuration; we report medians. The harness (\code{bench/}) captures
-separate prefill and decode timers and peak resident memory.
 
-\paragraph{Correctness (the contribution).} \Cref{tab:correct} summarizes the
-gates. The CPU oracle reproduces the pinned reference logits bit-for-bit; Metal
-matches the oracle at exact arg\,max and NMSE $\sim\!6\times10^{-7}$; and paged
-KV is \emph{bitwise}-identical to a contiguous cache under an adversarially
-scrambled block table on both backends.
+\subsection{Setup and methodology}
+\label{sec:eval-setup}
+All experiments run on an Apple M5~Max (40-core GPU, 128\,GB unified memory)
+with Qwen3-4B and greedy decoding unless stated, using one discarded warm-up
+and five measured subprocess runs per configuration. We report medians with
+median absolute deviation (MAD). The harness (\code{bench/}) captures
+separate prefill and decode timers and peak resident memory, and records the
+engine commit, hardware, and model revision in every result file. Earlier
+Kipp releases were benchmarked on a base M5 (10-core GPU); all numbers in
+this paper were re-measured on the M5~Max, and the committed result files
+self-describe their hardware.
+
+For serving experiments we use the standard load metrics
+\citep{zhong2024distserve}: time to first token (TTFT), time per output
+token (TPOT), and goodput, the fraction of requests meeting both a TTFT and
+a TPOT service-level objective. For quantization quality we report WikiText-2
+perplexity \citep{li2024evalquant}, computed over non-overlapping
+2{,}048-token windows with every position after each window's first scored
+and no burn-in; the protocol is deterministic and identical across schemes,
+but its absolute values are not comparable to llama.cpp's
+\code{perplexity} tool, which discards a per-window burn-in.
+
+\subsection{Correctness gates}
+\label{sec:eval-correct}
+\Cref{tab:correct} summarizes the gates. The CPU oracle reproduces the pinned
+reference logits bit for bit. Metal matches the oracle at exact arg\,max and
+NMSE near $\MetalNmse$, and paged KV is bitwise identical to a
+contiguous cache under an adversarially scrambled block table on both
+backends, for all three weight schemes.
 
 \begin{table}[t]\centering\small
 \caption{Correctness gates (Qwen3-4B). ``bitwise'' = \code{memcmp}-equal.}
@@ -260,149 +723,647 @@ scrambled block table on both backends.
 Gate & Result \\
 \midrule
 CPU vs.\ pinned reference        & bitwise identical \\
-Metal vs.\ CPU oracle            & arg\,max exact, NMSE $6\!\times\!10^{-7}$ \\
-CUDA vs.\ CPU oracle (A100)      & arg\,max exact, NMSE ${\le}10^{-6}$ \\
+Metal vs.\ CPU oracle            & arg\,max exact, NMSE $\MetalNmse$ \\
+CUDA vs.\ CPU oracle (A100)$^a$  & arg\,max exact, NMSE ${\le}10^{-6}$ \\
 Paged vs.\ contiguous (CPU)      & bitwise, scrambled table \\
 Paged vs.\ contiguous (Metal)    & bitwise, scrambled table \\
 Spec.\ vs.\ greedy decode        & token-identical \\
 \bottomrule
+\multicolumn{2}{l}{\scriptsize $^a$ CUDA scope: contiguous KV, BF16
+weights, final-row logits. Measured at the} \\
+\multicolumn{2}{l}{\scriptsize \ \ Phase-4 milestone gate on an NVIDIA A100;
+not re-run for this draft (\Cref{sec:discussion}).}
 \end{tabular}
 \end{table}
 
-\paragraph{Throughput.} \Cref{tab:perf} and \Cref{fig:tradeoff} report decode
-and prefill throughput by weight scheme. Decode is bandwidth-bound, so
-quantization scales it as it shrinks the weight bytes streamed per token:
-BF16~$\to$~4-bit lifts decode from \DecodeBF{} to \DecodeAffineFour{}~tok/s
-($2.1\times$). Prefill shows the opposite, and we report it honestly: it is compute-bound, and Kipp's quantized
-prefill currently uses a vector kernel rather than a simdgroup-matrix path, so
-quantization \emph{slows} prefill (\PrefillBF{}~$\to$~\PrefillAffine{}~tok/s). A
-quantized matrix-multiply prefill kernel is the obvious remedy and is future
-work.
+\subsection{Fault injection: do the gates catch bugs?}
+\label{sec:eval-faults}
+The claim of \Cref{sec:silent} is empirical: tolerance-based reference
+comparisons mask realistic paging bugs that the scramble gate catches. We
+test it by mutation \citep{demillo1978mutation,jia2011mutation}. A test-only
+build seeds one deliberate KV-addressing bug at a time
+\citep{hsueh1997fault}, and we run both gate families against each mutant.
+The faults are asymmetric, affecting the read side or the write side only,
+because \Cref{prop:invariance} itself proves that a mapping error applied
+identically to both sides is a harmless relocation. The mutation study must
+model where real bugs live, in one side's copy of the indirection:
+
+\begin{enumerate}\itemsep1pt
+  \item \emph{read-block}: attention reads resolve the next logical block;
+  \item \emph{read-slot}: attention reads resolve the next slot within the
+  block;
+  \item \emph{rollover}: each block's first position is written one past
+  the end of the previous block's physical block, so under the identity
+  table those bytes land exactly where the position belongs;
+  \item \emph{swap-kv}: one layer writes keys into the value store and
+  vice versa.
+\end{enumerate}
+
+\Cref{tab:faults} reports, for each mutant, the observed NMSE against the
+reference, whether the final arg\,max survived, and each gate's verdict.
+The detection pattern partitions the faults along the lines of
+\Cref{prop:invariance}.
+
+The placement-commuting faults (read-block, read-slot, swap-kv) corrupt the
+same logical positions under every block table, so both scramble runs
+compute identical wrong logits and the bitwise gate passes. The proposition
+predicts this: the scramble gate cannot see them. The tolerance gate catches
+all three, but only through its NMSE bound. The read-side faults corrupt
+the logits at NMSE near $10^{-2}$ without flipping the final arg\,max, so a
+gate that checked arg\,max alone, a common lightweight regression test,
+would have passed every mutant except swap-kv.
+
+The rollover fault is the mirror image. Its misaddressed write lands on
+exactly the right byte under the identity table, so the reference comparison
+measures NMSE of exactly $\FaultNmseRollover$, and no tolerance, however
+tight, can ever detect it. Only the scramble gate rejects this fault: under
+a non-identity table the same bug scatters the write into the wrong physical
+block. The two gate families are therefore complementary rather than
+redundant. The reference gate covers value corruption, and the scramble gate
+covers the placement-coupled residue that reference testing cannot reach.
+That residue is precisely the class of bug that ships silently today,
+because it only corrupts once a scheduler starts relocating blocks in
+production.
+
+The study also caught the gate itself. Our original scramble gate spanned
+two blocks, and the rollover mutant passed it: reversing a 2-entry table is
+a swap, and ``one past the end of the previous block's physical block,
+wrapping'' happens to land on the correct byte again. Reversal over three or
+more blocks breaks physical adjacency and exposes the fault, so the gate now
+spans three. Mutation testing evaluated the adequacy of the tests as well as
+the engine, and improved one of the tests.
 
 \begin{table}[t]\centering\small
-\caption{Throughput (tok/s), Qwen3-4B, Apple M5 Metal, median of 5.}
+\caption{Fault-detection matrix (Qwen3-4B, CPU oracle, 96-token/3-block
+sequence). ``caught'' = the gate fails on the mutant. Values from
+\code{bench/results/faults.json}.}
+\label{tab:faults}
+\begin{tabular}{lrccc}
+\toprule
+Seeded fault & NMSE & arg\,max & Tolerance gate & Scramble gate \\
+\midrule
+(control)    & $\FaultControlNmse$        & same    & clean   & clean \\
+read-block   & $\FaultNmseReadBlock$ & same & caught  & \emph{missed} \\
+read-slot    & $\FaultNmseReadSlot$ & same & caught  & \emph{missed} \\
+rollover     & $\FaultNmseRollover$        & same    & \emph{missed} & \textbf{caught} \\
+swap-kv      & $\FaultNmseSwapKv$      & flipped & caught  & \emph{missed} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Throughput and quality by weight scheme}
+\label{sec:eval-throughput}
+\Cref{tab:perf} reports decode and prefill throughput by weight scheme.
+Decode is bandwidth-bound, so quantization scales it as it shrinks the
+weight bytes streamed per token. Prefill is compute-bound. With the
+quantized MMA kernels of \Cref{sec:impl-kernels}, quantized prefill tracks
+the BF16 matrix path instead of regressing to a vector kernel; the
+regression and its removal are quantified in \Cref{sec:eval-ablation}.
+
+Speed is only half the tradeoff. \Cref{fig:quality} plots each scheme's
+WikiText-2 perplexity against its decode throughput, which is the plot a
+deployment decision actually needs: how much quality each streamed byte
+buys.
+% PHASE2: once ppl-4b.json lands, add one prose sentence quoting
+% \PplBF/\PplQEight/\PplAffine and the percentage deltas.
+
+\begin{table}[t]\centering\small
+\caption{Throughput (tok/s), Qwen3-4B, Apple M5~Max Metal, median of 5.
+Median absolute deviations are ${\le}1.1$ tok/s throughout (per-run
+distributions in the committed result files).}
 \label{tab:perf}
 \begin{tabular}{lrr}
 \toprule
 Weight scheme & Decode & Prefill \\
 \midrule
-BF16            & \DecodeBF        & \PrefillBF \\
-Q8\_0 (8-bit)    & \DecodeQEight    & \PrefillQEight \\
-Affine (4-bit)  & \DecodeAffineFour& \PrefillAffine \\
+BF16     & \DecodeBF         & \PrefillBF \\
+Q8\_0    & \DecodeQEight     & \PrefillQEight \\
+affine4  & \DecodeAffineFour & \PrefillAffine \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{figure}[t]\centering
 \begin{tikzpicture}
-\begin{axis}[
-  width=\columnwidth, height=4.6cm,
-  ybar, bar width=7pt, ymin=0,
-  ylabel={tok/s}, ymajorgrids, tick align=inside,
-  symbolic x coords={BF16, Q8\_0, 4-bit},
-  xtick=data, enlarge x limits=0.3,
-  legend style={at={(0.5,1.02)}, anchor=south, legend columns=2,
-                draw=none, font=\small},
-  nodes near coords, every node near coord/.append style={font=\tiny},
+\begin{axis}[kippplot,
+  xlabel={decode throughput (tok/s)},
+  ylabel={WikiText-2 perplexity},
+  xmin=50, xmax=145, ymin=8, ymax=13,
 ]
-\addplot coordinates {(BF16,12.6) (Q8\_0,20.7) (4-bit,26.9)};
-\addplot coordinates {(BF16,143) (Q8\_0,35) (4-bit,32)};
+% PHASE2: quant-ppl.dat arrives with ppl-4b.json; then enable:
+% PHASE2: \addplot+[only marks, mark size=2.4pt, nodes near coords,
+% PHASE2:   point meta=explicit symbolic]
+% PHASE2:   table[x=decode_tps, y=ppl, meta=scheme] {data/quant-ppl.dat};
+\end{axis}
+\end{tikzpicture}
+\caption{Quality--speed tradeoff by weight scheme (Qwen3-4B, M5~Max Metal):
+WikiText-2 perplexity against decode throughput, one point per scheme.
+Down and to the right is better.}
+\Description{Scatter plot of perplexity versus decode throughput for three
+weight schemes.}
+\label{fig:quality}
+\end{figure}
+
+\subsection{Model-size scaling}
+\label{sec:eval-modelsize}
+Decode throughput on bandwidth-bound hardware should scale inversely with
+the bytes streamed per token, independent of which checkpoint streams them.
+\Cref{fig:modelsize} checks this across the family (0.6B, 4B, 8B), so the
+4B results of \Cref{sec:eval-throughput} can be read as representative
+rather than cherry-picked.
+
+\begin{figure}[t]\centering
+\begin{tikzpicture}
+\begin{axis}[kippplot,
+  xmode=log, log ticks with fixed point,
+  xlabel={parameters (billions)}, ylabel={tok/s},
+  xmin=0.4, xmax=12, ymin=0, ymax=650,
+]
+% PHASE2: model-size.dat arrives with the 0.6B/8B sweep; then enable:
+% PHASE2: decode and prefill series, bf16 and q8_0, e.g.
+% PHASE2: \addplot table[x=params_b, y=decode] {data/model-size.dat};
+\end{axis}
+\end{tikzpicture}
+\caption{Throughput across the Qwen3 dense family (M5~Max Metal). Decode
+tracks streamed weight bytes per token; prefill tracks compute.}
+\Description{Line plot of decode and prefill throughput against model
+parameter count.}
+\label{fig:modelsize}
+\end{figure}
+
+\subsection{Context scaling}
+\label{sec:eval-context}
+\Cref{fig:ctx} reports throughput against prompt length (Q8\_0, 32-token
+decode, median of 3; \code{bench/results/ctx-*.json}). Decode degrades
+gracefully, from \CtxDecodeShort{} to \CtxDecodeLongest~tok/s between a 3-
+and a 3{,}200-token context, as the per-step KV read grows against the fixed
+weight stream. Prefill rises steeply once the matrix kernels amortize (the
+3-token point is dominated by fixed per-evaluation cost), peaks near
+\CtxPrefillPeak~tok/s, and eases at long context where per-layer KV re-reads
+in attention begin to dominate the projections.
+
+\begin{figure}[t]\centering
+\begin{tikzpicture}
+\begin{axis}[kippplot, height=4.8cm,
+  xmode=log, log ticks with fixed point,
+  xlabel={prompt tokens}, ylabel={tok/s}, ymin=0,
+  legend columns=2,
+  legend style={at={(0.5,1.02)}, anchor=south},
+]
+\addplot+[error bars/.cd, y dir=both, y explicit]
+  table[x=tokens, y=decode, y error=decode_mad] {data/ctx-scaling.dat};
+\addplot+[error bars/.cd, y dir=both, y explicit]
+  table[x=tokens, y=prefill, y error=prefill_mad] {data/ctx-scaling.dat};
+% PHASE2: the re-run extends ctx-scaling.dat with 6400- and 12800-token rows.
 \legend{decode, prefill}
 \end{axis}
 \end{tikzpicture}
-\caption{The quantization trade-off (Qwen3-4B, M5 Metal). Quantization
-lifts bandwidth-bound \emph{decode} but lowers compute-bound \emph{prefill},
-which lacks a quantized matrix-multiply kernel.}
-\label{fig:tradeoff}
+\caption{Context scaling (Qwen3-4B Q8\_0, M5~Max Metal; error bars show
+MAD). Decode falls as the per-step KV read grows; prefill peaks once the
+matrix kernels amortize and eases as attention's KV re-reads grow.}
+\Description{Line plot of decode and prefill throughput against prompt
+length on a log axis.}
+\label{fig:ctx}
 \end{figure}
 
-\paragraph{Speculative decoding.} \Cref{tab:spec} reports acceptance rate
-$\alpha$, block efficiency (accepted tokens per target forward), and wall-clock
-speedup across workloads. Prompt-lookup lifts copy-heavy decode from $21.7$ to
-\SpecDecodeRep{}~tok/s ($\SpecSpeedupRep\times$) at $\alpha{=}1.0$, but
-\emph{slows} code ($\SpecSpeedupCode\times$) and open-ended text
-($\SpecSpeedupChat\times$). The reason is specific to a bandwidth-bound engine:
-the $k{+}1$-token verify does not amortize weight streaming at small draft
-batch, so each speculative step costs close to $k{+}1$ decodes while advancing
-by only (accepted$+1$) tokens---a penalty that is \emph{harsher} than on
-compute-bound engines when $\alpha$ is low. This motivates two improvements
-(\Cref{sec:related}): a batched matrix-multiply verify kernel that amortizes
-weights, and adaptive draft gating that stops drafting when recent acceptance
-is low. Crucially, in every case the emitted tokens are identical to greedy
-decoding---speculation never changes the output, only the wall clock.
+\subsection{Batch scaling}
+\label{sec:eval-batching}
+Because decode is bandwidth-bound, aggregate server throughput scales with
+the number of concurrently decoding sequences: each batched step reads the
+weights once for all choices. \Cref{fig:batch} plots aggregate throughput on
+the pooled Q8\_0 server for one request with $n$ parallel choices and for
+$n$ independent concurrent connections, against the ideal of $n$ times the
+single-stream rate (sampled decoding, median of 3;
+\code{bench/results/server-batch.json}). One request with $n{=}1/2/4/8$ choices delivers
+\BatchChoicesTpsOne, \BatchChoicesTpsTwo, \BatchChoicesTpsFour, and
+\BatchChoicesTpsEight~tok/s aggregate; $1/2/4/8$ independent connections
+deliver \BatchConnsTpsOne, \BatchConnsTpsTwo, \BatchConnsTpsFour, and
+\BatchConnsTpsEight.
+Throughput roughly doubles before flattening where per-step scheduling and
+chunked prefill begin to compete with decode; the widening gap to the ideal
+line is that scheduling cost made visible.
+
+\begin{figure}[t]\centering
+\begin{tikzpicture}
+\begin{axis}[kippplot,
+  xlabel={concurrently decoding sequences $n$},
+  ylabel={aggregate tok/s},
+  xtick={1,2,4,8}, xmin=0.6, xmax=8.4, ymin=0, ymax=340,
+  legend columns=1,
+  legend style={at={(0.03,0.97)}, anchor=north west},
+]
+\addplot table[x=n, y=choices_tps] {data/server-batch.dat};
+\addplot table[x=n, y=connections_tps] {data/server-batch.dat};
+\addplot[dashed, gray, domain=1:8, samples=2] {\BatchChoicesTpsOne*x};
+\legend{parallel choices, concurrent connections, ideal linear}
+\end{axis}
+\end{tikzpicture}
+\caption{Batch scaling on the pooled Q8\_0 server (M5~Max). The dashed line
+is ideal linear scaling from the single-stream rate; the widening gap is
+per-step scheduling and chunked-prefill overhead.}
+\Description{Line plot of aggregate throughput against number of concurrent
+sequences, with a dashed ideal-scaling reference.}
+\label{fig:batch}
+\end{figure}
+
+\subsection{Serving under load}
+\label{sec:eval-load}
+Batch scaling measures a closed system; serving is an open one. We drive the
+server with open-loop Poisson arrivals of streamed completion requests at
+increasing offered rates and record per-request TTFT and TPOT percentiles
+and goodput under a fixed SLO (\Cref{fig:load};
+\code{bench/results/load.json}). This is the view a capacity planner needs:
+the offered rate at which tail latency leaves the knee, and how much of the
+offered load still meets its SLO beyond it.
+% PHASE2: once load.json lands, quote the peak sustainable rate and the
+% PHASE2: p99 TTFT knee in prose here via the \Load* macros.
+
+\begin{figure*}[t]\centering
+\begin{tikzpicture}
+\begin{axis}[kippplot, width=0.44\textwidth,
+  xlabel={offered rate (req/s)}, ylabel={TTFT (ms)},
+  xmin=0.4, xmax=4.2, ymin=0, ymax=4000,
+]
+% PHASE2: load-latency.dat arrives with load.json; then enable:
+% PHASE2: \addplot table[x=rate, y=ttft_p50] {data/load-latency.dat};
+% PHASE2: \addplot table[x=rate, y=ttft_p90] {data/load-latency.dat};
+% PHASE2: \addplot table[x=rate, y=ttft_p99] {data/load-latency.dat};
+% PHASE2: \legend{p50, p90, p99}
+\end{axis}
+\end{tikzpicture}\hfill
+\begin{tikzpicture}
+\begin{axis}[kippplot, width=0.44\textwidth,
+  xlabel={offered rate (req/s)}, ylabel={TPOT (ms)},
+  xmin=0.4, xmax=4.2, ymin=0, ymax=400,
+]
+% PHASE2: \addplot table[x=rate, y=tpot_p50] {data/load-latency.dat};
+% PHASE2: \addplot table[x=rate, y=tpot_p99] {data/load-latency.dat};
+% PHASE2: \addplot table[x=rate, y=goodput] {data/load-latency.dat}; (2nd axis)
+% PHASE2: \legend{p50, p99}
+\end{axis}
+\end{tikzpicture}
+\caption{Serving under open-loop Poisson load (Qwen3-4B Q8\_0, pooled
+server, M5~Max): TTFT and TPOT percentiles against offered request rate.}
+\Description{Two panels of latency percentiles against offered request
+rate.}
+\label{fig:load}
+\end{figure*}
+
+\subsection{Cross-request prefix sharing}
+\label{sec:eval-prefix}
+Prefix sharing is live in the serving path. A finished session publishes its
+full 32-token blocks to the content-addressed pool, and a new request adopts
+the longest published prefix at admission, re-evaluating only the partial
+tail. On a \PrefixPromptTokens-token prompt sent twice
+(\code{bench/results/prefix-reuse.json}), the second request adopts
+\PrefixAdoptedTokens{} tokens and its prefill time collapses from
+\PrefixColdSeconds~s to \PrefixWarmMs~ms, a $\PrefixSpeedup\times$ reduction
+in time to first token, with byte-identical output.
+
+The correctness side is gated rather than assumed: \Cref{tab:pooled} lists
+the pooled-gate scenarios, each proven on both backends for BF16 and
+quantized weights. This is the payoff of \Cref{sec:vpa}: block adoption is a
+block-table edit, and the scramble gate is what makes editing tables a safe
+operation.
 
 \begin{table}[t]\centering\small
-\caption{Prompt-lookup speculative decoding by workload (Qwen3-4B Q8\_0, M5),
-controlled A/B, median of 3. Speedup ${<}1$ means slower than plain decode.}
-\label{tab:spec}
-\begin{tabular}{lrrr}
+\caption{Pooled-sharing gate scenarios (\code{--pooled-cpu},
+\code{--pooled-metal}), each run on CPU and Metal for BF16, Q8\_0, and
+affine4 weights.}
+\label{tab:pooled}
+\begin{tabular}{@{}lp{3.6cm}@{}}
 \toprule
-Workload & $\alpha$ & Blk.\ eff. & Speedup \\
+Scenario & Criterion \\
 \midrule
-Repetitive / copy-heavy & 1.00 & 4.00 & $\SpecSpeedupRep\times$ \\
-Code                    & 0.17 & 1.39 & $\SpecSpeedupCode\times$ \\
-Open-ended / grounded   & 0.04 & 1.10 & $\SpecSpeedupChat\times$ \\
+Serial prefix sharing & bitwise vs.\ private-slab session \\
+Mixed shared/private batch & bitwise vs.\ private-slab sessions \\
+Pool exhaustion & clean failure; admission delays, never corrupts \\
+Truncation (spec.\ rollback) & bitwise; never enters a shared block \\
+Eviction and revival & bitwise after LRU eviction \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Memory.} Peak process RSS is $\sim$\PeakRSS{}~MB for the 4B model
-regardless of quantization, since weights are \code{mmap}-ed and paged in on
-demand; we report artifact size alongside RSS, as peak RSS understates true
-residency for GPU-touched \code{mmap} pages.
+\subsection{Speculative decoding}
+\label{sec:eval-spec}
+\Cref{tab:spec} and \Cref{fig:spec} report acceptance rate $\alpha$, block
+efficiency (accepted tokens per target forward), and wall-clock speedup
+across four workloads, with and without adaptive gating. Ungated
+prompt-lookup lifts copy-heavy decode from \SpecBaseRep{} to
+\SpecDecodeRep~tok/s ($\SpecSpeedupRep\times$) at $\alpha{=}1.0$. However,
+it slows code to $\SpecSpeedupCode\times$ and open-ended text to as little
+as $\SpecSpeedupGrounded\times$: the $k{+}1$-token verify does not amortize
+weight streaming at small draft batch, so each speculative step costs close
+to $k{+}1$ decodes while advancing by only accepted${}+1$ tokens. The
+adaptive gate suspends drafting on exactly those workloads, and its duty
+cycle (the fraction of steps that draft) makes the mechanism visible. In
+every configuration the emitted tokens are identical to greedy decoding;
+speculation changes only the wall clock.
+
+\begin{table}[t]\centering\small
+\caption{Prompt-lookup speculation by workload (Qwen3-4B Q8\_0, M5~Max,
+256-token decode), controlled A/B, median of 3. ``Gated'' adds the adaptive
+gate of \Cref{alg:gate}; ``duty'' is its drafting duty cycle. Speedup ${<}1$
+is slower than plain decode.}
+\label{tab:spec}
+\begin{tabular}{lrrrrr}
+\toprule
+Workload & $\alpha$ & Blk.\ eff. & Ungated & Gated & Duty \\
+\midrule
+Repetitive & \SpecAlphaRep & \SpecBlkRep &
+  $\SpecSpeedupRep\times$ & $\GatedSpeedupRep\times$ & \GatedDutyRep \\
+Code       & \SpecAlphaCode & \SpecBlkCode &
+  $\SpecSpeedupCode\times$ & $\GatedSpeedupCode\times$ & \GatedDutyCode \\
+Grounded   & \SpecAlphaGrounded & \SpecBlkGrounded &
+  $\SpecSpeedupGrounded\times$ & $\GatedSpeedupGrounded\times$ & \GatedDutyGrounded \\
+Open-ended & \SpecAlphaChat & \SpecBlkChat &
+  $\SpecSpeedupChat\times$ & $\GatedSpeedupChat\times$ & \GatedDutyChat \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]\centering
+\begin{tikzpicture}
+\begin{axis}[kippplot,
+  ybar, bar width=6pt, ymin=0,
+  ylabel={speedup vs.\ plain decode},
+  symbolic x coords={repetitive,code,grounded,chat},
+  xtick=data, enlarge x limits=0.15,
+  legend columns=2,
+  legend style={at={(0.5,1.02)}, anchor=south},
+]
+\addplot[ybar, fill=kippblue!75, draw=kippblue]
+  table[x=workload, y=ungated] {data/spec-speedup.dat};
+\addplot[ybar, fill=kipporange!75, draw=kipporange]
+  table[x=workload, y=gated] {data/spec-speedup.dat};
+\draw[dashed, gray]
+  ({rel axis cs:0,0}|-{axis cs:repetitive,1}) --
+  ({rel axis cs:1,0}|-{axis cs:repetitive,1})
+  node[pos=0.88, above, font=\tiny, text=gray] {parity};
+\legend{ungated, gated}
+\end{axis}
+\end{tikzpicture}
+\caption{Speculation speedup by workload, with and without the adaptive
+gate. The dashed line is parity with plain decode: gating preserves the
+repetitive-workload win and pulls every losing workload back toward parity.}
+\Description{Grouped bar chart of speculation speedup per workload, ungated
+and gated, with a parity line at one.}
+\label{fig:spec}
+\end{figure}
+
+\subsection{Comparison with llama.cpp}
+\label{sec:eval-llamacpp}
+We compare against llama.cpp \citep{llamacpp2023gguf} on identical hardware
+and the same pinned Qwen3-4B revision, converted independently with
+llama.cpp's own tooling and matched at 348 prefill tokens and 64 decode
+tokens (\Cref{tab:llamacpp}; the commit and exact commands are recorded in
+\code{bench/results/llamacpp-qwen3-4b.json}). The result cuts both ways. On
+decode, the phase that dominates serving cost, Kipp is faster: \DecodeBF{}
+vs.\ \LlamaDecodeBF~tok/s at BF16 and \DecodeQEight{} vs.\
+\LlamaDecodeQEight{} at 8-bit, with Kipp's affine4 scheme reaching
+\DecodeAffineFour. The verification discipline costs nothing where it
+matters most. On prefill, llama.cpp is about $\LlamaPrefillRatioBF\times$
+faster (\LlamaPrefillBF{} vs.\ \PrefillBF~tok/s at BF16), reflecting years
+of kernel engineering (larger tiles, threadgroup-level pipelining, autotuned
+dispatch) that Kipp's readable single-kernel-per-op design does not attempt.
+Kipp is not the fastest prefill engine and does not try to be; its scope is
+one pinned family with no autotuning, and we present this number as the
+measured price of a readable, verifiable prefill path. Two caveats on
+fairness: \code{llama-bench} reports means (with prefill standard deviations
+of several hundred tok/s at BF16) while Kipp reports medians, and the 4-bit
+schemes differ (llama.cpp Q4\_0 is scale-only; affine4 carries a bias), so
+the 4-bit rows are close cousins rather than twins.
+% PHASE2: the llama.cpp re-run adds a Q4_0 row; replace the n/a cells with
+% PHASE2: \LlamaDecodeQFour / \LlamaPrefillQFour.
+
+\begin{table}[t]\centering\small
+\caption{llama.cpp head-to-head (Qwen3-4B, M5~Max Metal, 348-token prefill,
+64-token decode; tok/s). llama.cpp = mean of 5 (\code{llama-bench}); Kipp =
+median of 5.}
+\label{tab:llamacpp}
+\begin{tabular}{lrrrr}
+\toprule
+& \multicolumn{2}{c}{Decode} & \multicolumn{2}{c}{Prefill} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Weights & Kipp & llama.cpp & Kipp & llama.cpp \\
+\midrule
+BF16    & \textbf{\DecodeBF} & \LlamaDecodeBF & \PrefillBF & \textbf{\LlamaPrefillBF} \\
+Q8\_0   & \textbf{\DecodeQEight} & \LlamaDecodeQEight & \PrefillQEight & \textbf{\LlamaPrefillQEight} \\
+affine4 & \textbf{\DecodeAffineFour} & n/a & \PrefillAffine & n/a \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Memory}
+\label{sec:eval-memory}
+Peak process RSS is about \PeakRSS~MB for the 4B model regardless of
+quantization, since the loader \code{mmap}s weights and pages them in on
+demand. Note that peak RSS understates true unified-memory residency for
+GPU-touched \code{mmap} pages, so we report artifact size alongside RSS and
+never present RSS as the total memory needed to run the model.
+
+\subsection{Ablations}
+\label{sec:eval-ablation}
+\paragraph{Quantized prefill: vector vs.\ MMA} Before the quantized MMA
+kernels, quantized prefill re-dequantized each weight block once per token in
+a vector kernel and slowed under quantization: on the same host, Q8\_0
+prefilled at \PrefillQEightOld~tok/s and affine4 at \PrefillAffineOld,
+against BF16's \PrefillBF. The MMA kernels dequantize each block once per
+16-token tile, lifting Q8\_0 to \PrefillQEight{} ($2.3\times$) and affine4
+to \PrefillAffine{} ($2.2\times$), on par with the BF16 matrix path's
+\PrefillBF. % HAND: the 2.3x/2.2x ratios derive from \PrefillQEight/\PrefillQEightOld and \PrefillAffine/\PrefillAffineOld
+The gates that admitted the change are the same lattice as every other
+feature: exact arg\,max, per-scheme NMSE, bitwise scramble.
+\paragraph{Verify-path reduction order} This change also produced a
+cautionary result. Routing speculative verify rounds through the matrix
+kernels broke the spec-equals-greedy gate, because the different summation
+order flipped near-tie arg\,maxes. Verify rounds now force the vector
+kernels, whose per-token reduction order is bitwise-identical to decode's,
+and the gate is green again. The contract caught its own optimization.
+\paragraph{Gate sensitivity} The mutation study of \Cref{sec:eval-faults}
+doubles as an ablation of the gate lattice. Removing the scramble gate
+leaves the rollover fault undetectable in principle. Removing the NMSE bound
+and keeping only arg\,max would pass three of the four mutants. Shrinking
+the scramble sequence back to two blocks re-masks the rollover fault. Every
+component of the lattice has at least one mutant that only it catches.
+\paragraph{Adaptive gating} The paired columns of \Cref{tab:spec} isolate
+the gate's effect: it preserves the repetitive-workload win while converting
+the low-acceptance losses to near-parity.
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\paragraph{What the contract does not cover} Placement invariance is
+claimed only for retained KV, not for logical reordering or prefill-column
+permutation (\Cref{sec:vpa}). The scramble gate exercises one adversarial
+permutation (reversal) per run. It localizes one-sided addressing bugs, but
+a bug that only manifests under a specific table shape could in principle
+require other permutations. These are cheap to add, since any non-identity
+permutation is a valid gate.
+
+\paragraph{Porting the discipline, and future work} Nothing in the scramble
+gate is specific to Kipp. Any paged engine with a per-sequence block table
+can evaluate a multi-block prompt twice, once under identity and once under
+a reversal, and \code{memcmp} the logits, provided its kernels satisfy H3
+within a run (fixed reduction order for a fixed batch shape), which
+batch-invariant kernels \citep{he2025defeating} already provide. We would
+welcome the gate's adoption in vLLM or SGLang; it is a few dozen lines
+against either engine's test harness. The most promising extension is
+tree-shaped speculative rollback
+\citep{cai2024medusa,li2024eagle,li2024eagle2}: chain methods roll back by
+cheap truncation and dense-buffer tree methods pay a gather-copy, so
+reclaiming rejected tree branches by block-table unlinking, under a
+bitwise-safety gate, is exactly the kind of operation placement invariance
+makes trustworthy.
+
+\subsection{Limitations}
+\label{sec:limitations}
+\begin{itemize}\itemsep2pt
+  \item \emph{Scope.} Kipp is a single-node, single-GPU engine for one
+  pinned model family; distributed serving and heterogeneous placement are
+  out of scope.
+  \item \emph{CUDA.} The CUDA backend is contiguous, BF16-only, final-row
+  logits, and gated at milestone points on ephemeral cloud A100s; the
+  correctness row in \Cref{tab:correct} was measured at that milestone and
+  not re-run for this draft. Extending paging and the scramble gate to CUDA
+  is mechanical (the kernels mirror Metal's structure) but unverified, so we
+  do not claim it.
+  \item \emph{One permutation per run.} The scramble gate reverses the
+  table; other adversarial permutations are possible and cheap but not yet
+  exercised.
+  \item \emph{Quality metric.} Quantization quality is evaluated by
+  perplexity only; task-suite accuracy \citep{li2024evalquant} is future
+  work.
+  \item \emph{Oracle scope.} The oracle pins greedy logits; it does not
+  characterize sampling distributions beyond the logits it checks.
+\end{itemize}
 
 \section{Related Work}
 \label{sec:related}
-\paragraph{Paged KV and relocation.} PagedAttention \citep{kwon2023pagedattention}
-introduced the block table; SGLang's RadixAttention \citep{zheng2024sglang}
-shares prefixes across calls via a radix tree. Both rely on placement- and
-sharing-correctness and test throughput and cache-hit rate, not a
-placement-permutation invariant. Systems that migrate KV blocks at runtime for
-load balancing treat relocatability as safe by construction. Kipp instead makes
-placement-invariance an explicit passing gate.
+PagedAttention \citep{kwon2023pagedattention} introduced the block table,
+and SGLang's RadixAttention \citep{zheng2024sglang} shares prefixes across
+calls via a radix tree. A growing family of systems moves KV around at
+runtime: Llumnix migrates running requests and their caches between
+instances \citep{sun2024llumnix}, InfiniGen spills KV between GPU and host
+memory \citep{lee2024infinigen}, Mooncake ships it between prefill and
+decode clusters \citep{qin2025mooncake}, CachedAttention persists it across
+conversation turns \citep{gao2024cachedattention}, and Prompt Cache reuses
+precomputed attention states across prompts \citep{gim2024promptcache}.
+vAttention revisits the layout question entirely, backing contiguous virtual
+KV with demand paging \citep{prabhu2025vattention}, and production engines
+such as TensorRT-LLM \citep{nvidia2023tensorrtllm} and TGI
+\citep{huggingface2023tgi} relocate blocks internally. All of these systems
+evaluate throughput and cache-hit rate; none tests placement invariance as a
+named property (\Cref{tab:survey}). CacheGen \citep{liu2024cachegen}
+makes an interesting contrast, since it compresses KV lossily in transit and
+deliberately gives up the bitwise equality that our gate demands. On-device
+engines such as llama.cpp \citep{llamacpp2023gguf} and MLX
+\citep{hannun2023mlx} target the same hardware class as Kipp's Metal
+backend.
 
-\paragraph{Determinism.} \citet{he2025defeating} trace run-to-run
-nondeterminism to batch-size-dependent kernel reductions and restore bitwise
-determinism with batch-invariant kernels, subsequently adopted for
-deterministic serving. That work fixes the reduction-order axis; our contract
-fixes the orthogonal spatial (physical-placement) axis and adds a byte-stable
-scalar oracle as a hard cross-backend gate.
+\citet{he2025defeating} trace run-to-run nondeterminism to
+batch-size-dependent kernel reductions and restore bitwise determinism with
+batch-invariant kernels. That work fixes the reduction-order axis; our
+contract fixes the orthogonal placement axis and adds a byte-stable scalar
+oracle as a hard cross-backend gate. On the testing side, the scramble gate
+is a metamorphic test \citep{chen2018metamorphic}, and the oracle discipline
+is differential testing \citep{mckeeman1998differential} in the lineage of
+CRADLE's cross-framework validation \citep{pham2019cradle}. Symbolic
+checkers such as GKLEE \citep{li2012gklee} verify GPU kernels exhaustively
+but do not scale to a full transformer forward pass, and fuzzers for
+deep-learning libraries \citep{wei2022freefuzz} find crashes rather than
+wrong-computation bugs, which require an oracle. Our fault study applies
+classical mutation testing \citep{demillo1978mutation,jia2011mutation} and
+software fault injection \citep{hsueh1997fault} to an inference engine's
+memory system. MLPerf \citep{reddi2020mlperf} standardizes performance
+reporting; we extend the same rigor to correctness claims.
 
-\paragraph{Attention and quantization.} FlashAttention
+FlashAttention
 \citep{dao2022flashattention,dao2024flashattention2,shah2024flashattention3}
-made exact attention IO-efficient; Kipp's streaming online-softmax Metal
-kernel is in this lineage. Post-training quantization
-\citep{frantar2023gptq,lin2024awq} and GGUF k-quants \citep{llamacpp2023gguf}
-inform Kipp's block-quantized weights.
-
-\paragraph{Speculative decoding.} Speculative decoding
-\citep{leviathan2023speculative,chen2023speculativesampling} and its
-draft-model-free \citep{saxena2023promptlookup} and self-drafting
-\citep{cai2024medusa,li2024eagle,li2024eagle2} variants accelerate decode.
-Chain methods roll back by cheap truncation; dense-buffer tree methods pay a
-gather-copy. Extending Kipp's placement-invariance gate to \emph{tree}-shaped
-speculative rollback---reclaiming rejected branches by block-table unlinking
-with a bitwise-safety gate---is a promising direction the chain-only mainline
-lacks.
-
-\section{Limitations and Future Work}
-Placement-invariance is claimed only for retained KV, not logical reordering or
-prefill-column permutation (\Cref{sec:vpa}). CUDA paging and the cross-request
-block pool are implemented but not yet wired into the serving path; CUDA is
-gated for correctness on cloud A100s but throughput numbers are reported only
-where measured. A quantized matrix-multiply prefill kernel would remove the
-prefill regression of \Cref{tab:perf}. The most promising extension is
-tree-speculative rollback under the same invariance gate.
+made exact attention IO-efficient; Flash-Decoding
+\citep{dao2023flashdecoding} specializes the split-K streaming shape for
+decode, and FlashInfer \citep{ye2025flashinfer} generalizes paged and
+block-sparse attention kernels behind a serving-oriented interface. Kipp's
+streaming online-softmax Metal kernel is in this lineage. Post-training
+quantization \citep{frantar2023gptq,lin2024awq} and GGUF k-quants
+\citep{llamacpp2023gguf} inform Kipp's block-quantized weights, and
+\citet{li2024evalquant} systematize quality evaluation for quantized LLMs.
+Speculative decoding
+\citep{leviathan2023speculative,chen2023speculativesampling} accelerates
+decode, with draft-model-free \citep{saxena2023promptlookup,fu2024lookahead},
+self-drafting \citep{cai2024medusa,li2024eagle,li2024eagle2}, and adaptive
+\citep{huang2025specdecpp,kim2023bild} variants. Kipp's contribution here is
+the acceptance-gated policy and the token-identity gate, not a new drafting
+scheme. DistServe \citep{zhong2024distserve}
+defines the goodput-oriented serving metrics our load evaluation adopts.
 
 \section{Conclusion}
-Kipp shows that the placement-invariance every paged inference system relies on
-can be a \emph{tested} contract rather than an assumption, and that a
-byte-stable scalar oracle can hold real GPU backends to exact arg\,max. The
-result is a small, fast, and---above all---continuously verifiable engine: not
-the fastest, but one where correctness is reproducible by re-execution.
+Kipp shows that the placement invariance every paged inference system relies
+on can be a tested contract rather than an assumption, and that the stakes
+are measurable by mutation. A realistic block-rollover bug is bitwise
+invisible to every identity-mapped reference test, yet a scramble gate that
+costs seconds on GPU catches it immediately, while value-corrupting bugs
+sail past arg\,max checks and fall only to a tight NMSE bound. The gates are
+complementary, each with mutants that only it catches, and the mutation
+study repaired a blind spot in the gate itself. A byte-stable scalar oracle
+holds real GPU backends to exact arg\,max, and every feature in the engine,
+from quantization and MMA prefill to batching, adaptive speculation, and
+pooled KV sharing, landed through the same lattice. The result is a small,
+continuously verifiable engine whose correctness, and every number in this
+paper, is reproducible by re-execution --- and a discipline that any paged
+engine can adopt for the cost of a reversed block table and a
+\code{memcmp}.
+
+\section*{Artifact Availability}
+Kipp is open source under the MIT license:\par
+\noindent\url{https://github.com/Polished-Snow/Kipp}\par
+\noindent This paper was built from commit \texttt{<commit>} of that
+repository. An archived artifact with a DOI will accompany the final
+version. \code{REPRODUCE.md} in the repository
+documents the full build, gate, and benchmark reproduction path, and
+\Cref{app:artifact} maps each claim in this paper to the command that checks
+it. Every measured number is generated into the paper from a committed
+\code{bench/results/*.json} by \code{make paper-data} and verified by
+\code{make paper-check}.
 
 \balance
-\bibliographystyle{plainnat}
+\bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
+
+\appendix
+\section{Artifact: claims to commands}
+\label{app:artifact}
+Every correctness claim maps to a gate command, and every number maps to a
+committed result file. Build and gate commands (see also
+\code{REPRODUCE.md}):
+
+\begin{lstlisting}
+make cpu metal server-metal      # binaries
+make test test-sanitize          # hermetic units + ASan/UBSan
+# model gates (direct; $M = GGUF, $V = pinned vectors):
+build/kipp_test        --model         $M $V   # bitwise vs reference
+build/kipp_test        --paged-cpu     $M $V   # scramble, bitwise
+build/kipp_test        --multilogit    $M $V
+build/kipp_test        --phase2-model  $M $V
+build/kipp_test_metal  --metal-operators
+build/kipp_test_metal  --phase3-metal  $M $V   # argmax + 1e-4
+build/kipp_test_metal  --paged-metal   $M $V   # scramble, bitwise
+build/kipp_test_metal  --multilogit-metal $M $V
+make test-server                 # OpenAI API surface
+# mutation study (test-only build):
+make build/kipp_test_fault
+KIPP_FAULT=<1..4> build/kipp_test_fault --phase2-model $M $V
+KIPP_FAULT=<1..4> build/kipp_test_fault --paged-cpu    $M $V
+# benchmarks (each writes a self-describing bench/results/*.json):
+python3 tools/bench.py ...             # decode/prefill by scheme and size
+python3 bench/spec_bench.py --gate off # ungated speculation baseline
+python3 bench/spec_bench.py --gate on  # adaptive-gated speculation
+python3 bench/server_bench.py ...      # batch scaling
+python3 bench/load_bench.py ...        # open-loop serving load
+python3 bench/prefix_bench.py ...      # cross-request prefix reuse
+python3 bench/ppl_bench.py ...         # WikiText-2 perplexity by scheme
+# paper numbers (regenerate + verify the macro/data bindings):
+make paper-data paper-check
+\end{lstlisting}
 
 \end{document}
