@@ -34,10 +34,11 @@ number quoted anywhere (docs, paper) must trace to a committed
 `results/*.json`**, and a hardware change must be visible in that file, not
 inferred.
 
-The recorded `dirty` flag ignores `bench/results/` itself: a run whose only
-working-tree changes are freshly written result files records
-`dirty: false`. Any modification outside `bench/results/` still marks the
-run dirty.
+The recorded `dirty` flag ignores `bench/results/` itself and the paper
+artifacts derived from it (`paper/generated/`, `paper/data/`): a run whose
+only working-tree changes are freshly written results or stale derived
+paper data records `dirty: false`. Any modification outside those paths
+still marks the run dirty.
 
 ## Measurement protocol: GPU steady state
 
