@@ -3,7 +3,7 @@
 % read from. Regenerate with `make paper-data`; CI verifies
 % byte-identical regeneration with `make paper-check`.
 % -- decode / prefill by weight scheme, Qwen3-4B --
-\newcommand{\DecodeBF}{57.5}% 4b-bf16-decode.json decode_tokens_per_second.median commit 9506fd1 MAD 0.2
+\newcommand{\DecodeBF}{60.3}% 4b-bf16-decode.json decode_tokens_per_second.median commit 4cb3e5e MAD 0.67
 \newcommand{\PrefillBF}{355}% 4b-bf16-prefill.json prefill_tokens_per_second.median commit 1ca49c3 MAD 0.082
 \newcommand{\DecodeQEight}{98.2}% 4b-q8_0-decode.json decode_tokens_per_second.median commit 1ca49c3 MAD 0.035
 \newcommand{\PrefillQEight}{218}% 4b-q8_0-prefill.json prefill_tokens_per_second.median commit 1ca49c3 MAD 0.045
@@ -12,7 +12,7 @@
 \newcommand{\PrefillTwoKBF}{278}% 4b-bf16-prefill2k.json prefill_tokens_per_second.median commit 9506fd1 MAD 13
 \newcommand{\PrefillTwoKQEight}{70.4}% 4b-q8_0-prefill2k.json prefill_tokens_per_second.median commit 9506fd1 MAD 11
 \newcommand{\PrefillTwoKAffine}{102}% 4b-affine4_gs32-prefill2k.json prefill_tokens_per_second.median commit 9506fd1 MAD 9.5
-\newcommand{\PeakRSS}{41}% 4b-bf16-decode.json peak_resident_bytes.median (MB, scheme-invariant) commit 9506fd1
+\newcommand{\PeakRSS}{41}% 4b-bf16-decode.json peak_resident_bytes.median (MB, scheme-invariant) commit 4cb3e5e
 % -- context scaling (q8_0, decode 32) --
 \newcommand{\CtxDecodeShort}{98.4}% ctx-3.json decode_tokens_per_second.median commit 1ca49c3
 \newcommand{\CtxDecodeLongest}{21.5}% ctx-12800.json decode_tokens_per_second.median commit 9506fd1
