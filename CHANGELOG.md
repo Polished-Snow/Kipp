@@ -3,7 +3,7 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
-## Unreleased
+## v0.0.3 — 2026-07-22
 
 ### Metal matrix kernels restored; harness tripwire (2026-07-22)
 - **Fixed a reserved-MSL-keyword bug** (`fragment` used as a loop variable

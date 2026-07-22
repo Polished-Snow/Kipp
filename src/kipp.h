@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define KIPP_VERSION "0.0.2"
+#define KIPP_VERSION "0.0.3"
 
 /*
  * Family-invariant Qwen3 dense dimensions. Everything that varies between
