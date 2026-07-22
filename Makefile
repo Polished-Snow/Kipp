@@ -275,6 +275,13 @@ $(BUILD_DIR)/kipp_cuda_test.o: tests/kipp_test.c src/kipp.h src/kipp_chat.h \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DKIPP_TESTING -DKIPP_ENABLE_CUDA \
 		-c tests/kipp_test.c -o $@
 
+# The KV pool's KIPP_TESTING collision hook is referenced by the test
+# binary, so the CUDA test links a testing-compiled pool object rather
+# than the production one.
+$(BUILD_DIR)/kipp_kv_pool_testing.o: src/kipp_kv_pool.c src/kipp_kv_pool.h \
+		| $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKIPP_TESTING -c src/kipp_kv_pool.c -o $@
+
 $(BUILD_DIR)/kipp_chat.o: src/kipp_chat.c src/kipp_chat.h src/kipp.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_chat.c -o $@
 
@@ -297,7 +304,7 @@ $(BUILD_DIR)/kipp-server-cuda: $(BUILD_DIR)/kipp_cuda_core.o \
 
 $(BUILD_DIR)/kipp_test_cuda: $(BUILD_DIR)/kipp_cuda_test_core.o \
 		$(BUILD_DIR)/kipp_cuda_test.o $(BUILD_DIR)/kipp_chat.o \
-		$(BUILD_DIR)/kipp_spec.o $(BUILD_DIR)/kipp_kv_pool.o \
+		$(BUILD_DIR)/kipp_spec.o $(BUILD_DIR)/kipp_kv_pool_testing.o \
 		$(BUILD_DIR)/kipp_json.o $(BUILD_DIR)/kipp_http.o \
 		$(BUILD_DIR)/kipp_cuda_bridge_generic.o \
 		$(BUILD_DIR)/kipp_cuda_kernels_generic.o

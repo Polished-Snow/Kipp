@@ -122,10 +122,29 @@ VM_ID=$(printf '%s' "$CREATED" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 VOLUME_ID=$(printf '%s' "$CREATED" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["os_volume_id"])')
-IP=$(printf '%s' "$CREATED" |
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"] or "")')
+read_ip() {
+    python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list):
+    data = data[0] if data else {}
+for key in ("ip", "public_ip", "ip_address", "public_ipv4"):
+    value = data.get(key)
+    if value:
+        print(value)
+        break
+'
+}
+IP=$(printf '%s' "$CREATED" | read_ip)
+# Newer CLI releases assign the address after create returns; poll describe.
+ATTEMPTS=0
+while [ -z "$IP" ] && [ "$ATTEMPTS" -lt 36 ]; do
+    sleep 5
+    IP=$(verda vm describe "$VM_ID" -o json 2>/dev/null | read_ip)
+    ATTEMPTS=$((ATTEMPTS + 1))
+done
 if [ -z "$IP" ]; then
-    echo "Verda returned no IP for $VM_ID" >&2
+    echo "Verda returned no IP for $VM_ID after $ATTEMPTS polls" >&2
     exit 1
 fi
 echo "instance $HOST ($VM_ID) at $IP"
