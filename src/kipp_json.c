@@ -266,12 +266,12 @@ static bool json_parse_collection(json_cursor *cursor, kipp_json_value *value,
         if (is_object) {
             if (cursor->offset >= cursor->length ||
                 !json_parse_string(cursor, &value->keys[value->count])) {
-                return false;
+                goto fail_slot;
             }
             json_skip_space(cursor);
             if (cursor->offset >= cursor->length ||
                 cursor->text[cursor->offset] != ':') {
-                return false;
+                goto fail_slot;
             }
             ++cursor->offset;
         }
@@ -279,7 +279,7 @@ static bool json_parse_collection(json_cursor *cursor, kipp_json_value *value,
         if (cursor->offset >= cursor->length ||
             !json_parse_value(cursor, &value->items[value->count],
                               depth + 1)) {
-            return false;
+            goto fail_slot;
         }
         ++value->count;
         json_skip_space(cursor);
@@ -296,6 +296,20 @@ static bool json_parse_collection(json_cursor *cursor, kipp_json_value *value,
         }
         return false;
     }
+    return false;
+
+    /*
+     * Failure with an in-flight slot: value->count does not yet cover it,
+     * so the caller's recursive free would never reach the parsed key or
+     * the failed child's partial subtree; release them here.
+     */
+fail_slot:
+    if (is_object && value->keys != NULL &&
+        value->keys[value->count] != NULL) {
+        free(value->keys[value->count]);
+        value->keys[value->count] = NULL;
+    }
+    kipp_json_free(&value->items[value->count]);
     return false;
 }
 
