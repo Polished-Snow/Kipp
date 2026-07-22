@@ -22,6 +22,8 @@
 
 #include "kipp.h"
 #include "kipp_chat.h"
+#include "kipp_http.h"
+#include "kipp_json.h"
 #include "kipp_kv_pool.h" /* KIPP_KV_BLOCK_TOKENS for pool sizing */
 
 #include <arpa/inet.h>
@@ -49,7 +51,6 @@
 #define SERVER_DEFAULT_MAX_TOKENS 16u
 #define SERVER_STOP_LIMIT 4u
 #define SERVER_CHOICE_LIMIT 8u
-#define SERVER_JSON_DEPTH_LIMIT 16u
 #define SERVER_MAX_CONNECTIONS 64u
 #define SERVER_MAX_GENERATIONS 8u
 #define SERVER_PREFILL_CHUNK 32u
@@ -184,355 +185,6 @@ static void sb_append_json_string(string_builder *builder, const char *text,
     sb_append(builder, "\"");
 }
 
-/* ------------------------------------------------------------------- JSON */
-
-typedef enum {
-    JSON_NULL,
-    JSON_BOOL,
-    JSON_NUMBER,
-    JSON_STRING,
-    JSON_ARRAY,
-    JSON_OBJECT
-} json_type;
-
-typedef struct json_value json_value;
-
-struct json_value {
-    json_type type;
-    bool boolean;
-    double number;
-    char *string;
-    char **keys;
-    json_value *items;
-    size_t count;
-};
-
-static void json_free_value(json_value *value) {
-    if (value == NULL) {
-        return;
-    }
-    free(value->string);
-    for (size_t index = 0; index < value->count; ++index) {
-        if (value->keys != NULL) {
-            free(value->keys[index]);
-        }
-        json_free_value(&value->items[index]);
-    }
-    free(value->keys);
-    free(value->items);
-    memset(value, 0, sizeof(*value));
-}
-
-typedef struct {
-    const char *text;
-    size_t length;
-    size_t offset;
-} json_cursor;
-
-static void json_skip_space(json_cursor *cursor) {
-    while (cursor->offset < cursor->length) {
-        char c = cursor->text[cursor->offset];
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
-            break;
-        }
-        ++cursor->offset;
-    }
-}
-
-static bool json_literal(json_cursor *cursor, const char *literal) {
-    size_t length = strlen(literal);
-    if (cursor->length - cursor->offset < length ||
-        memcmp(cursor->text + cursor->offset, literal, length) != 0) {
-        return false;
-    }
-    cursor->offset += length;
-    return true;
-}
-
-static size_t json_utf8_encode(char *output, uint32_t codepoint) {
-    if (codepoint < 0x80) {
-        output[0] = (char)codepoint;
-        return 1;
-    }
-    if (codepoint < 0x800) {
-        output[0] = (char)(0xc0 | (codepoint >> 6));
-        output[1] = (char)(0x80 | (codepoint & 0x3f));
-        return 2;
-    }
-    if (codepoint < 0x10000) {
-        output[0] = (char)(0xe0 | (codepoint >> 12));
-        output[1] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
-        output[2] = (char)(0x80 | (codepoint & 0x3f));
-        return 3;
-    }
-    output[0] = (char)(0xf0 | (codepoint >> 18));
-    output[1] = (char)(0x80 | ((codepoint >> 12) & 0x3f));
-    output[2] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
-    output[3] = (char)(0x80 | (codepoint & 0x3f));
-    return 4;
-}
-
-static bool json_parse_hex4(json_cursor *cursor, uint32_t *value) {
-    if (cursor->length - cursor->offset < 4) {
-        return false;
-    }
-    *value = 0;
-    for (int digit = 0; digit < 4; ++digit) {
-        char c = cursor->text[cursor->offset + (size_t)digit];
-        uint32_t nibble;
-        if (c >= '0' && c <= '9') {
-            nibble = (uint32_t)(c - '0');
-        } else if (c >= 'a' && c <= 'f') {
-            nibble = (uint32_t)(c - 'a' + 10);
-        } else if (c >= 'A' && c <= 'F') {
-            nibble = (uint32_t)(c - 'A' + 10);
-        } else {
-            return false;
-        }
-        *value = (*value << 4) | nibble;
-    }
-    cursor->offset += 4;
-    return true;
-}
-
-static bool json_parse_string(json_cursor *cursor, char **output) {
-    if (cursor->text[cursor->offset] != '"') {
-        return false;
-    }
-    ++cursor->offset;
-    string_builder builder = {0};
-    while (cursor->offset < cursor->length) {
-        char c = cursor->text[cursor->offset];
-        if (c == '"') {
-            ++cursor->offset;
-            if (builder.failed) {
-                sb_free(&builder);
-                return false;
-            }
-            *output = builder.data != NULL ? builder.data : calloc(1, 1);
-            return *output != NULL;
-        }
-        if ((unsigned char)c < 0x20) {
-            break;
-        }
-        if (c != '\\') {
-            sb_append_bytes(&builder, &cursor->text[cursor->offset], 1);
-            ++cursor->offset;
-            continue;
-        }
-        ++cursor->offset;
-        if (cursor->offset >= cursor->length) {
-            break;
-        }
-        char escape = cursor->text[cursor->offset];
-        ++cursor->offset;
-        char encoded[4];
-        uint32_t codepoint;
-        switch (escape) {
-        case '"':
-        case '\\':
-        case '/':
-            sb_append_bytes(&builder, &escape, 1);
-            continue;
-        case 'b':
-            sb_append(&builder, "\b");
-            continue;
-        case 'f':
-            sb_append(&builder, "\f");
-            continue;
-        case 'n':
-            sb_append(&builder, "\n");
-            continue;
-        case 'r':
-            sb_append(&builder, "\r");
-            continue;
-        case 't':
-            sb_append(&builder, "\t");
-            continue;
-        case 'u':
-            if (!json_parse_hex4(cursor, &codepoint)) {
-                sb_free(&builder);
-                return false;
-            }
-            if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
-                uint32_t low;
-                if (!json_literal(cursor, "\\u") ||
-                    !json_parse_hex4(cursor, &low) || low < 0xdc00 ||
-                    low > 0xdfff) {
-                    sb_free(&builder);
-                    return false;
-                }
-                codepoint = 0x10000 +
-                            ((codepoint - 0xd800) << 10) + (low - 0xdc00);
-            } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
-                sb_free(&builder);
-                return false;
-            }
-            sb_append_bytes(&builder, encoded,
-                            json_utf8_encode(encoded, codepoint));
-            continue;
-        default:
-            sb_free(&builder);
-            return false;
-        }
-    }
-    sb_free(&builder);
-    return false;
-}
-
-static bool json_parse_value(json_cursor *cursor, json_value *value,
-                             unsigned depth);
-
-static bool json_parse_collection(json_cursor *cursor, json_value *value,
-                                  bool is_object, unsigned depth) {
-    char open = is_object ? '{' : '[';
-    char close = is_object ? '}' : ']';
-    if (cursor->text[cursor->offset] != open) {
-        return false;
-    }
-    ++cursor->offset;
-    value->type = is_object ? JSON_OBJECT : JSON_ARRAY;
-    json_skip_space(cursor);
-    if (cursor->offset < cursor->length &&
-        cursor->text[cursor->offset] == close) {
-        ++cursor->offset;
-        return true;
-    }
-    size_t capacity = 0;
-    while (cursor->offset < cursor->length) {
-        if (value->count == capacity) {
-            size_t new_capacity = capacity == 0 ? 4 : capacity * 2;
-            json_value *items =
-                realloc(value->items, new_capacity * sizeof(*items));
-            if (items == NULL) {
-                return false;
-            }
-            memset(items + capacity, 0,
-                   (new_capacity - capacity) * sizeof(*items));
-            value->items = items;
-            if (is_object) {
-                char **keys =
-                    realloc(value->keys, new_capacity * sizeof(*keys));
-                if (keys == NULL) {
-                    return false;
-                }
-                memset(keys + capacity, 0,
-                       (new_capacity - capacity) * sizeof(*keys));
-                value->keys = keys;
-            }
-            capacity = new_capacity;
-        }
-        json_skip_space(cursor);
-        if (is_object) {
-            if (cursor->offset >= cursor->length ||
-                !json_parse_string(cursor, &value->keys[value->count])) {
-                return false;
-            }
-            json_skip_space(cursor);
-            if (cursor->offset >= cursor->length ||
-                cursor->text[cursor->offset] != ':') {
-                return false;
-            }
-            ++cursor->offset;
-        }
-        json_skip_space(cursor);
-        if (cursor->offset >= cursor->length ||
-            !json_parse_value(cursor, &value->items[value->count],
-                              depth + 1)) {
-            return false;
-        }
-        ++value->count;
-        json_skip_space(cursor);
-        if (cursor->offset >= cursor->length) {
-            return false;
-        }
-        if (cursor->text[cursor->offset] == ',') {
-            ++cursor->offset;
-            continue;
-        }
-        if (cursor->text[cursor->offset] == close) {
-            ++cursor->offset;
-            return true;
-        }
-        return false;
-    }
-    return false;
-}
-
-static bool json_parse_value(json_cursor *cursor, json_value *value,
-                             unsigned depth) {
-    if (depth > SERVER_JSON_DEPTH_LIMIT) {
-        return false;
-    }
-    json_skip_space(cursor);
-    if (cursor->offset >= cursor->length) {
-        return false;
-    }
-    char c = cursor->text[cursor->offset];
-    if (c == '{' || c == '[') {
-        return json_parse_collection(cursor, value, c == '{', depth);
-    }
-    if (c == '"') {
-        value->type = JSON_STRING;
-        return json_parse_string(cursor, &value->string);
-    }
-    if (json_literal(cursor, "true")) {
-        value->type = JSON_BOOL;
-        value->boolean = true;
-        return true;
-    }
-    if (json_literal(cursor, "false")) {
-        value->type = JSON_BOOL;
-        value->boolean = false;
-        return true;
-    }
-    if (json_literal(cursor, "null")) {
-        value->type = JSON_NULL;
-        return true;
-    }
-    if (c == '-' || (c >= '0' && c <= '9')) {
-        char buffer[64];
-        size_t length = 0;
-        while (cursor->offset < cursor->length &&
-               length + 1 < sizeof(buffer)) {
-            char digit = cursor->text[cursor->offset];
-            if (digit != '-' && digit != '+' && digit != '.' &&
-                digit != 'e' && digit != 'E' &&
-                (digit < '0' || digit > '9')) {
-                break;
-            }
-            buffer[length++] = digit;
-            ++cursor->offset;
-        }
-        buffer[length] = '\0';
-        char *end = NULL;
-        errno = 0;
-        value->number = strtod(buffer, &end);
-        if (errno != 0 || end != buffer + length || length == 0 ||
-            !isfinite(value->number)) {
-            return false;
-        }
-        value->type = JSON_NUMBER;
-        return true;
-    }
-    return false;
-}
-
-static bool json_parse(const char *text, size_t length, json_value *value) {
-    json_cursor cursor = {text, length, 0};
-    memset(value, 0, sizeof(*value));
-    if (!json_parse_value(&cursor, value, 0)) {
-        json_free_value(value);
-        return false;
-    }
-    json_skip_space(&cursor);
-    if (cursor.offset != length) {
-        json_free_value(value);
-        return false;
-    }
-    return true;
-}
-
 /* ------------------------------------------------------------ completions */
 
 #define SERVER_LOGIT_BIAS_LIMIT 64u
@@ -569,9 +221,9 @@ static void completion_request_free(completion_request *request) {
     memset(request, 0, sizeof(*request));
 }
 
-static bool json_number_as_u32(const json_value *value, uint32_t minimum,
+static bool json_number_as_u32(const kipp_json_value *value, uint32_t minimum,
                                uint32_t maximum, uint32_t *output) {
-    if (value->type != JSON_NUMBER || value->number != floor(value->number) ||
+    if (value->type != KIPP_JSON_NUMBER || value->number != floor(value->number) ||
         value->number < (double)minimum || value->number > (double)maximum) {
         return false;
     }
@@ -585,7 +237,7 @@ static bool json_number_as_u32(const json_value *value, uint32_t minimum,
  * parser's key (caller keeps checking), -1 on a validation error (message
  * written). Keeps both endpoints' sampling surface identical.
  */
-static int parse_sampling_field(const char *key, const json_value *value,
+static int parse_sampling_field(const char *key, const kipp_json_value *value,
                                 completion_request *request, char *message,
                                 size_t message_size) {
     if (strcmp(key, "top_k") == 0) {
@@ -600,7 +252,7 @@ static int parse_sampling_field(const char *key, const json_value *value,
         return 1;
     }
     if (strcmp(key, "min_p") == 0) {
-        if (value->type != JSON_NUMBER || value->number < 0.0 ||
+        if (value->type != KIPP_JSON_NUMBER || value->number < 0.0 ||
             value->number > 1.0) {
             (void)snprintf(message, message_size,
                            "min_p must be a number between 0 and 1");
@@ -611,7 +263,7 @@ static int parse_sampling_field(const char *key, const json_value *value,
     }
     if (strcmp(key, "frequency_penalty") == 0 ||
         strcmp(key, "presence_penalty") == 0) {
-        if (value->type != JSON_NUMBER || value->number < -2.0 ||
+        if (value->type != KIPP_JSON_NUMBER || value->number < -2.0 ||
             value->number > 2.0) {
             (void)snprintf(message, message_size,
                            "%s must be a number between -2 and 2", key);
@@ -625,7 +277,7 @@ static int parse_sampling_field(const char *key, const json_value *value,
         return 1;
     }
     if (strcmp(key, "repetition_penalty") == 0) {
-        if (value->type != JSON_NUMBER || value->number <= 0.0 ||
+        if (value->type != KIPP_JSON_NUMBER || value->number <= 0.0 ||
             value->number > 4.0) {
             (void)snprintf(message, message_size,
                            "repetition_penalty must be greater than 0 and at "
@@ -636,7 +288,7 @@ static int parse_sampling_field(const char *key, const json_value *value,
         return 1;
     }
     if (strcmp(key, "logit_bias") == 0) {
-        if (value->type != JSON_OBJECT) {
+        if (value->type != KIPP_JSON_OBJECT) {
             (void)snprintf(message, message_size,
                            "logit_bias must be an object of token biases");
             return -1;
@@ -658,8 +310,8 @@ static int parse_sampling_field(const char *key, const json_value *value,
                                KIPP_VOCAB_SIZE);
                 return -1;
             }
-            const json_value *bias = &value->items[index];
-            if (bias->type != JSON_NUMBER || bias->number < -100.0 ||
+            const kipp_json_value *bias = &value->items[index];
+            if (bias->type != KIPP_JSON_NUMBER || bias->number < -100.0 ||
                 bias->number > 100.0) {
                 (void)snprintf(message, message_size,
                                "logit_bias values must be between -100 and 100");
@@ -675,17 +327,17 @@ static int parse_sampling_field(const char *key, const json_value *value,
 }
 
 /* Parse the shared stream_options object. Returns 0 or -1 (message written). */
-static int parse_stream_options(const json_value *value,
+static int parse_stream_options(const kipp_json_value *value,
                                 completion_request *request, char *message,
                                 size_t message_size) {
-    if (value->type != JSON_OBJECT) {
+    if (value->type != KIPP_JSON_OBJECT) {
         (void)snprintf(message, message_size,
                        "stream_options must be an object");
         return -1;
     }
     for (size_t index = 0; index < value->count; ++index) {
         if (strcmp(value->keys[index], "include_usage") == 0) {
-            if (value->items[index].type != JSON_BOOL) {
+            if (value->items[index].type != KIPP_JSON_BOOL) {
                 (void)snprintf(message, message_size,
                                "include_usage must be a boolean");
                 return -1;
@@ -705,7 +357,7 @@ static int parse_stream_options(const json_value *value,
  * Validate the request body against the supported field set. Returns 0 on
  * success; on failure writes a client-facing message and returns -1.
  */
-static int parse_completion_request(const json_value *body,
+static int parse_completion_request(const kipp_json_value *body,
                                     completion_request *request,
                                     char *message, size_t message_size) {
     memset(request, 0, sizeof(*request));
@@ -716,14 +368,14 @@ static int parse_completion_request(const json_value *body,
     request->repetition_penalty = 1.0f;
     request->seed = 0;
 
-    if (body->type != JSON_OBJECT) {
+    if (body->type != KIPP_JSON_OBJECT) {
         (void)snprintf(message, message_size,
                        "request body must be a JSON object");
         return -1;
     }
     for (size_t index = 0; index < body->count; ++index) {
         const char *key = body->keys[index];
-        const json_value *value = &body->items[index];
+        const kipp_json_value *value = &body->items[index];
         int sampled = parse_sampling_field(key, value, request, message,
                                            message_size);
         if (sampled < 0) {
@@ -733,7 +385,7 @@ static int parse_completion_request(const json_value *body,
             continue;
         }
         if (strcmp(key, "model") == 0) {
-            if (value->type != JSON_STRING ||
+            if (value->type != KIPP_JSON_STRING ||
                 strcmp(value->string, server_info.checkpoint_id) != 0) {
                 (void)snprintf(message, message_size,
                                "model must be \"%s\"",
@@ -741,7 +393,7 @@ static int parse_completion_request(const json_value *body,
                 return -1;
             }
         } else if (strcmp(key, "prompt") == 0) {
-            if (value->type != JSON_STRING) {
+            if (value->type != KIPP_JSON_STRING) {
                 (void)snprintf(message, message_size,
                                "prompt must be a single string");
                 return -1;
@@ -762,7 +414,7 @@ static int parse_completion_request(const json_value *body,
                 return -1;
             }
         } else if (strcmp(key, "temperature") == 0) {
-            if (value->type != JSON_NUMBER || value->number < 0.0 ||
+            if (value->type != KIPP_JSON_NUMBER || value->number < 0.0 ||
                 value->number > 2.0) {
                 (void)snprintf(message, message_size,
                                "temperature must be a number between 0 "
@@ -771,7 +423,7 @@ static int parse_completion_request(const json_value *body,
             }
             request->temperature = (float)value->number;
         } else if (strcmp(key, "top_p") == 0) {
-            if (value->type != JSON_NUMBER || value->number <= 0.0 ||
+            if (value->type != KIPP_JSON_NUMBER || value->number <= 0.0 ||
                 value->number > 1.0) {
                 (void)snprintf(message, message_size,
                                "top_p must be a number greater than 0 and "
@@ -797,19 +449,19 @@ static int parse_completion_request(const json_value *body,
                 return -1;
             }
         } else if (strcmp(key, "stream") == 0) {
-            if (value->type != JSON_BOOL) {
+            if (value->type != KIPP_JSON_BOOL) {
                 (void)snprintf(message, message_size,
                                "stream must be a boolean");
                 return -1;
             }
             request->stream = value->boolean;
         } else if (strcmp(key, "stop") == 0) {
-            const json_value *entries = value;
+            const kipp_json_value *entries = value;
             size_t entry_count = 1;
-            if (value->type == JSON_ARRAY) {
+            if (value->type == KIPP_JSON_ARRAY) {
                 entries = value->items;
                 entry_count = value->count;
-            } else if (value->type != JSON_STRING) {
+            } else if (value->type != KIPP_JSON_STRING) {
                 (void)snprintf(message, message_size,
                                "stop must be a string or an array of up to "
                                "%u strings",
@@ -823,9 +475,9 @@ static int parse_completion_request(const json_value *body,
                 return -1;
             }
             for (size_t stop = 0; stop < entry_count; ++stop) {
-                const json_value *entry =
-                    value->type == JSON_ARRAY ? &entries[stop] : value;
-                if (entry->type != JSON_STRING ||
+                const kipp_json_value *entry =
+                    value->type == KIPP_JSON_ARRAY ? &entries[stop] : value;
+                if (entry->type != KIPP_JSON_STRING ||
                     entry->string[0] == '\0') {
                     (void)snprintf(message, message_size,
                                    "stop strings must be non-empty");
@@ -839,7 +491,7 @@ static int parse_completion_request(const json_value *body,
                 ++request->stop_count;
             }
         } else if (strcmp(key, "logprobs") == 0) {
-            if (value->type == JSON_NULL) {
+            if (value->type == KIPP_JSON_NULL) {
                 continue; /* explicit null disables logprobs */
             }
             uint32_t top;
@@ -889,7 +541,7 @@ static kipp_chat_role chat_role_from_string(const char *role, bool *ok) {
  * with the text-completion parser; the only chat-specific inputs are the
  * `messages` array and optional `chat_template_kwargs.enable_thinking`.
  */
-static int parse_chat_request(const json_value *body,
+static int parse_chat_request(const kipp_json_value *body,
                               completion_request *request, char *message,
                               size_t message_size) {
     memset(request, 0, sizeof(*request));
@@ -900,17 +552,17 @@ static int parse_chat_request(const json_value *body,
     request->repetition_penalty = 1.0f;
     request->is_chat = true;
 
-    if (body->type != JSON_OBJECT) {
+    if (body->type != KIPP_JSON_OBJECT) {
         (void)snprintf(message, message_size,
                        "request body must be a JSON object");
         return -1;
     }
-    const json_value *messages = NULL;
+    const kipp_json_value *messages = NULL;
     bool enable_thinking = true;
     bool saw_top_logprobs = false;
     for (size_t index = 0; index < body->count; ++index) {
         const char *key = body->keys[index];
-        const json_value *value = &body->items[index];
+        const kipp_json_value *value = &body->items[index];
         int sampled = parse_sampling_field(key, value, request, message,
                                            message_size);
         if (sampled < 0) {
@@ -920,14 +572,14 @@ static int parse_chat_request(const json_value *body,
             continue;
         }
         if (strcmp(key, "messages") == 0) {
-            if (value->type != JSON_ARRAY || value->count == 0) {
+            if (value->type != KIPP_JSON_ARRAY || value->count == 0) {
                 (void)snprintf(message, message_size,
                                "messages must be a non-empty array");
                 return -1;
             }
             messages = value;
         } else if (strcmp(key, "model") == 0) {
-            if (value->type != JSON_STRING ||
+            if (value->type != KIPP_JSON_STRING ||
                 strcmp(value->string, server_info.checkpoint_id) != 0) {
                 (void)snprintf(message, message_size, "model must be \"%s\"",
                                server_info.checkpoint_id);
@@ -943,7 +595,7 @@ static int parse_chat_request(const json_value *body,
                 return -1;
             }
         } else if (strcmp(key, "temperature") == 0) {
-            if (value->type != JSON_NUMBER || value->number < 0.0 ||
+            if (value->type != KIPP_JSON_NUMBER || value->number < 0.0 ||
                 value->number > 2.0) {
                 (void)snprintf(message, message_size,
                                "temperature must be a number between 0 and 2");
@@ -951,7 +603,7 @@ static int parse_chat_request(const json_value *body,
             }
             request->temperature = (float)value->number;
         } else if (strcmp(key, "top_p") == 0) {
-            if (value->type != JSON_NUMBER || value->number <= 0.0 ||
+            if (value->type != KIPP_JSON_NUMBER || value->number <= 0.0 ||
                 value->number > 1.0) {
                 (void)snprintf(message, message_size,
                                "top_p must be greater than 0 and at most 1");
@@ -976,21 +628,21 @@ static int parse_chat_request(const json_value *body,
                 return -1;
             }
         } else if (strcmp(key, "stream") == 0) {
-            if (value->type != JSON_BOOL) {
+            if (value->type != KIPP_JSON_BOOL) {
                 (void)snprintf(message, message_size,
                                "stream must be a boolean");
                 return -1;
             }
             request->stream = value->boolean;
         } else if (strcmp(key, "chat_template_kwargs") == 0) {
-            if (value->type != JSON_OBJECT) {
+            if (value->type != KIPP_JSON_OBJECT) {
                 (void)snprintf(message, message_size,
                                "chat_template_kwargs must be an object");
                 return -1;
             }
             for (size_t inner = 0; inner < value->count; ++inner) {
                 if (strcmp(value->keys[inner], "enable_thinking") == 0) {
-                    if (value->items[inner].type != JSON_BOOL) {
+                    if (value->items[inner].type != KIPP_JSON_BOOL) {
                         (void)snprintf(message, message_size,
                                        "enable_thinking must be a boolean");
                         return -1;
@@ -999,12 +651,12 @@ static int parse_chat_request(const json_value *body,
                 }
             }
         } else if (strcmp(key, "stop") == 0) {
-            const json_value *entries = value;
+            const kipp_json_value *entries = value;
             size_t entry_count = 1;
-            if (value->type == JSON_ARRAY) {
+            if (value->type == KIPP_JSON_ARRAY) {
                 entries = value->items;
                 entry_count = value->count;
-            } else if (value->type != JSON_STRING) {
+            } else if (value->type != KIPP_JSON_STRING) {
                 (void)snprintf(message, message_size,
                                "stop must be a string or array of up to %u "
                                "strings",
@@ -1018,9 +670,9 @@ static int parse_chat_request(const json_value *body,
                 return -1;
             }
             for (size_t stop = 0; stop < entry_count; ++stop) {
-                const json_value *entry =
-                    value->type == JSON_ARRAY ? &entries[stop] : value;
-                if (entry->type != JSON_STRING || entry->string[0] == '\0') {
+                const kipp_json_value *entry =
+                    value->type == KIPP_JSON_ARRAY ? &entries[stop] : value;
+                if (entry->type != KIPP_JSON_STRING || entry->string[0] == '\0') {
                     (void)snprintf(message, message_size,
                                    "stop strings must be non-empty");
                     return -1;
@@ -1033,10 +685,10 @@ static int parse_chat_request(const json_value *body,
                 ++request->stop_count;
             }
         } else if (strcmp(key, "logprobs") == 0) {
-            if (value->type == JSON_NULL) {
+            if (value->type == KIPP_JSON_NULL) {
                 continue; /* explicit null disables logprobs */
             }
-            if (value->type != JSON_BOOL) {
+            if (value->type != KIPP_JSON_BOOL) {
                 (void)snprintf(message, message_size,
                                "logprobs must be a boolean");
                 return -1;
@@ -1079,10 +731,10 @@ static int parse_chat_request(const json_value *body,
         return -1;
     }
     for (size_t index = 0; index < messages->count; ++index) {
-        const json_value *entry = &messages->items[index];
+        const kipp_json_value *entry = &messages->items[index];
         const char *role = NULL;
         const char *content = NULL;
-        if (entry->type != JSON_OBJECT) {
+        if (entry->type != KIPP_JSON_OBJECT) {
             free(rendered);
             (void)snprintf(message, message_size,
                            "message %zu must be an object", index);
@@ -1090,10 +742,10 @@ static int parse_chat_request(const json_value *body,
         }
         for (size_t field = 0; field < entry->count; ++field) {
             if (strcmp(entry->keys[field], "role") == 0 &&
-                entry->items[field].type == JSON_STRING) {
+                entry->items[field].type == KIPP_JSON_STRING) {
                 role = entry->items[field].string;
             } else if (strcmp(entry->keys[field], "content") == 0 &&
-                       entry->items[field].type == JSON_STRING) {
+                       entry->items[field].type == KIPP_JSON_STRING) {
                 content = entry->items[field].string;
             }
         }
@@ -1938,12 +1590,12 @@ static uint32_t active_batch_items(void) {
  * request was rejected or failed (a response has been queued).
  */
 static int generation_admit(kipp_model *model, server_connection *conn) {
-    json_value body = {0};
+    kipp_json_value body = {0};
     completion_request request = {0};
     char message[256];
     kipp_error error = {0};
 
-    if (!json_parse(conn->in.data + conn->header_end, conn->body_length,
+    if (!kipp_json_parse(conn->in.data + conn->header_end, conn->body_length,
                     &body)) {
         connection_error(conn, 400, "Bad Request", "invalid_request_error",
                          "request body is not valid JSON");
@@ -1955,13 +1607,13 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
                 : parse_completion_request(&body, &request, message,
                                            sizeof(message));
     if (parse_status != 0) {
-        json_free_value(&body);
+        kipp_json_free(&body);
         completion_request_free(&request);
         connection_error(conn, 400, "Bad Request", "invalid_request_error",
                          "%s", message);
         return -1;
     }
-    json_free_value(&body);
+    kipp_json_free(&body);
 
     generation *gen = NULL;
     for (uint32_t slot = 0; slot < SERVER_MAX_GENERATIONS; ++slot) {
@@ -2448,26 +2100,6 @@ static bool any_generation_active(void) {
 
 /* ------------------------------------------------------------ event loop */
 
-static const char *find_header_value(const char *headers, const char *name) {
-    size_t name_length = strlen(name);
-    const char *line = headers;
-    while (line != NULL && *line != '\0') {
-        if (strncasecmp(line, name, name_length) == 0 &&
-            line[name_length] == ':') {
-            const char *value = line + name_length + 1;
-            while (*value == ' ' || *value == '\t') {
-                ++value;
-            }
-            return value;
-        }
-        line = strstr(line, "\r\n");
-        if (line != NULL) {
-            line += 2;
-        }
-    }
-    return NULL;
-}
-
 /* Serve GET /metrics as a Prometheus text exposition. */
 static void connection_serve_metrics(server_connection *conn) {
     uint32_t running = 0;
@@ -2662,7 +2294,7 @@ static int connection_read(server_connection *conn) {
             return -1;
         }
         const char *length_header =
-            find_header_value(conn->in.data, "Content-Length");
+            kipp_http_header_value(conn->in.data, "Content-Length");
         *split = '\r';
         if (length_header != NULL) {
             char *end = NULL;

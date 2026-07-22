@@ -37,8 +37,10 @@ CORE_HEADERS := src/kipp.h src/kipp_backend.h src/kipp_checkpoints.h \
 CLI_OBJECTS := $(BUILD_DIR)/kipp_cli.o $(BUILD_DIR)/kipp_spec.o \
 	$(BUILD_DIR)/kipp_kv_pool.o
 SERVER_OBJECTS := $(BUILD_DIR)/kipp_server.o $(BUILD_DIR)/kipp_chat.o \
+	$(BUILD_DIR)/kipp_json.o $(BUILD_DIR)/kipp_http.o \
 	$(BUILD_DIR)/kipp_kv_pool.o
-TEST_SUPPORT_SOURCES := src/kipp_chat.c src/kipp_spec.c src/kipp_kv_pool.c
+TEST_SUPPORT_SOURCES := src/kipp_chat.c src/kipp_spec.c src/kipp_kv_pool.c \
+	src/kipp_json.c src/kipp_http.c
 
 all: cpu
 
@@ -56,7 +58,8 @@ $(BUILD_DIR)/kipp_cli.o: src/kipp_cli.c src/kipp.h | $(BUILD_DIR)
 $(BUILD_DIR)/kipp: $(BUILD_DIR)/kipp.o $(CLI_OBJECTS)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD_DIR)/kipp_server.o: src/kipp_server.c src/kipp.h src/kipp_chat.h | $(BUILD_DIR)
+$(BUILD_DIR)/kipp_server.o: src/kipp_server.c src/kipp.h src/kipp_chat.h \
+		src/kipp_json.h src/kipp_http.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_server.c -o $@
 
 $(BUILD_DIR)/kipp-server: $(BUILD_DIR)/kipp.o $(SERVER_OBJECTS)
@@ -117,7 +120,8 @@ $(BUILD_DIR)/kipp_test_metal: src/kipp.c src/kipp_chat.c src/kipp.h \
 		$(BUILD_DIR)/kipp_metal_bridge.o | $(BUILD_DIR)
 	xcrun --sdk macosx clang $(CPPFLAGS) $(CFLAGS) \
 		-DKIPP_TESTING -DKIPP_ENABLE_METAL src/kipp.c src/kipp_chat.c \
-		src/kipp_spec.c src/kipp_kv_pool.c tests/kipp_test.c \
+		src/kipp_spec.c src/kipp_kv_pool.c src/kipp_json.c \
+		src/kipp_http.c tests/kipp_test.c \
 		$(BUILD_DIR)/kipp_metal_bridge.o $(LDLIBS) $(METAL_FRAMEWORKS) -o $@
 
 test: $(BUILD_DIR)/kipp_test test-tools
@@ -258,6 +262,12 @@ $(BUILD_DIR)/kipp_cuda_test.o: tests/kipp_test.c src/kipp.h src/kipp_chat.h \
 $(BUILD_DIR)/kipp_chat.o: src/kipp_chat.c src/kipp_chat.h src/kipp.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_chat.c -o $@
 
+$(BUILD_DIR)/kipp_json.o: src/kipp_json.c src/kipp_json.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_json.c -o $@
+
+$(BUILD_DIR)/kipp_http.o: src/kipp_http.c src/kipp_http.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_http.c -o $@
+
 $(BUILD_DIR)/kipp_spec.o: src/kipp_spec.c src/kipp_spec.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_spec.c -o $@
 
@@ -272,6 +282,7 @@ $(BUILD_DIR)/kipp-server-cuda: $(BUILD_DIR)/kipp_cuda_core.o \
 $(BUILD_DIR)/kipp_test_cuda: $(BUILD_DIR)/kipp_cuda_test_core.o \
 		$(BUILD_DIR)/kipp_cuda_test.o $(BUILD_DIR)/kipp_chat.o \
 		$(BUILD_DIR)/kipp_spec.o $(BUILD_DIR)/kipp_kv_pool.o \
+		$(BUILD_DIR)/kipp_json.o $(BUILD_DIR)/kipp_http.o \
 		$(BUILD_DIR)/kipp_cuda_bridge_generic.o \
 		$(BUILD_DIR)/kipp_cuda_kernels_generic.o
 	$(NVCC) $(NVCCFLAGS) $(CUDA_GENERIC_ARCH_FLAGS) $^ $(LDLIBS) -o $@
