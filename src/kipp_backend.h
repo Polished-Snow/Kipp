@@ -144,6 +144,15 @@ typedef struct {
      * with private slabs (their identity table lives in the backend).
      */
     const uint32_t *block_table;
+    /*
+     * Multi-row calls default to the bitwise decode-order contract: every
+     * logit row reproduces per-token evaluation exactly (speculative verify
+     * depends on it). When set, the backend may batch or reorder reductions
+     * for the rows and guarantee them only within its documented tolerance
+     * (kipp_session_eval_scored: perplexity and prompt logprobs). The CPU
+     * oracle ignores the flag; its scalar order is the reference either way.
+     */
+    bool relaxed_order;
 } kipp_eval_item;
 
 typedef struct {

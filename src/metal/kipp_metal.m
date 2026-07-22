@@ -599,6 +599,47 @@ static void metal_encode_swiglu(id<MTLComputeCommandEncoder> target,
 }
 
 /*
+ * Final logits for one finishing part. Single-row finishes (decode, plain
+ * prefill) and forced-vector rounds (speculative verify) keep the tiled
+ * vector matvec, whose reduction order matches decode bitwise. Relaxed
+ * multi-row finishes with a matrix-capable device route the 151,936-row
+ * lm_head through the simdgroup-matrix kernel instead; lm_head is always
+ * BF16 (loader contract), so only the BF16 matmul and a BF16 staging pass
+ * are ever needed.
+ */
+static void metal_encode_lm_head(id<MTLComputeCommandEncoder> target,
+                                 KippMetalModel *model,
+                                 KippMetalSession *workspace,
+                                 NSUInteger logitsOffset, uint32_t rows,
+                                 bool forceVector) {
+    const kipp_tensor_view *lmHead = &model.view->weights.lm_head;
+    uint32_t columns = model.config.embedding_length;
+    if (!model.matrixKernelAvailable || forceVector ||
+        rows < KIPP_METAL_TOKEN_TILE) {
+        metal_encode_matvec(target, model, lmHead, workspace.normalized,
+                            model.batchLogits, logitsOffset, KIPP_VOCAB_SIZE,
+                            columns, rows);
+        return;
+    }
+    metal_encode_stage(target, model, workspace, workspace.normalized,
+                       columns * rows);
+    metal_matvec_params params = {KIPP_VOCAB_SIZE, columns, rows};
+    NSUInteger rowGroups = (KIPP_VOCAB_SIZE + 127u) / 128u;
+    NSUInteger tokenGroups = ((NSUInteger)rows + 15u) / 16u;
+    metal_enc_groups(
+        target, metal_pipeline(model, @"kipp_matmul_bf16"), rowGroups,
+        tokenGroups, KIPP_METAL_GROUP_THREADS,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+          [encoder setBuffer:model.weights
+                      offset:metal_weight_offset(model, lmHead)
+                     atIndex:0];
+          [encoder setBuffer:workspace.staging offset:0 atIndex:1];
+          [encoder setBuffer:model.batchLogits offset:logitsOffset atIndex:2];
+          [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        });
+}
+
+/*
  * One part of a round: a contiguous run of workspace token slots that
  * belongs to one session's KV timeline. finishLogits is set when the last
  * slot of this part completes its eval item.
@@ -761,10 +802,8 @@ static int metal_encode_round(KippMetalModel *model,
         metal_encode_norm(encoder, model, workspace.x, firstOffset,
                           &model.view->weights.output_norm,
                           workspace.normalized, config.embedding_length, rows);
-        metal_encode_matvec(encoder, model, &model.view->weights.lm_head,
-                            workspace.normalized, model.batchLogits,
-                            p->logitsOffset, KIPP_VOCAB_SIZE,
-                            config.embedding_length, rows);
+        metal_encode_lm_head(encoder, model, workspace, p->logitsOffset,
+                             rows, forceVector);
     }
 
     [encoder endEncoding];
@@ -1296,8 +1335,13 @@ static int metal_eval(void *backendModel, kipp_eval_item *items,
             };
             memcpy(session.tokens.contents, item->tokens + done,
                    (size_t)batch * sizeof(uint32_t));
-            if (metal_encode_round(model, session, &part, 1, batch, rows > 1,
-                                   error) != 0) {
+            /* Multi-row rounds force the vector kernels so every logit row
+             * reproduces the decode path bitwise (the speculative-verify
+             * contract). Scored evaluation (relaxed_order) opts out and
+             * takes the matrix kernels within the 1e-4 tolerance. */
+            bool forceVector = rows > 1 && !item->relaxed_order;
+            if (metal_encode_round(model, session, &part, 1, batch,
+                                   forceVector, error) != 0) {
                 if (!session.pooled) {
                     session.length = initialLength;
                 }
