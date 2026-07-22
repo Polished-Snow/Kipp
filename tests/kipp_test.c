@@ -2,6 +2,8 @@
 
 #include "kipp.h"
 #include "kipp_chat.h"
+#include "kipp_http.h"
+#include "kipp_json.h"
 #include "kipp_kv_pool.h"
 #include "kipp_spec.h"
 #ifdef KIPP_ENABLE_METAL
@@ -347,6 +349,153 @@ static void test_gguf_reject_fuzz(void) {
         CHECK(error.code != KIPP_OK);
         CHECK(unlink(path) == 0);
     }
+}
+
+/*
+ * The JSON parser reads untrusted request bodies, so fuzz it the same way
+ * the tokenizer and GGUF loader are fuzzed: deterministic xorshift rounds
+ * alternating between mutated valid documents (to get past the first
+ * bytes) and pure garbage. Sanitizer builds are the real oracle; here we
+ * assert no crash, a sane result type, and clean rejection of trailing
+ * garbage and depth bombs.
+ */
+static void test_json_parse_fuzz(void) {
+    static const char *const corpus[] = {
+        ("{\"prompt\": \"The capital of France is\", \"max_tokens\": 8, "
+         "\"temperature\": 0, \"stop\": [\"\\n\"], "
+         "\"logit_bias\": {\"42\": -1.5}}"),
+        ("{\"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], "
+         "\"stream\": true, \"chat_template_kwargs\": "
+         "{\"enable_thinking\": false}}"),
+        ("[[1, 2.5, -3e-2], {\"k\": [null, true, false]}, \"\\u00e9\", "
+         "\"\\ud83d\\ude00\", \"\\\\\\\"\\n\"]"),
+        "{\"a\": {\"b\": {\"c\": [0, 1e10, -0.25, 151935]}}}",
+    };
+    uint64_t state = UINT64_C(0x9e3779b97f4a7c15);
+    char buffer[512];
+
+    /* The unmutated corpus must parse. */
+    for (size_t doc = 0; doc < sizeof(corpus) / sizeof(corpus[0]); ++doc) {
+        kipp_json_value value;
+        CHECK(kipp_json_parse(corpus[doc], strlen(corpus[doc]), &value));
+        CHECK(value.type == KIPP_JSON_OBJECT ||
+              value.type == KIPP_JSON_ARRAY);
+        kipp_json_free(&value);
+    }
+
+    /* Trailing garbage and over-deep nesting are rejections. */
+    kipp_json_value rejected;
+    CHECK(!kipp_json_parse("{} x", 4, &rejected));
+    char deep[2 * (KIPP_JSON_DEPTH_LIMIT + 8)];
+    size_t half = KIPP_JSON_DEPTH_LIMIT + 8;
+    for (size_t index = 0; index < half; ++index) {
+        deep[index] = '[';
+        deep[half + index] = ']';
+    }
+    CHECK(!kipp_json_parse(deep, sizeof(deep), &rejected));
+
+    for (int round = 0; round < 400; ++round) {
+        size_t length;
+        if (round % 2 == 0) {
+            const char *doc =
+                corpus[fuzz_next(&state) %
+                       (sizeof(corpus) / sizeof(corpus[0]))];
+            length = strlen(doc);
+            memcpy(buffer, doc, length);
+            size_t mutations = 1 + fuzz_next(&state) % 4;
+            for (size_t index = 0; index < mutations; ++index) {
+                switch (fuzz_next(&state) % 3) {
+                case 0: /* flip a byte */
+                    buffer[fuzz_next(&state) % length] =
+                        (char)(fuzz_next(&state) & 0xff);
+                    break;
+                case 1: /* truncate */
+                    length = 1 + fuzz_next(&state) % length;
+                    break;
+                default: /* duplicate a prefix byte at the end */
+                    if (length + 1 < sizeof(buffer)) {
+                        buffer[length] =
+                            buffer[fuzz_next(&state) % length];
+                        ++length;
+                    }
+                    break;
+                }
+            }
+        } else {
+            length = 1 + fuzz_next(&state) % 256;
+            for (size_t index = 0; index < length; ++index) {
+                buffer[index] = (char)(fuzz_next(&state) & 0xff);
+            }
+        }
+        kipp_json_value value;
+        if (kipp_json_parse(buffer, length, &value)) {
+            CHECK(value.type <= KIPP_JSON_OBJECT);
+            kipp_json_free(&value);
+        }
+    }
+}
+
+/*
+ * Header lookup scans raw network bytes; fuzz it with hostile header
+ * blocks and require that any returned pointer lands inside the input.
+ */
+static void test_http_header_fuzz(void) {
+    uint64_t state = UINT64_C(0xda3e39cb94b95bdb);
+    char buffer[512];
+    for (int round = 0; round < 400; ++round) {
+        size_t length = 0;
+        if (round % 2 == 0) {
+            /* Plausible header lines with mutations. */
+            static const char *const lines[] = {
+                "Content-Length: 42\r\n",
+                "content-length:9\r\n",
+                "CONTENT-TYPE: application/json\r\n",
+                "X-Long-Name-That-Never-Matches-Anything: v\r\n",
+                "NoColonHere\r\n",
+                "Content-Length\r: 7\r\n",
+                ": empty-name\r\n",
+                "\r\n",
+            };
+            size_t line_count = 1 + fuzz_next(&state) % 6;
+            for (size_t index = 0; index < line_count; ++index) {
+                const char *line =
+                    lines[fuzz_next(&state) %
+                          (sizeof(lines) / sizeof(lines[0]))];
+                size_t line_length = strlen(line);
+                if (length + line_length + 1 >= sizeof(buffer)) {
+                    break;
+                }
+                memcpy(buffer + length, line, line_length);
+                length += line_length;
+            }
+            if (length > 0 && fuzz_next(&state) % 4 == 0) {
+                buffer[fuzz_next(&state) % length] =
+                    (char)(fuzz_next(&state) & 0xff);
+            }
+        } else {
+            length = fuzz_next(&state) % 400;
+            for (size_t index = 0; index < length; ++index) {
+                char byte = (char)(fuzz_next(&state) & 0xff);
+                buffer[index] = byte == '\0' ? ' ' : byte;
+            }
+        }
+        buffer[length] = '\0';
+        static const char *const names[] = {"Content-Length",
+                                            "Content-Type", "Host"};
+        for (size_t name = 0; name < 3; ++name) {
+            const char *value =
+                kipp_http_header_value(buffer, names[name]);
+            CHECK(value == NULL ||
+                  (value >= buffer && value <= buffer + length));
+        }
+    }
+
+    /* Deterministic behavior checks. */
+    const char *block =
+        "Host: localhost\r\ncontent-length:  17\r\nX: y\r\n";
+    const char *value = kipp_http_header_value(block, "Content-Length");
+    CHECK(value != NULL && strncmp(value, "17", 2) == 0);
+    CHECK(kipp_http_header_value(block, "Accept") == NULL);
 }
 
 static void test_sampler(void) {
@@ -2666,6 +2815,8 @@ int main(int argc, char **argv) {
     RUN(test_pretokenizer_fuzz);
     RUN(test_nfc_fuzz);
     RUN(test_gguf_reject_fuzz);
+    RUN(test_json_parse_fuzz);
+    RUN(test_http_header_fuzz);
     RUN(test_sampler);
     RUN(test_sample_ex);
     RUN(test_public_argument_checks);

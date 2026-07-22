@@ -64,6 +64,8 @@ class ServerTests(unittest.TestCase):
                 BACKEND,
                 "--port",
                 str(port),
+                "--idle-timeout",
+                "5",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -355,6 +357,11 @@ class ServerTests(unittest.TestCase):
             "kipp_prompt_tokens_total",
             "kipp_generation_tokens_total",
             "kipp_requests_running",
+            "kipp_queue_wait_seconds_sum",
+            "kipp_queue_wait_seconds_count",
+            "kipp_ttft_seconds_sum",
+            "kipp_ttft_seconds_count",
+            "kipp_decode_seconds_sum",
         ):
             self.assertIn(metric, raw)
         line = [
@@ -362,6 +369,16 @@ class ServerTests(unittest.TestCase):
             if row.startswith("kipp_requests_total ")
         ][0]
         self.assertGreaterEqual(int(line.split()[1]), 1)
+
+        def sample(name: str) -> float:
+            row = [
+                r for r in raw.splitlines() if r.startswith(name + " ")
+            ][0]
+            return float(row.split()[1])
+
+        self.assertGreaterEqual(sample("kipp_ttft_seconds_count"), 1)
+        self.assertGreater(sample("kipp_ttft_seconds_sum"), 0.0)
+        self.assertGreaterEqual(sample("kipp_queue_wait_seconds_count"), 1)
 
     def test_chat_completion(self) -> None:
         status, body = self.chat(
@@ -477,6 +494,51 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("between 1 and 8", body["error"]["message"])
 
+    def test_choice_boundary_accepted(self) -> None:
+        status, body = self.completion(
+            prompt="hi", n=8, max_tokens=2, temperature=0
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["choices"]), 8)
+
+    def test_stop_boundary(self) -> None:
+        four = ["alpha", "beta", "gamma", "delta"]
+        status, _ = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, stop=four
+        )
+        self.assertEqual(status, 200)
+        status, body = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, stop=four + ["epsilon"]
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("stop", body["error"]["message"])
+
+    def test_logit_bias_boundary(self) -> None:
+        bias = {str(token): 1.0 for token in range(64)}
+        status, _ = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, logit_bias=bias
+        )
+        self.assertEqual(status, 200)
+        bias[str(64)] = 1.0
+        status, body = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, logit_bias=bias
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("logit_bias", body["error"]["message"])
+
+    def test_logit_bias_forces_token(self) -> None:
+        # +100 on <|endoftext|> dominates every greedy step, so the first
+        # sampled token is the stop token: empty text, finish "stop".
+        status, body = self.completion(
+            prompt="The capital of France is",
+            max_tokens=8,
+            temperature=0,
+            logit_bias={"151643": 100.0},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["text"], "")
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
     def test_streaming_multiple_choices(self) -> None:
         _, chunks, saw_done = self.stream_completion(
             prompt="The capital of France is", max_tokens=4, temperature=0,
@@ -517,6 +579,92 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(
                 body["choices"][0]["text"], serial[1]["choices"][0]["text"]
             )
+
+    def test_more_than_eight_concurrent_decode(self) -> None:
+        # 12 concurrent n=1 requests must all decode together now that the
+        # generation cap matches the 32-item batch limit (it was 8).
+        request = {
+            "prompt": "The capital of France is",
+            "max_tokens": 48,
+            "temperature": 0,
+        }
+        serial = self.completion(**request)
+        self.assertEqual(serial[0], 200)
+        running_high = {"value": 0}
+        stop_polling = {"value": False}
+
+        def poll_running() -> None:
+            import re
+
+            while not stop_polling["value"]:
+                try:
+                    _, text = self.raw_get("/metrics")
+                    match = re.search(
+                        r"^kipp_requests_running (\d+)$", text, re.M
+                    )
+                    if match:
+                        running_high["value"] = max(
+                            running_high["value"], int(match.group(1))
+                        )
+                except OSError:
+                    pass
+                time.sleep(0.05)
+
+        import threading
+
+        poller = threading.Thread(target=poll_running)
+        poller.start()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=12
+            ) as pool:
+                futures = [
+                    pool.submit(self.completion, **request)
+                    for _ in range(12)
+                ]
+                results = [f.result(timeout=300) for f in futures]
+        finally:
+            stop_polling["value"] = True
+            poller.join(timeout=10)
+        for status, body in results:
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                body["choices"][0]["text"], serial[1]["choices"][0]["text"]
+            )
+        self.assertGreaterEqual(running_high["value"], 9)
+
+    def test_idle_partial_header_is_reaped(self) -> None:
+        # A slow-loris client that sends part of a request line and stalls
+        # must be disconnected once the idle timeout (5s here) elapses.
+        host, port = self.base.replace("http://", "").split(":")
+        with socket.create_connection((host, int(port)), timeout=20) as raw:
+            raw.sendall(b"GET /healthz HTT")
+            raw.settimeout(20)
+            deadline = time.monotonic() + 15.0
+            closed = False
+            while time.monotonic() < deadline:
+                try:
+                    if raw.recv(64) == b"":
+                        closed = True
+                        break
+                except socket.timeout:
+                    break
+            self.assertTrue(closed, "server kept the stalled socket open")
+
+    def test_idle_silent_socket_is_reaped(self) -> None:
+        host, port = self.base.replace("http://", "").split(":")
+        with socket.create_connection((host, int(port)), timeout=20) as raw:
+            raw.settimeout(20)
+            deadline = time.monotonic() + 15.0
+            closed = False
+            while time.monotonic() < deadline:
+                try:
+                    if raw.recv(64) == b"":
+                        closed = True
+                        break
+                except socket.timeout:
+                    break
+            self.assertTrue(closed, "server kept the silent socket open")
 
     def test_concurrent_mixed_prompts(self) -> None:
         prompts = [
