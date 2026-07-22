@@ -64,6 +64,8 @@ class ServerTests(unittest.TestCase):
                 BACKEND,
                 "--port",
                 str(port),
+                "--idle-timeout",
+                "5",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -615,6 +617,39 @@ class ServerTests(unittest.TestCase):
                 body["choices"][0]["text"], serial[1]["choices"][0]["text"]
             )
         self.assertGreaterEqual(running_high["value"], 9)
+
+    def test_idle_partial_header_is_reaped(self) -> None:
+        # A slow-loris client that sends part of a request line and stalls
+        # must be disconnected once the idle timeout (5s here) elapses.
+        host, port = self.base.replace("http://", "").split(":")
+        with socket.create_connection((host, int(port)), timeout=20) as raw:
+            raw.sendall(b"GET /healthz HTT")
+            raw.settimeout(20)
+            deadline = time.monotonic() + 15.0
+            closed = False
+            while time.monotonic() < deadline:
+                try:
+                    if raw.recv(64) == b"":
+                        closed = True
+                        break
+                except socket.timeout:
+                    break
+            self.assertTrue(closed, "server kept the stalled socket open")
+
+    def test_idle_silent_socket_is_reaped(self) -> None:
+        host, port = self.base.replace("http://", "").split(":")
+        with socket.create_connection((host, int(port)), timeout=20) as raw:
+            raw.settimeout(20)
+            deadline = time.monotonic() + 15.0
+            closed = False
+            while time.monotonic() < deadline:
+                try:
+                    if raw.recv(64) == b"":
+                        closed = True
+                        break
+                except socket.timeout:
+                    break
+            self.assertTrue(closed, "server kept the silent socket open")
 
     def test_concurrent_mixed_prompts(self) -> None:
         prompts = [

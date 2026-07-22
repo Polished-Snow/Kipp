@@ -86,6 +86,14 @@ static struct {
 static bool server_pooled;
 static kipp_model *server_model; /* for pool stats at GET /metrics */
 
+/*
+ * Idle deadline for client-driven connection phases (reading a request,
+ * draining a response). WAITING and GENERATING are server-driven and
+ * exempt: a request queued behind admission back-pressure may legitimately
+ * wait for a long time. 0 disables the sweep.
+ */
+static long long server_idle_timeout_ns = 30LL * 1000000000LL;
+
 static void handle_stop_signal(int signal_number) {
     (void)signal_number;
     server_running = 0;
@@ -1083,6 +1091,7 @@ typedef struct server_connection {
     string_builder out;
     size_t out_sent;
     uint64_t arrival; /* admission FIFO order for waiting requests */
+    long long last_activity_ns;
     generation *gen;
 } server_connection;
 
@@ -2275,6 +2284,7 @@ static int connection_read(server_connection *conn) {
         if (memchr(chunk, '\0', (size_t)received) != NULL) {
             return -1;
         }
+        conn->last_activity_ns = now_ns();
         sb_append_bytes(&conn->in, chunk, (size_t)received);
         if (conn->in.failed ||
             conn->in.length > SERVER_HEADER_LIMIT + SERVER_BODY_LIMIT) {
@@ -2331,6 +2341,7 @@ static int connection_write(server_connection *conn) {
             }
             return -1;
         }
+        conn->last_activity_ns = now_ns();
         conn->out_sent += (size_t)written;
     }
     if (conn->out_sent == conn->out.length &&
@@ -2346,6 +2357,26 @@ static void serve(kipp_model *model, int listener) {
     }
     struct pollfd fds[1 + SERVER_MAX_CONNECTIONS];
     while (server_running) {
+        /* Reap connections whose client-driven phase has gone idle. */
+        bool sweep_eligible = false;
+        if (server_idle_timeout_ns > 0) {
+            long long now = now_ns();
+            for (uint32_t slot = 0; slot < SERVER_MAX_CONNECTIONS;
+                 ++slot) {
+                server_connection *conn = &connections[slot];
+                if (conn->fd < 0 ||
+                    (conn->phase != CONNECTION_READING &&
+                     conn->phase != CONNECTION_DRAINING)) {
+                    continue;
+                }
+                if (now - conn->last_activity_ns >
+                    server_idle_timeout_ns) {
+                    connection_close(conn);
+                } else {
+                    sweep_eligible = true;
+                }
+            }
+        }
         nfds_t count = 0;
         fds[count].fd = listener;
         fds[count].events = POLLIN;
@@ -2366,7 +2397,9 @@ static void serve(kipp_model *model, int listener) {
             poll_map[count] = (int)slot;
             ++count;
         }
-        int timeout = any_generation_active() ? 0 : -1;
+        int timeout = any_generation_active() ? 0
+                      : sweep_eligible          ? 1000
+                                                : -1;
         int ready = poll(fds, count, timeout);
         if (ready < 0 && errno != EINTR) {
             fprintf(stderr, "kipp-server: poll: %s\n", strerror(errno));
@@ -2396,6 +2429,7 @@ static void serve(kipp_model *model, int listener) {
                 memset(conn, 0, sizeof(*conn));
                 conn->fd = accepted;
                 conn->phase = CONNECTION_READING;
+                conn->last_activity_ns = now_ns();
             }
         }
         if (ready > 0) {
@@ -2475,7 +2509,7 @@ static void serve(kipp_model *model, int listener) {
 static void server_usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --model MODEL.gguf [--backend cpu|metal|cuda] "
-            "[--port N] [--kv-pool-mib N]\n"
+            "[--port N] [--kv-pool-mib N] [--idle-timeout SECONDS]\n"
             "Serves GET /healthz, GET /metrics, GET /v1/models, "
             "POST /v1/completions, and POST /v1/chat/completions "
             "on 127.0.0.1.\n"
@@ -2533,6 +2567,17 @@ int main(int argc, char **argv) {
                 server_usage(argv[0]);
                 return 1;
             }
+        } else if (strcmp(argv[index], "--idle-timeout") == 0 &&
+                   index + 1 < argc) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long seconds = strtoul(argv[++index], &end, 10);
+            if (errno != 0 || end == argv[index] || *end != '\0' ||
+                seconds > 86400) {
+                server_usage(argv[0]);
+                return 1;
+            }
+            server_idle_timeout_ns = (long long)seconds * 1000000000LL;
         } else {
             server_usage(argv[0]);
             return 1;
