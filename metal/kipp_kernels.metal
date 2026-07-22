@@ -894,8 +894,11 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
     simdgroup_barrier(mem_flags::mem_threadgroup);
 
     simdgroup_float8x8 out_acc[KIPP_HEAD_DIM / 8];
-    for (uint fragment = 0; fragment < KIPP_HEAD_DIM / 8; ++fragment) {
-        out_acc[fragment] = simdgroup_float8x8(0.0f);
+    /* `fragment` is a reserved MSL keyword; using it as an identifier makes
+     * the whole MMA library fail to compile at runtime and silently drops
+     * every matrix kernel to the vector path (found 2026-07-22). */
+    for (uint frag = 0; frag < KIPP_HEAD_DIM / 8; ++frag) {
+        out_acc[frag] = simdgroup_float8x8(0.0f);
     }
 
     /* The final tile can cover positions past the session's high-water
@@ -988,18 +991,18 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
             simdgroup_load(p_frag[column], &probs[column * 8u],
                            KIPP_FA_SCORE_STRIDE);
         }
-        for (uint fragment = 0; fragment < KIPP_HEAD_DIM / 8; ++fragment) {
-            simdgroup_multiply(out_acc[fragment], diag, out_acc[fragment]);
+        for (uint frag = 0; frag < KIPP_HEAD_DIM / 8; ++frag) {
+            simdgroup_multiply(out_acc[frag], diag, out_acc[frag]);
             for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
                 simdgroup_bfloat8x8 v_frag;
                 simdgroup_load(v_frag,
                                values + (ulong)(column * 8u) *
                                             KIPP_KV_VALUES_PER_TOKEN +
-                                   fragment * 8u,
+                                   frag * 8u,
                                KIPP_KV_VALUES_PER_TOKEN);
-                simdgroup_multiply_accumulate(out_acc[fragment],
+                simdgroup_multiply_accumulate(out_acc[frag],
                                               p_frag[column], v_frag,
-                                              out_acc[fragment]);
+                                              out_acc[frag]);
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1007,8 +1010,8 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
 
     /* Stage the tile's output and write the valid rows, dividing by each
      * query's softmax denominator on the way out. */
-    for (uint fragment = 0; fragment < KIPP_HEAD_DIM / 8; ++fragment) {
-        simdgroup_store(out_acc[fragment], &staged_out[fragment * 8u],
+    for (uint frag = 0; frag < KIPP_HEAD_DIM / 8; ++frag) {
+        simdgroup_store(out_acc[frag], &staged_out[frag * 8u],
                         KIPP_HEAD_DIM);
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);

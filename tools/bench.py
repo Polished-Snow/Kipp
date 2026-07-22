@@ -193,6 +193,17 @@ def run_once(
             "benchmark output is missing KIPP_METRIC on stderr\n"
             f"{stderr}"
         )
+    # Tripwire: the Metal bridge falls back to vector kernels when the MMA
+    # pipeline fails to compile, printing this warning. A silent fallback
+    # once contaminated a whole benchmark campaign (2026-07-22, a reserved
+    # MSL keyword disabled every matrix kernel for two days) -- refuse to
+    # record numbers from a degraded build.
+    if requested_backend == "metal" and "matrix kernel unavailable" in stderr:
+        raise RuntimeError(
+            "Metal matrix kernels failed to compile (vector fallback "
+            "active); fix the kernel source before benchmarking:\n"
+            + stderr[:1000]
+        )
     (
         metric_backend,
         prefill_tokens,
