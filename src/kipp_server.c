@@ -74,6 +74,13 @@ static struct {
     uint64_t prompt_tokens_total;
     uint64_t generation_tokens_total;
     uint64_t prefix_tokens_reused_total;
+    /* Latency accumulators (seconds); export as SUM/COUNT pairs so
+     * dashboards derive averages and rates without histogram buckets. */
+    double queue_wait_seconds_sum;
+    uint64_t queue_wait_count;
+    double ttft_seconds_sum; /* request received -> first logits */
+    uint64_t ttft_count;
+    double decode_seconds_sum; /* first logits -> finish (successes) */
 } server_metrics;
 
 /*
@@ -1063,6 +1070,7 @@ typedef struct {
     bool uses_cache;
     uint64_t id;
     long long created;
+    long long received_ns;     /* copied from the connection at admission */
     long long admitted_ns;     /* prompt clock start */
     long long prefill_done_ns; /* first sample begins here */
     size_t longest_stop;
@@ -1091,6 +1099,7 @@ typedef struct server_connection {
     string_builder out;
     size_t out_sent;
     uint64_t arrival; /* admission FIFO order for waiting requests */
+    long long received_ns; /* full request parsed; queue-wait clock start */
     long long last_activity_ns;
     generation *gen;
 } server_connection;
@@ -1488,6 +1497,13 @@ static void generation_fail(generation *gen, const char *detail) {
 static void generation_finish(generation *gen) {
     server_connection *conn = gen->conn;
     long long finish_ns = now_ns();
+    if (gen->prefill_done_ns > 0) {
+        server_metrics.ttft_seconds_sum +=
+            (double)(gen->prefill_done_ns - gen->received_ns) / 1e9;
+        ++server_metrics.ttft_count;
+        server_metrics.decode_seconds_sum +=
+            (double)(finish_ns - gen->prefill_done_ns) / 1e9;
+    }
     bool want_logprobs = gen->request.logprobs_enabled;
     for (uint32_t choice = 0; choice < gen->choice_count; ++choice) {
         if (gen->choices[choice].finish_reason == NULL) {
@@ -1828,7 +1844,11 @@ static int generation_admit(kipp_model *model, server_connection *conn) {
 admitted:
     gen->id = ++completion_counter;
     gen->created = (long long)time(NULL);
+    gen->received_ns = conn->received_ns;
     gen->admitted_ns = now_ns();
+    server_metrics.queue_wait_seconds_sum +=
+        (double)(gen->admitted_ns - gen->received_ns) / 1e9;
+    ++server_metrics.queue_wait_count;
     uint64_t seed_base = gen->request.seed != 0
                              ? gen->request.seed
                              : (uint64_t)time(NULL) * 2654435761u + gen->id;
@@ -2166,6 +2186,37 @@ static void connection_serve_metrics(server_connection *conn) {
         "# HELP kipp_requests_waiting Parsed requests awaiting admission\n"
         "# TYPE kipp_requests_waiting gauge\nkipp_requests_waiting %u\n",
         running, running_choices, waiting);
+    sb_append_format(&body,
+                     "# HELP kipp_queue_wait_seconds_sum Seconds requests "
+                     "spent parsed but unadmitted\n"
+                     "# TYPE kipp_queue_wait_seconds_sum counter\n"
+                     "kipp_queue_wait_seconds_sum %.6f\n",
+                     server_metrics.queue_wait_seconds_sum);
+    sb_append_format(&body,
+                     "# HELP kipp_queue_wait_seconds_count Requests "
+                     "admitted (queue-wait samples)\n"
+                     "# TYPE kipp_queue_wait_seconds_count counter\n"
+                     "kipp_queue_wait_seconds_count %llu\n",
+                     (unsigned long long)server_metrics.queue_wait_count);
+    sb_append_format(&body,
+                     "# HELP kipp_ttft_seconds_sum Seconds from request "
+                     "received to first logits\n"
+                     "# TYPE kipp_ttft_seconds_sum counter\n"
+                     "kipp_ttft_seconds_sum %.6f\n",
+                     server_metrics.ttft_seconds_sum);
+    sb_append_format(&body,
+                     "# HELP kipp_ttft_seconds_count Completed generations "
+                     "(TTFT samples)\n"
+                     "# TYPE kipp_ttft_seconds_count counter\n"
+                     "kipp_ttft_seconds_count %llu\n",
+                     (unsigned long long)server_metrics.ttft_count);
+    sb_append_format(&body,
+                     "# HELP kipp_decode_seconds_sum Seconds spent decoding "
+                     "after first logits; rate() against "
+                     "kipp_generation_tokens_total for decode speed\n"
+                     "# TYPE kipp_decode_seconds_sum counter\n"
+                     "kipp_decode_seconds_sum %.6f\n",
+                     server_metrics.decode_seconds_sum);
     kipp_kv_pool_stats_public pool_stats;
     if (server_pooled &&
         kipp_model_kv_pool_stats(server_model, &pool_stats) == 0) {
@@ -2247,6 +2298,7 @@ static void connection_route(server_connection *conn) {
                 strcmp(conn->path, "/v1/chat/completions") == 0)) {
         conn->phase = CONNECTION_WAITING;
         conn->arrival = ++arrival_counter;
+        conn->received_ns = now_ns();
     } else if (strcmp(conn->path, "/healthz") == 0 ||
                strcmp(conn->path, "/v1/models") == 0 ||
                strcmp(conn->path, "/v1/completions") == 0 ||

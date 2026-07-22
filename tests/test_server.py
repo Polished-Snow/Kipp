@@ -357,6 +357,11 @@ class ServerTests(unittest.TestCase):
             "kipp_prompt_tokens_total",
             "kipp_generation_tokens_total",
             "kipp_requests_running",
+            "kipp_queue_wait_seconds_sum",
+            "kipp_queue_wait_seconds_count",
+            "kipp_ttft_seconds_sum",
+            "kipp_ttft_seconds_count",
+            "kipp_decode_seconds_sum",
         ):
             self.assertIn(metric, raw)
         line = [
@@ -364,6 +369,16 @@ class ServerTests(unittest.TestCase):
             if row.startswith("kipp_requests_total ")
         ][0]
         self.assertGreaterEqual(int(line.split()[1]), 1)
+
+        def sample(name: str) -> float:
+            row = [
+                r for r in raw.splitlines() if r.startswith(name + " ")
+            ][0]
+            return float(row.split()[1])
+
+        self.assertGreaterEqual(sample("kipp_ttft_seconds_count"), 1)
+        self.assertGreater(sample("kipp_ttft_seconds_sum"), 0.0)
+        self.assertGreaterEqual(sample("kipp_queue_wait_seconds_count"), 1)
 
     def test_chat_completion(self) -> None:
         status, body = self.chat(
