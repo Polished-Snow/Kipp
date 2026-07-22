@@ -25,19 +25,25 @@
   </a>
 </p>
 
-> **Status (v0.0.2):** Kipp targets the **pinned Qwen3 dense family**
+> **Status (v0.0.2 + main):** Kipp targets the **pinned Qwen3 dense family**
 > (0.6B–32B, base + instruct) through a compiled-in checkpoint registry —
 > strict validation, per-checkpoint pinned revisions and hashes, one shared
 > forward pass. Validated checkpoints run on the CPU oracle plus **Metal** on
-> Apple M5 or **CUDA** on an NVIDIA A100; registry-only entries are not
+> Apple M5 or **CUDA** on an NVIDIA H100; registry-only entries are not
 > presented as validated. Kipp runs
-> **BF16, Q8_0, and 4-bit affine** weights — from near-lossless Q8 to a
-> smaller Q4-class option, with ~1.6–2× faster decode and larger checkpoints
-> under Apple's Metal single-buffer cap. The server speaks the OpenAI
-> **Completions and Chat Completions** subset (SSE streaming, batched
-> multi-sequence decode, serial prefix reuse), a full sampling surface
-> (temperature, top-p, top-k, min-p, penalties, logit_bias, seed), and a
-> Prometheus `/metrics` endpoint.
+> **BF16, Q8_0, and 4-bit affine** weights — from near-lossless Q8
+> (+0.02% wikitext-2 perplexity) to a smaller Q4-class option (+5.7%),
+> with ~1.6–2.2× faster decode, quantized prefill at BF16 parity on the
+> simdgroup-matrix kernels, and larger checkpoints
+> under Apple's Metal single-buffer cap. The CLI has a multi-turn
+> **`--chat` REPL** (suffix-only KV evaluation across turns) and a
+> wikitext **`--ppl`** perplexity mode. The server speaks the OpenAI
+> **Completions and Chat Completions** subset (SSE streaming, 32-way
+> batched multi-sequence decode, idle-connection reaping), a full sampling
+> surface (temperature, top-p, top-k, min-p, penalties, logit_bias, seed),
+> and a Prometheus `/metrics` endpoint with latency counters — with
+> **cross-request KV prefix caching** on CPU/Metal through a
+> content-addressed block pool, gated against unshared evaluation.
 
 ## What is Kipp?
 

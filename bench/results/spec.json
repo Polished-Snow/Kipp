@@ -1,0 +1,82 @@
+{
+  "engine": {
+    "backend": "metal",
+    "binary": "build/kipp-metal",
+    "commit": "8a04db95b27141350469c6091bf24e0004a9c6be",
+    "dirty": false,
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
+  },
+  "hardware": {
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "processor": "Apple M5 Max",
+    "gpu_cores": 40,
+    "unified_memory_bytes": 137438953472
+  },
+  "model": {
+    "artifact_bytes": 4642894144,
+    "checkpoint": "qwen3-4b-base",
+    "repository": "Qwen/Qwen3-4B-Base",
+    "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+    "format": "GGUF-v3 Kipp Qwen3 subset",
+    "sha256": "e81b9066347d9e3ab1c22058ac7de5792a6a78f41ce408d187421b620de0bc96",
+    "scheme": "q8_0"
+  },
+  "configuration": {
+    "decode": 256,
+    "runs": 3,
+    "warmup_runs": 1,
+    "gate": "off",
+    "paired_baseline": true
+  },
+  "workloads": {
+    "repetitive": {
+      "baseline_decode_tps": 90.57,
+      "spec_decode_tps": 189.76,
+      "speedup": 2.095,
+      "accept_rate": 1.0,
+      "block_efficiency": 4.0,
+      "drafted": 192,
+      "accepted": 192,
+      "draft_steps": 64,
+      "plain_steps": 0,
+      "draft_duty": 1.0
+    },
+    "code": {
+      "baseline_decode_tps": 59.82,
+      "spec_decode_tps": 43.78,
+      "speedup": 0.732,
+      "accept_rate": 0.149,
+      "block_efficiency": 1.567,
+      "drafted": 511,
+      "accepted": 76,
+      "draft_steps": 68,
+      "plain_steps": 66,
+      "draft_duty": 0.507
+    },
+    "grounded": {
+      "baseline_decode_tps": 84.87,
+      "spec_decode_tps": 22.63,
+      "speedup": 0.267,
+      "accept_rate": 0.023,
+      "block_efficiency": 1.069,
+      "drafted": 353,
+      "accepted": 8,
+      "draft_steps": 46,
+      "plain_steps": 70,
+      "draft_duty": 0.397
+    },
+    "chat": {
+      "baseline_decode_tps": 95.91,
+      "spec_decode_tps": 59.88,
+      "speedup": 0.624,
+      "accept_rate": 0.037,
+      "block_efficiency": 1.069,
+      "drafted": 54,
+      "accepted": 2,
+      "draft_steps": 7,
+      "plain_steps": 22,
+      "draft_duty": 0.241
+    }
+  }
+}

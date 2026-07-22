@@ -1,0 +1,36 @@
+{
+  "description": "Mutation study: seeded CPU paged-KV addressing faults vs gate families. fault-reference = identity-mapped session logits vs stateless reference, 96-token/3-block sequence, NMSE<=1e-6 + argmax. paged-cpu = bitwise scramble gate, reversed 3-block table.",
+  "engine_commit": "9cb357d09a488e13278afb969223f40288b41578",
+  "faults": {
+    "control": {
+      "reference_nmse": 0.0,
+      "argmax_match": true,
+      "tolerance_gate_detects": false,
+      "scramble_gate_detects": false
+    },
+    "read-block": {
+      "reference_nmse": 0.00693325094,
+      "argmax_match": true,
+      "tolerance_gate_detects": true,
+      "scramble_gate_detects": false
+    },
+    "read-slot": {
+      "reference_nmse": 0.0155477635,
+      "argmax_match": true,
+      "tolerance_gate_detects": true,
+      "scramble_gate_detects": false
+    },
+    "rollover": {
+      "reference_nmse": 0.0,
+      "argmax_match": true,
+      "tolerance_gate_detects": false,
+      "scramble_gate_detects": true
+    },
+    "swap-kv": {
+      "reference_nmse": 1.56496754,
+      "argmax_match": false,
+      "tolerance_gate_detects": true,
+      "scramble_gate_detects": false
+    }
+  }
+}

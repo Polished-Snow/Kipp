@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define KIPP_VERSION "0.0.2"
+#define KIPP_VERSION "0.0.3"
 
 /*
  * Family-invariant Qwen3 dense dimensions. Everything that varies between
@@ -96,6 +96,17 @@ typedef struct {
 int kipp_model_open(const char *path, kipp_model **out_model, kipp_error *error);
 int kipp_model_open_backend(const char *path, kipp_backend_kind backend,
                             kipp_model **out_model, kipp_error *error);
+/*
+ * Like kipp_model_open_backend, but backs every session with one shared KV
+ * slab of kv_pool_blocks 32-token blocks and enables cross-session prefix
+ * sharing: a finished session's full blocks are published to a
+ * content-addressed pool, and a later session can adopt a matching prefix
+ * with kipp_session_match_prefix instead of re-evaluating it. CPU and Metal;
+ * CUDA returns KIPP_ERROR_UNSUPPORTED. kv_pool_blocks must be nonzero.
+ */
+int kipp_model_open_pooled(const char *path, kipp_backend_kind backend,
+                           uint32_t kv_pool_blocks, kipp_model **out_model,
+                           kipp_error *error);
 int kipp_model_close(kipp_model *model, kipp_error *error);
 int kipp_model_get_info(const kipp_model *model, kipp_model_info *out_info);
 /* Nonzero when generation should stop after sampling this token. */
@@ -156,6 +167,41 @@ int kipp_session_eval(kipp_session *session, const uint32_t *tokens,
 int kipp_session_eval_n(kipp_session *session, const uint32_t *tokens,
                         size_t token_count, float *logits, uint32_t rows,
                         kipp_error *error);
+
+/*
+ * Like kipp_session_eval_n, but the rows are guaranteed to match
+ * single-token evaluation only within the backend's documented tolerance:
+ * the backend may batch the rows through kernels whose parallel reduction
+ * order differs from decode. Use for scoring — perplexity and prompt
+ * logprobs — where logits feed tolerance-based math. Speculative-decode
+ * verification must keep using kipp_session_eval_n, whose rows reproduce
+ * the decode path bitwise so greedy arg max ties cannot flip.
+ */
+int kipp_session_eval_scored(kipp_session *session, const uint32_t *tokens,
+                             size_t token_count, float *logits, uint32_t rows,
+                             kipp_error *error);
+
+/*
+ * On a fresh (length 0) session of a pooled model: adopt the longest
+ * published prefix of `tokens` from the pool — whole 32-token blocks only,
+ * capped one token short of token_count so evaluation always has a token
+ * left to produce logits. Evaluation then resumes at *matched_tokens.
+ * Sessions of non-pooled models return KIPP_ERROR_UNSUPPORTED.
+ */
+int kipp_session_match_prefix(kipp_session *session, const uint32_t *tokens,
+                              size_t token_count, uint32_t *matched_tokens,
+                              kipp_error *error);
+
+/* Pool occupancy and reuse counters for a pooled model. */
+typedef struct kipp_kv_pool_stats_public {
+    uint32_t total_blocks;
+    uint32_t free_blocks;
+    uint64_t reused_blocks_total;
+    uint64_t evicted_blocks_total;
+} kipp_kv_pool_stats_public;
+
+int kipp_model_kv_pool_stats(const kipp_model *model,
+                             kipp_kv_pool_stats_public *out_stats);
 
 /*
  * Evaluate several sessions in one backend call. Each item appends its

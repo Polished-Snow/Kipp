@@ -23,6 +23,22 @@ build/kipp --backend cpu \
 On Apple Silicon, replace `make cpu` with `make metal` and use
 `build/kipp-metal --backend metal`.
 
+## Interactive chat (instruct checkpoints)
+
+`--chat` runs a multi-turn REPL through the native Qwen3 ChatML renderer,
+reusing the session KV cache across turns (only each turn's new bytes are
+evaluated). Type `exit` or press Ctrl-D to quit:
+
+```bash
+build/kipp-metal --backend metal \
+  --model models/qwen3-4b-instruct-2507/kipp-qwen3-4b-instruct-2507-bf16.gguf \
+  --chat --system "You are terse." --temperature 0.7
+```
+
+`--no-think` suppresses reasoning on the hybrid instruct checkpoints
+(Qwen3-X); the 2507 variants ignore it. `--ctx N` bounds the session KV
+(default 8192 tokens), and `--decode N` bounds each turn's reply.
+
 ## HTTP server
 
 Start the server on loopback:
@@ -50,7 +66,21 @@ curl --fail-with-body http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 The chat request uses SSE streaming. Add `-N` to `curl` to print each event as
-it arrives.
+it arrives. A streamed text completion with a trailing usage chunk:
+
+```bash
+curl -N --fail-with-body http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  --data @examples/http/completion-stream.json
+```
+
+Top-3 alternatives per generated token (legacy `logprobs` shape):
+
+```bash
+curl --fail-with-body http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  --data @examples/http/completion-logprobs.json
+```
 
 Inspect health and Prometheus metrics:
 

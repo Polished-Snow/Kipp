@@ -26,6 +26,65 @@ hardware, and must link the exact commands used.
 warm-up runs, captures the CLI's separate prefill and decode timers, samples
 peak process RSS with `/usr/bin/time -l`, and reports the median, median
 absolute deviation, minimum, maximum, and each raw run as JSON.
+`bench/spec_bench.py`, `bench/server_bench.py`, `bench/prefix_bench.py`,
+`bench/load_bench.py`, and `bench/ppl_bench.py` cover speculation, server
+batching, cross-request prefix reuse, open-loop serving load, and
+quantization quality; all record the full engine/hardware/model provenance
+block via `bench/_provenance.py`.
+
+All numbers are **sustained steady-state** measurements: Apple-silicon GPU
+clocks are demand-scaled, so benches run on an otherwise idle machine,
+back-to-back in one session after a multi-minute GPU warm-up, and a file is
+trusted only when its recorded dispersion is tight (see `bench/README.md`,
+"Measurement protocol").
+
+## Apple M5 Max (v0.0.3 measurement campaign, 2026-07-22)
+
+The development machine changed from a base M5 (10-core GPU, 24 GiB) to an
+M5 Max (40-core GPU, 128 GB); throughput is roughly 4× the sections below,
+which are retained for the base-M5 configuration. An earlier 2026-07-21
+campaign was measured on a build whose Metal matrix kernels had silently
+failed to compile (a reserved MSL keyword; every correctness gate still
+passed) — those numbers are superseded, and the harness now refuses to
+record results from a fallback build. Current reference numbers
+(Qwen3-4B, Metal, greedy; every value traces to a committed
+`bench/results/*.json`):
+
+- Decode tok/s (64 tokens, median of 5): BF16 **60.7**, Q8_0 **97.9**,
+  affine4 **130**.
+- Wikitext-2 perplexity (full test set, 2,048-token windows): BF16
+  **7.731**, Q8_0 **7.733** (+0.02%), affine4 **8.171** (+5.7%) — Q8_0 is
+  effectively lossless; affine4 is Q4-class.
+- Prefill tok/s (348-token / 2,048-token prompt): BF16 **528 / 481**,
+  Q8_0 **488 / 441**, affine4 **509 / 466**. The simdgroup-matrix kernels
+  dequantize once per 16-token tile, so quantized prefill stays near BF16
+  parity; the O(n²) attention tail brings Q8_0 prefill from ~485 tok/s at
+  short context to **177 tok/s** at 12,800 tokens.
+- Context scaling (Q8_0): decode 98.4 → 26.0 tok/s from a 3- to a
+  12,800-token prompt (`ctx-*.json`).
+- Model-size sweep (BF16 decode): 0.6B **269**, 4B **60.7**, 8B **33.5**
+  tok/s — bandwidth-bound decode scales inversely with streamed weight
+  bytes across the family (8B Q8_0: 57.8 tok/s; 8B prefill 316/331).
+- Server aggregate (Q8_0, sampled, 48 tokens/sequence): n = 1/2/4/8
+  choices → 76.9/96.8/89.8/80.1 tok/s; 1/2/4/8 concurrent connections →
+  55.9/61.3/78.5/80.8. Aggregate flattens as per-step scheduling gaps let
+  the demand-scaled GPU clocks sag — a consumer-SoC serving effect.
+- Cross-request prefix reuse: a 6,890-token prompt sent twice adopts 6,880
+  tokens on the second request; prefill drops 30.4 s → 174 ms (**175×**
+  TTFT).
+- Speculation (Q8_0, 256-token decode, paired-baseline A/B): adaptive-gated
+  **2.27×** on repetitive text, **above parity on code (1.24×)**, and a
+  **0.84×** floor elsewhere (ungated: 2.10× / down to 0.27×). Gains are
+  smaller than earlier drafts because the sampling fast path made the
+  plain-decode baseline itself faster.
+- llama.cpp A/B (same weights/host, pinned commit, same session,
+  `llamacpp-qwen3-4b.json`): Kipp decode 60.7/97.9 vs llama.cpp 35.0/56.5
+  (BF16/Q8_0, ~1.7× in Kipp's favor); llama.cpp Q4_0 decodes 89.1 vs
+  affine4's 130 (schemes differ). llama.cpp prefill is ~4.5× faster at a
+  matched 2,048-token prompt (2,174 vs 481 BF16).
+- CUDA revalidation (`cuda-h100-gates.json`): all four default checkpoints
+  pass `--model` and `--phase4-cuda` on an ephemeral NVIDIA H100 80GB
+  (worst observed NMSE 5.9e-7 against the CPU oracle).
 
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 

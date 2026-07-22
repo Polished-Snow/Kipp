@@ -64,6 +64,8 @@ class ServerTests(unittest.TestCase):
                 BACKEND,
                 "--port",
                 str(port),
+                "--idle-timeout",
+                "5",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -129,6 +131,16 @@ class ServerTests(unittest.TestCase):
 
     def chat(self, **fields) -> tuple[int, dict]:
         return self.post("/v1/chat/completions", fields)
+
+    def metric_values(self) -> dict[str, int]:
+        import re
+
+        status, text = self.raw_get("/metrics")
+        self.assertEqual(status, 200)
+        return {
+            match.group(1): int(match.group(2))
+            for match in re.finditer(r"^(kipp_\w+) (\d+)$", text, re.M)
+        }
 
     def test_healthz(self) -> None:
         status, body = self.get("/healthz")
@@ -345,6 +357,11 @@ class ServerTests(unittest.TestCase):
             "kipp_prompt_tokens_total",
             "kipp_generation_tokens_total",
             "kipp_requests_running",
+            "kipp_queue_wait_seconds_sum",
+            "kipp_queue_wait_seconds_count",
+            "kipp_ttft_seconds_sum",
+            "kipp_ttft_seconds_count",
+            "kipp_decode_seconds_sum",
         ):
             self.assertIn(metric, raw)
         line = [
@@ -352,6 +369,16 @@ class ServerTests(unittest.TestCase):
             if row.startswith("kipp_requests_total ")
         ][0]
         self.assertGreaterEqual(int(line.split()[1]), 1)
+
+        def sample(name: str) -> float:
+            row = [
+                r for r in raw.splitlines() if r.startswith(name + " ")
+            ][0]
+            return float(row.split()[1])
+
+        self.assertGreaterEqual(sample("kipp_ttft_seconds_count"), 1)
+        self.assertGreater(sample("kipp_ttft_seconds_sum"), 0.0)
+        self.assertGreaterEqual(sample("kipp_queue_wait_seconds_count"), 1)
 
     def test_chat_completion(self) -> None:
         status, body = self.chat(
@@ -467,6 +494,51 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("between 1 and 8", body["error"]["message"])
 
+    def test_choice_boundary_accepted(self) -> None:
+        status, body = self.completion(
+            prompt="hi", n=8, max_tokens=2, temperature=0
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["choices"]), 8)
+
+    def test_stop_boundary(self) -> None:
+        four = ["alpha", "beta", "gamma", "delta"]
+        status, _ = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, stop=four
+        )
+        self.assertEqual(status, 200)
+        status, body = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, stop=four + ["epsilon"]
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("stop", body["error"]["message"])
+
+    def test_logit_bias_boundary(self) -> None:
+        bias = {str(token): 1.0 for token in range(64)}
+        status, _ = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, logit_bias=bias
+        )
+        self.assertEqual(status, 200)
+        bias[str(64)] = 1.0
+        status, body = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, logit_bias=bias
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("logit_bias", body["error"]["message"])
+
+    def test_logit_bias_forces_token(self) -> None:
+        # +100 on <|endoftext|> dominates every greedy step, so the first
+        # sampled token is the stop token: empty text, finish "stop".
+        status, body = self.completion(
+            prompt="The capital of France is",
+            max_tokens=8,
+            temperature=0,
+            logit_bias={"151643": 100.0},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["text"], "")
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
     def test_streaming_multiple_choices(self) -> None:
         _, chunks, saw_done = self.stream_completion(
             prompt="The capital of France is", max_tokens=4, temperature=0,
@@ -507,6 +579,92 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(
                 body["choices"][0]["text"], serial[1]["choices"][0]["text"]
             )
+
+    def test_more_than_eight_concurrent_decode(self) -> None:
+        # 12 concurrent n=1 requests must all decode together now that the
+        # generation cap matches the 32-item batch limit (it was 8).
+        request = {
+            "prompt": "The capital of France is",
+            "max_tokens": 48,
+            "temperature": 0,
+        }
+        serial = self.completion(**request)
+        self.assertEqual(serial[0], 200)
+        running_high = {"value": 0}
+        stop_polling = {"value": False}
+
+        def poll_running() -> None:
+            import re
+
+            while not stop_polling["value"]:
+                try:
+                    _, text = self.raw_get("/metrics")
+                    match = re.search(
+                        r"^kipp_requests_running (\d+)$", text, re.M
+                    )
+                    if match:
+                        running_high["value"] = max(
+                            running_high["value"], int(match.group(1))
+                        )
+                except OSError:
+                    pass
+                time.sleep(0.05)
+
+        import threading
+
+        poller = threading.Thread(target=poll_running)
+        poller.start()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=12
+            ) as pool:
+                futures = [
+                    pool.submit(self.completion, **request)
+                    for _ in range(12)
+                ]
+                results = [f.result(timeout=300) for f in futures]
+        finally:
+            stop_polling["value"] = True
+            poller.join(timeout=10)
+        for status, body in results:
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                body["choices"][0]["text"], serial[1]["choices"][0]["text"]
+            )
+        self.assertGreaterEqual(running_high["value"], 9)
+
+    def test_idle_partial_header_is_reaped(self) -> None:
+        # A slow-loris client that sends part of a request line and stalls
+        # must be disconnected once the idle timeout (5s here) elapses.
+        host, port = self.base.replace("http://", "").split(":")
+        with socket.create_connection((host, int(port)), timeout=20) as raw:
+            raw.sendall(b"GET /healthz HTT")
+            raw.settimeout(20)
+            deadline = time.monotonic() + 15.0
+            closed = False
+            while time.monotonic() < deadline:
+                try:
+                    if raw.recv(64) == b"":
+                        closed = True
+                        break
+                except socket.timeout:
+                    break
+            self.assertTrue(closed, "server kept the stalled socket open")
+
+    def test_idle_silent_socket_is_reaped(self) -> None:
+        host, port = self.base.replace("http://", "").split(":")
+        with socket.create_connection((host, int(port)), timeout=20) as raw:
+            raw.settimeout(20)
+            deadline = time.monotonic() + 15.0
+            closed = False
+            while time.monotonic() < deadline:
+                try:
+                    if raw.recv(64) == b"":
+                        closed = True
+                        break
+                except socket.timeout:
+                    break
+            self.assertTrue(closed, "server kept the silent socket open")
 
     def test_concurrent_mixed_prompts(self) -> None:
         prompts = [
@@ -574,6 +732,192 @@ class ServerTests(unittest.TestCase):
             finally:
                 error.close()
         self.assertEqual(status, 405)
+
+    # ------------------------------------------------ pooled prefix sharing
+
+    POOL_PROMPT = (
+        "the quick brown fox jumps over the lazy dog and " * 9
+    )  # 100+ tokens: several whole 32-token blocks publish at release
+
+    def test_pool_cross_request_reuse(self) -> None:
+        first = self.completion(
+            prompt=self.POOL_PROMPT, max_tokens=8, temperature=0
+        )
+        self.assertEqual(first[0], 200)
+        before = self.metric_values()
+        second = self.completion(
+            prompt=self.POOL_PROMPT, max_tokens=8, temperature=0
+        )
+        self.assertEqual(second[0], 200)
+        after = self.metric_values()
+        self.assertEqual(
+            first[1]["choices"][0]["text"], second[1]["choices"][0]["text"]
+        )
+        self.assertGreater(
+            after["kipp_prefix_tokens_reused_total"],
+            before["kipp_prefix_tokens_reused_total"],
+        )
+        self.assertGreater(
+            after["kipp_kv_pool_reused_blocks_total"],
+            before["kipp_kv_pool_reused_blocks_total"],
+        )
+
+    def test_pool_multi_choice(self) -> None:
+        single = self.completion(
+            prompt=self.POOL_PROMPT, max_tokens=6, temperature=0
+        )
+        status, body = self.completion(
+            prompt=self.POOL_PROMPT, max_tokens=6, temperature=0, n=4
+        )
+        self.assertEqual(status, 200)
+        texts = {choice["text"] for choice in body["choices"]}
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(texts.pop(), single[1]["choices"][0]["text"])
+
+    def test_pool_disconnect_releases(self) -> None:
+        idle_free = self.metric_values()["kipp_kv_pool_blocks_free"]
+        connection = http.client.HTTPConnection(
+            self.base.removeprefix("http://"), timeout=300
+        )
+        connection.request(
+            "POST",
+            "/v1/completions",
+            body=json.dumps(
+                {
+                    "prompt": self.POOL_PROMPT,
+                    "max_tokens": 200,
+                    "temperature": 0,
+                    "stream": True,
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        reply = connection.getresponse()
+        reply.read(64)  # receive a little, then vanish
+        connection.close()
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            if (
+                self.metric_values()["kipp_kv_pool_blocks_free"]
+                >= idle_free
+            ):
+                break
+            time.sleep(0.5)
+        self.assertGreaterEqual(
+            self.metric_values()["kipp_kv_pool_blocks_free"], idle_free
+        )
+        before = self.metric_values()["kipp_kv_pool_reused_blocks_total"]
+        status, body = self.completion(
+            prompt=self.POOL_PROMPT, max_tokens=4, temperature=0
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["choices"][0]["text"])
+        self.assertGreater(
+            self.metric_values()["kipp_kv_pool_reused_blocks_total"], before
+        )
+
+
+class TinyPoolTests(unittest.TestCase):
+    """Pool pressure: admission is delayed, never corrupted.
+
+    A second server with a pool of only a few blocks forces concurrent
+    requests to queue behind the block reservation. Every request must
+    complete with its isolated-run output; delayed admission shows up as
+    latency, never as a 5xx or wrong text.
+    """
+
+    process: subprocess.Popen
+    base: str
+
+    # One 4B block is 4.5 MiB of KV; 18 MiB = 4 blocks, enough for one
+    # ~40-token request (2 blocks) plus one more reserving behind it.
+    POOL_MIB = 18
+    PROMPTS = [
+        "The capital of France is famous for its museums and",
+        "Water is composed of hydrogen and oxygen, which means",
+        "Once upon a time in a village by the sea there",
+        "The theory of relativity fundamentally changed how we",
+    ]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not BINARY.is_file():
+            raise unittest.SkipTest(f"server binary {BINARY} is not built")
+        if not MODEL.is_file():
+            raise unittest.SkipTest(f"model artifact {MODEL} is missing")
+        port = free_port()
+        cls.base = f"http://127.0.0.1:{port}"
+        cls.process = subprocess.Popen(
+            [
+                str(BINARY),
+                "--model",
+                str(MODEL),
+                "--backend",
+                BACKEND,
+                "--port",
+                str(port),
+                "--kv-pool-mib",
+                str(cls.POOL_MIB),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            if cls.process.poll() is not None:
+                raise RuntimeError("tiny-pool server exited during startup")
+            try:
+                with urllib.request.urlopen(
+                    cls.base + "/healthz", timeout=2
+                ):
+                    return
+            except OSError:
+                time.sleep(0.25)
+        raise RuntimeError("tiny-pool server did not become healthy")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.process.poll() is None:
+            cls.process.send_signal(signal.SIGTERM)
+            cls.process.wait(timeout=30)
+
+    def completion(self, **fields) -> tuple[int, dict]:
+        request = urllib.request.Request(
+            self.base + "/v1/completions",
+            data=json.dumps(fields).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as reply:
+                return reply.status, json.load(reply)
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, json.load(error)
+            finally:
+                error.close()
+
+    def test_pressure_delays_but_never_corrupts(self) -> None:
+        isolated = []
+        for prompt in self.PROMPTS:
+            status, body = self.completion(
+                prompt=prompt, max_tokens=8, temperature=0
+            )
+            self.assertEqual(status, 200)
+            isolated.append(body["choices"][0]["text"])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(
+                    self.completion,
+                    prompt=prompt,
+                    max_tokens=8,
+                    temperature=0,
+                )
+                for prompt in self.PROMPTS
+            ]
+            results = [f.result(timeout=300) for f in futures]
+        for expected, (status, body) in zip(isolated, results):
+            self.assertEqual(status, 200)
+            self.assertEqual(body["choices"][0]["text"], expected)
 
 
 if __name__ == "__main__":

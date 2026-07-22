@@ -13,9 +13,18 @@ import resource
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "bench"))
+from _provenance import (  # noqa: E402
+    checked_command_text,
+    engine_metadata,
+    hardware_metadata,
+    model_metadata,
+)
 
 METRIC_PATTERN = re.compile(
     r"KIPP_METRIC backend=(\w+) prefill_tokens=(\d+) "
@@ -51,22 +60,6 @@ class Measurement:
                 raise RuntimeError("CUDA measurement is missing peak device memory")
             result["peak_device_bytes"] = self.peak_device_bytes
         return result
-
-
-def checked_command_text(command: list[str]) -> str:
-    try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True, check=True
-        )
-    except FileNotFoundError as error:
-        raise RuntimeError(f"required tool {command[0]!r} was not found") from error
-    except subprocess.CalledProcessError as error:
-        detail = (error.stderr or error.stdout or "").strip()
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(
-            f"{command[0]} exited {error.returncode}{suffix}"
-        ) from error
-    return completed.stdout.strip()
 
 
 def cuda_process_bytes(nvidia_smi: str, pid: int) -> int | None:
@@ -200,6 +193,17 @@ def run_once(
             "benchmark output is missing KIPP_METRIC on stderr\n"
             f"{stderr}"
         )
+    # Tripwire: the Metal bridge falls back to vector kernels when the MMA
+    # pipeline fails to compile, printing this warning. A silent fallback
+    # once contaminated a whole benchmark campaign (2026-07-22, a reserved
+    # MSL keyword disabled every matrix kernel for two days) -- refuse to
+    # record numbers from a degraded build.
+    if requested_backend == "metal" and "matrix kernel unavailable" in stderr:
+        raise RuntimeError(
+            "Metal matrix kernels failed to compile (vector fallback "
+            "active); fix the kernel source before benchmarking:\n"
+            + stderr[:1000]
+        )
     (
         metric_backend,
         prefill_tokens,
@@ -237,132 +241,6 @@ def summarize(values: list[float]) -> dict[str, float]:
         "minimum": min(values),
         "maximum": max(values),
     }
-
-
-def git_metadata(root: pathlib.Path) -> tuple[str, bool]:
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return (
-        revision.stdout.strip() if revision.returncode == 0 else "uncommitted",
-        bool(status.stdout.strip()) if status.returncode == 0 else True,
-    )
-
-
-def command_text(command: list[str]) -> str:
-    try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True, check=False
-        )
-    except OSError:
-        return f"unknown ({command[0]} unavailable)"
-    if completed.returncode != 0:
-        return f"unknown ({command[0]} exited {completed.returncode})"
-    return completed.stdout.strip()
-
-
-def macos_hardware_metadata() -> dict[str, object]:
-    memory_text = command_text(["sysctl", "-n", "hw.memsize"])
-    gpu_cores: int | str = "unknown"
-    profiler = command_text(["system_profiler", "SPDisplaysDataType", "-json"])
-    try:
-        displays = json.loads(profiler)["SPDisplaysDataType"]
-        gpu_cores = int(displays[0]["sppci_cores"])
-    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-        pass
-    return {
-        "platform": platform.platform(),
-        "processor": command_text(["sysctl", "-n", "machdep.cpu.brand_string"]),
-        "gpu_cores": gpu_cores,
-        "unified_memory_bytes": (
-            int(memory_text) if memory_text.isdigit() else memory_text
-        ),
-    }
-
-
-def linux_value(path: pathlib.Path, key: str) -> str | None:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return None
-    for line in lines:
-        name, separator, value = line.partition(":")
-        if separator and name.strip() == key:
-            return value.strip()
-    return None
-
-
-def linux_hardware_metadata() -> dict[str, object]:
-    processor = linux_value(pathlib.Path("/proc/cpuinfo"), "model name")
-    memory_text = linux_value(pathlib.Path("/proc/meminfo"), "MemTotal")
-    memory_match = (
-        re.fullmatch(r"(\d+)\s+kB", memory_text) if memory_text else None
-    )
-    return {
-        "platform": platform.platform(),
-        "processor": processor or platform.processor() or "unknown",
-        "memory_bytes": (
-            int(memory_match.group(1)) * 1024
-            if memory_match is not None
-            else "unknown"
-        ),
-    }
-
-
-def cuda_hardware_metadata(nvidia_smi: str) -> dict[str, object]:
-    gpu_output = checked_command_text(
-        [
-            nvidia_smi,
-            "--query-gpu=name,driver_version",
-            "--format=csv,noheader",
-        ]
-    )
-    gpu_names: list[str] = []
-    driver_versions: list[str] = []
-    for line in gpu_output.splitlines():
-        fields = [field.strip() for field in line.split(",", maxsplit=1)]
-        if len(fields) != 2:
-            raise RuntimeError(f"could not parse nvidia-smi GPU metadata: {line!r}")
-        gpu_names.append(fields[0])
-        driver_versions.append(fields[1])
-    if not gpu_names:
-        raise RuntimeError("nvidia-smi reported no NVIDIA GPUs")
-
-    nvcc_output = command_text(["nvcc", "--version"])
-    nvcc_lines = nvcc_output.splitlines()
-    return {
-        "gpu_name": "; ".join(gpu_names),
-        "gpu_driver": "; ".join(dict.fromkeys(driver_versions)),
-        "nvcc_version": nvcc_lines[-1] if nvcc_lines else "unknown",
-    }
-
-
-def hardware_metadata(
-    backend: str = "metal", nvidia_smi: str | None = None
-) -> dict[str, object]:
-    system = platform.system()
-    if system == "Darwin":
-        metadata = macos_hardware_metadata()
-    elif system == "Linux":
-        metadata = linux_hardware_metadata()
-    else:
-        raise RuntimeError(f"unsupported benchmark platform {system!r}")
-    if backend == "cuda":
-        if nvidia_smi is None:
-            raise RuntimeError("CUDA benchmarking requires nvidia-smi in PATH")
-        metadata.update(cuda_hardware_metadata(nvidia_smi))
-    return metadata
 
 
 def main() -> None:
@@ -431,29 +309,9 @@ def main() -> None:
             )
         )
 
-    revision, dirty = git_metadata(root)
-    compiler_command = ["clang", "--version"]
-    if args.backend == "cuda":
-        compiler_command = ["nvcc", "--version"]
-    compiler_lines = command_text(compiler_command).splitlines() or [
-        "unknown (no compiler version output)"
-    ]
-    compiler = compiler_lines[-1] if args.backend == "cuda" else compiler_lines[0]
     report = {
-        "engine": {
-            "commit": revision,
-            "dirty": dirty,
-            "backend": args.backend,
-            "binary": str(binary),
-            "compiler": compiler,
-            "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
-        },
-        "model": {
-            "repository": "Qwen/Qwen3-4B-Base",
-            "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
-            "format": "BF16 Kipp GGUF-v3",
-            "artifact_bytes": model.stat().st_size,
-        },
+        "engine": engine_metadata(binary, args.backend, root),
+        "model": model_metadata(model),
         "hardware": hardware_metadata(args.backend, nvidia_smi),
         "configuration": {
             "prompt": args.prompt,

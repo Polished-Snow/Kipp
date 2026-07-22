@@ -138,14 +138,29 @@ struct kipp_model {
     void *backend_model;
     size_t active_session_count;
     kipp_backend_kind backend_kind;
+    kipp_kv_pool *kv_pool; /* NULL unless opened with kipp_model_open_pooled */
 };
 
+/*
+ * Pooled sessions (model->kv_pool != NULL) carry the sharing bookkeeping in
+ * the core: `timeline` records every evaluated token id, `block_ids` maps
+ * each logical block onto a pool block (this array is passed to the backend
+ * as the eval-item block table), and `adopted_blocks` counts the leading
+ * blocks adopted from the pool by kipp_session_match_prefix. Blocks a
+ * session writes stay private until reset/destroy publishes the full ones
+ * ("publish-at-finish"), which is what keeps truncation — speculative
+ * rollback — from ever landing inside a shared block.
+ */
 struct kipp_session {
     kipp_model *model;
     void *backend_session;
     uint32_t capacity;
     uint32_t length;
     uint64_t cache_bytes;
+    uint32_t *timeline;
+    uint32_t *block_ids;
+    uint32_t mapped_blocks;
+    uint32_t adopted_blocks;
 };
 
 static const kipp_backend_ops *cpu_backend_operations(void);
@@ -1154,8 +1169,9 @@ int kipp_model_open(const char *path, kipp_model **out_model, kipp_error *error)
     return kipp_model_open_backend(path, KIPP_BACKEND_CPU, out_model, error);
 }
 
-int kipp_model_open_backend(const char *path, kipp_backend_kind backend,
-                            kipp_model **out_model, kipp_error *error) {
+static int open_model(const char *path, kipp_backend_kind backend,
+                      uint32_t kv_pool_blocks, kipp_model **out_model,
+                      kipp_error *error) {
     struct stat status;
     kipp_model *model;
     const kipp_backend_ops *backend_ops;
@@ -1219,6 +1235,14 @@ int kipp_model_open_backend(const char *path, kipp_backend_kind backend,
     if (parse_model_mapping(model, error) != 0) {
         goto failure;
     }
+    model->view.config.kv_pool_blocks = kv_pool_blocks;
+    if (kv_pool_blocks != 0) {
+        model->kv_pool = kipp_kv_pool_create(kv_pool_blocks);
+        if (model->kv_pool == NULL) {
+            fail(error, KIPP_ERROR_MEMORY, "unable to allocate KV pool");
+            goto failure;
+        }
+    }
     if (model->backend_ops->model_create(&model->view, &model->backend_model,
                                          error) != 0) {
         goto failure;
@@ -1231,6 +1255,26 @@ failure:
     return -1;
 }
 
+int kipp_model_open_backend(const char *path, kipp_backend_kind backend,
+                            kipp_model **out_model, kipp_error *error) {
+    return open_model(path, backend, 0, out_model, error);
+}
+
+int kipp_model_open_pooled(const char *path, kipp_backend_kind backend,
+                           uint32_t kv_pool_blocks, kipp_model **out_model,
+                           kipp_error *error) {
+    clear_error(error);
+    if (kv_pool_blocks == 0) {
+        return fail(error, KIPP_ERROR_RANGE,
+                    "pooled models need at least one KV block");
+    }
+    if (backend != KIPP_BACKEND_CPU && backend != KIPP_BACKEND_METAL) {
+        return fail(error, KIPP_ERROR_UNSUPPORTED,
+                    "pooled KV is supported on the CPU and Metal backends");
+    }
+    return open_model(path, backend, kv_pool_blocks, out_model, error);
+}
+
 static void destroy_model(kipp_model *model) {
     if (model == NULL) {
         return;
@@ -1238,6 +1282,7 @@ static void destroy_model(kipp_model *model) {
     if (model->backend_ops != NULL && model->backend_model != NULL) {
         model->backend_ops->model_destroy(model->backend_model);
     }
+    kipp_kv_pool_destroy(model->kv_pool);
     free_tokenizer(&model->tokenizer);
     if (model->mapping != NULL) {
         (void)munmap(model->mapping, model->mapping_size);
@@ -2541,6 +2586,12 @@ static int cpu_forward(const kipp_model_view *view, const uint32_t *tokens,
 
 typedef struct {
     const kipp_model_view *view;
+    /* Pooled mode (config->kv_pool_blocks > 0): one shared KV slab, owned by
+     * the backend model; pooled sessions point into it and carry no storage
+     * of their own. */
+    uint16_t *pool_key_cache;
+    uint16_t *pool_value_cache;
+    uint32_t pool_slab_positions;
 } cpu_backend_model;
 
 /*
@@ -2564,6 +2615,9 @@ typedef struct {
     uint16_t *key_cache;
     uint16_t *value_cache;
     cpu_workspace workspace;
+    /* Pooled sessions borrow the model slab and the core's block table; the
+     * core owns length tracking and per-eval table contents. */
+    bool pooled;
 } cpu_backend_session;
 
 static uint64_t kv_cache_bytes_for_capacity(uint32_t block_count,
@@ -2594,6 +2648,73 @@ static size_t kv_cache_offset(const cpu_backend_session *session,
                                         physical_position, head, dimension);
 }
 
+#ifdef KIPP_FAULT_INJECT
+/*
+ * Mutation-study scaffolding: never compiled into production targets. The
+ * KIPP_FAULT environment variable seeds one deliberate KV-addressing bug so
+ * the gates' detection power can be measured. Faults are asymmetric (read
+ * side or write side only) because a mapping error applied identically to
+ * both sides is a consistent relocation, which placement invariance proves
+ * harmless — real paging bugs live in one side's copy of the indirection.
+ *
+ *   1  read-block:  attention reads resolve the next logical block.
+ *   2  read-slot:   attention reads resolve the next slot within the block.
+ *   3  rollover:    each block's first position is written one past the end
+ *                   of the previous logical block's physical block. Under
+ *                   the identity table those bytes land exactly where the
+ *                   position belongs, so no identity-mapped comparison can
+ *                   see it; any non-identity table corrupts.
+ *   4  swap-kv:     layer 0 writes keys into the value store and values
+ *                   into the key store.
+ */
+static int kipp_fault_selected(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *value = getenv("KIPP_FAULT");
+        mode = value == NULL ? 0 : atoi(value);
+    }
+    return mode;
+}
+
+static size_t kv_cache_offset_read(const cpu_backend_session *session,
+                                   uint32_t layer, uint32_t position,
+                                   uint32_t head, uint32_t dimension) {
+    uint32_t logical_block = position / KIPP_KV_BLOCK_TOKENS;
+    uint32_t slot = position % KIPP_KV_BLOCK_TOKENS;
+    if (kipp_fault_selected() == 1) {
+        logical_block = (logical_block + 1u) % session->block_capacity;
+    } else if (kipp_fault_selected() == 2) {
+        slot = (slot + 1u) % KIPP_KV_BLOCK_TOKENS;
+    } else {
+        return kv_cache_offset(session, layer, position, head, dimension);
+    }
+    uint32_t physical = session->block_table[logical_block];
+    uint32_t physical_position = physical * KIPP_KV_BLOCK_TOKENS + slot;
+    return kv_cache_offset_for_capacity(session->slab_positions, layer,
+                                        physical_position, head, dimension);
+}
+
+static size_t kv_cache_offset_write(const cpu_backend_session *session,
+                                    uint32_t layer, uint32_t position,
+                                    uint32_t head, uint32_t dimension) {
+    uint32_t logical_block = position / KIPP_KV_BLOCK_TOKENS;
+    uint32_t slot = position % KIPP_KV_BLOCK_TOKENS;
+    if (kipp_fault_selected() == 3 && slot == 0u && logical_block > 0u) {
+        uint32_t stale = session->block_table[logical_block - 1u];
+        uint32_t physical_position =
+            (stale * KIPP_KV_BLOCK_TOKENS + KIPP_KV_BLOCK_TOKENS) %
+            session->slab_positions;
+        return kv_cache_offset_for_capacity(session->slab_positions, layer,
+                                            physical_position, head,
+                                            dimension);
+    }
+    return kv_cache_offset(session, layer, position, head, dimension);
+}
+#else
+#define kv_cache_offset_read kv_cache_offset
+#define kv_cache_offset_write kv_cache_offset
+#endif
+
 static void cached_gqa(const cpu_backend_session *session, uint32_t layer,
                        uint32_t position, const float *query, float *output,
                        float *scores, uint32_t query_head_count) {
@@ -2609,7 +2730,7 @@ static void cached_gqa(const cpu_backend_session *session, uint32_t layer,
             query + (size_t)query_head * KIPP_ATTENTION_HEAD_DIM;
         for (uint32_t source = 0; source <= position; ++source) {
             size_t cache_base =
-                kv_cache_offset(session, layer, source, kv_head, 0);
+                kv_cache_offset_read(session, layer, source, kv_head, 0);
             float dot = 0.0f;
             for (uint32_t dimension = 0;
                  dimension < KIPP_ATTENTION_HEAD_DIM; ++dimension) {
@@ -2623,7 +2744,7 @@ static void cached_gqa(const cpu_backend_session *session, uint32_t layer,
             output + (size_t)query_head * KIPP_ATTENTION_HEAD_DIM;
         for (uint32_t source = 0; source <= position; ++source) {
             size_t cache_base =
-                kv_cache_offset(session, layer, source, kv_head, 0);
+                kv_cache_offset_read(session, layer, source, kv_head, 0);
             for (uint32_t dimension = 0;
                  dimension < KIPP_ATTENTION_HEAD_DIM; ++dimension) {
                 destination[dimension] +=
@@ -2678,15 +2799,23 @@ static int cpu_cached_token(const kipp_model_view *view,
         apply_rope(workspace->key, 1, KIPP_ATTENTION_HEAD_COUNT_KV, position,
                    config->rope_theta);
 
+        uint16_t *key_store = session->key_cache;
+        uint16_t *value_store = session->value_cache;
+#ifdef KIPP_FAULT_INJECT
+        if (kipp_fault_selected() == 4 && layer_index == 0) {
+            key_store = session->value_cache;
+            value_store = session->key_cache;
+        }
+#endif
         for (uint32_t head = 0; head < KIPP_ATTENTION_HEAD_COUNT_KV; ++head) {
             size_t cache_base =
-                kv_cache_offset(session, layer_index, position, head, 0);
+                kv_cache_offset_write(session, layer_index, position, head, 0);
             size_t state_base = (size_t)head * KIPP_ATTENTION_HEAD_DIM;
             for (uint32_t dimension = 0;
                  dimension < KIPP_ATTENTION_HEAD_DIM; ++dimension) {
-                session->key_cache[cache_base + dimension] =
+                key_store[cache_base + dimension] =
                     float_to_bf16(workspace->key[state_base + dimension]);
-                session->value_cache[cache_base + dimension] =
+                value_store[cache_base + dimension] =
                     float_to_bf16(workspace->value[state_base + dimension]);
             }
         }
@@ -2735,18 +2864,52 @@ static int cpu_backend_model_create(const kipp_model_view *view,
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "CPU backend model arguments are required");
     }
-    state = malloc(sizeof(*state));
+    state = calloc(1, sizeof(*state));
     if (state == NULL) {
         return fail(error, KIPP_ERROR_MEMORY,
                     "unable to allocate CPU backend model");
     }
     state->view = view;
+    if (view->config.kv_pool_blocks != 0) {
+        size_t positions =
+            (size_t)view->config.kv_pool_blocks * KIPP_KV_BLOCK_TOKENS;
+        size_t elements;
+        size_t bytes;
+        if (positions > UINT32_MAX ||
+            !checked_multiply_size(view->config.block_count, positions,
+                                   &elements) ||
+            !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_COUNT_KV,
+                                   &elements) ||
+            !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_DIM,
+                                   &elements) ||
+            !checked_multiply_size(elements, sizeof(uint16_t), &bytes)) {
+            free(state);
+            return fail(error, KIPP_ERROR_MEMORY, "KV pool size overflows");
+        }
+        state->pool_slab_positions = (uint32_t)positions;
+        state->pool_key_cache = malloc(bytes);
+        state->pool_value_cache = malloc(bytes);
+        if (state->pool_key_cache == NULL ||
+            state->pool_value_cache == NULL) {
+            free(state->pool_key_cache);
+            free(state->pool_value_cache);
+            free(state);
+            return fail(error, KIPP_ERROR_MEMORY,
+                        "unable to allocate pooled KV slab");
+        }
+    }
     *backend_model = state;
     return 0;
 }
 
 static void cpu_backend_model_destroy(void *backend_model) {
-    free(backend_model);
+    cpu_backend_model *state = backend_model;
+    if (state == NULL) {
+        return;
+    }
+    free(state->pool_key_cache);
+    free(state->pool_value_cache);
+    free(state);
 }
 
 static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
@@ -2759,8 +2922,8 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "CPU backend session arguments are required");
     }
-    const kipp_model_config *config =
-        &((cpu_backend_model *)backend_model)->view->config;
+    cpu_backend_model *state = backend_model;
+    const kipp_model_config *config = &state->view->config;
     *backend_session = NULL;
     if (capacity == 0 || capacity > config->context_length) {
         return fail(error, KIPP_ERROR_RANGE,
@@ -2788,6 +2951,21 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
     session->capacity = capacity;
     session->block_count = config->block_count;
     session->block_capacity = block_capacity;
+    if (config->kv_pool_blocks != 0) {
+        /* Pooled: borrow the model slab; the core supplies a block table
+         * with every eval item, so no per-session storage exists. */
+        session->pooled = true;
+        session->slab_positions = state->pool_slab_positions;
+        session->key_cache = state->pool_key_cache;
+        session->value_cache = state->pool_value_cache;
+        if (allocate_workspace(&session->workspace, config, 1, capacity,
+                               error) != 0) {
+            free(session);
+            return -1;
+        }
+        *backend_session = session;
+        return 0;
+    }
     session->slab_positions = (uint32_t)slab_positions;
     session->slab_elements = elements;
     session->block_table = malloc((size_t)block_capacity *
@@ -2822,9 +3000,11 @@ static void cpu_backend_session_destroy(void *backend_session) {
     if (session == NULL) {
         return;
     }
-    free(session->block_table);
-    free(session->key_cache);
-    free(session->value_cache);
+    if (!session->pooled) {
+        free(session->block_table);
+        free(session->key_cache);
+        free(session->value_cache);
+    }
     free_workspace(&session->workspace);
     free(session);
 }
@@ -2845,6 +3025,10 @@ static int cpu_backend_session_truncate(void *backend_session,
     if (session == NULL) {
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "CPU backend session is required");
+    }
+    if (session->pooled) {
+        /* The core owns pooled length tracking and block release. */
+        return 0;
     }
     if (length > session->length) {
         return fail(error, KIPP_ERROR_RANGE,
@@ -2892,15 +3076,30 @@ static int cpu_backend_eval(void *backend_model, kipp_eval_item *items,
         }
 
         cpu_backend_session *session = item->session;
-        if (item->start_position != session->length) {
-            return fail(error, KIPP_ERROR_ARGUMENT,
-                        "start position %u does not match session length %u",
-                        item->start_position, session->length);
-        }
-        if (item->token_count > session->capacity - session->length) {
-            return fail(error, KIPP_ERROR_RANGE,
-                        "CPU session append exceeds capacity %u",
-                        session->capacity);
+        if (session->pooled) {
+            /* The core owns pooled length tracking and supplies the block
+             * table with every item. */
+            if (item->block_table == NULL) {
+                return fail(error, KIPP_ERROR_ARGUMENT,
+                            "pooled evaluation requires a block table");
+            }
+            if (item->token_count > session->capacity - item->start_position) {
+                return fail(error, KIPP_ERROR_RANGE,
+                            "CPU session append exceeds capacity %u",
+                            session->capacity);
+            }
+            session->block_table = (uint32_t *)item->block_table;
+        } else {
+            if (item->start_position != session->length) {
+                return fail(error, KIPP_ERROR_ARGUMENT,
+                            "start position %u does not match session length %u",
+                            item->start_position, session->length);
+            }
+            if (item->token_count > session->capacity - session->length) {
+                return fail(error, KIPP_ERROR_RANGE,
+                            "CPU session append exceeds capacity %u",
+                            session->capacity);
+            }
         }
         /* Logits are written for the last `rows` tokens, row-major. */
         uint32_t first_logit_token = item->token_count - rows;
@@ -2919,7 +3118,9 @@ static int cpu_backend_eval(void *backend_model, kipp_eval_item *items,
                 return -1;
             }
         }
-        session->length += item->token_count;
+        if (!session->pooled) {
+            session->length += item->token_count;
+        }
     }
     return 0;
 }
@@ -2965,6 +3166,53 @@ static uint64_t xorshift64_star(uint64_t *state) {
 
 static double uniform_unit(uint64_t *state) {
     return (double)(xorshift64_star(state) >> 11) / 9007199254740992.0;
+}
+
+/*
+ * Sampling scratch. kipp_sample_ex runs once per generated token per choice,
+ * and a fresh working-copy + candidate malloc/free pair per call dominated
+ * its cost at the full 151,936-entry vocabulary. The scratch is thread-local
+ * so the library stays safe if a host embeds it in threads, lazily grown to
+ * the largest vocabulary seen, and never shrunk or freed.
+ */
+static _Thread_local float *sample_working;
+static _Thread_local sample_candidate *sample_candidates;
+static _Thread_local size_t sample_scratch_count;
+
+static int ensure_sample_scratch(size_t logits_count, kipp_error *error) {
+    if (logits_count <= sample_scratch_count) {
+        return 0;
+    }
+    float *working = realloc(sample_working,
+                             logits_count * sizeof(*sample_working));
+    if (working == NULL) {
+        return fail(error, KIPP_ERROR_MEMORY,
+                    "unable to allocate sampling logits");
+    }
+    sample_working = working;
+    sample_candidate *candidates =
+        realloc(sample_candidates, logits_count * sizeof(*sample_candidates));
+    if (candidates == NULL) {
+        return fail(error, KIPP_ERROR_MEMORY,
+                    "unable to allocate sampling candidates");
+    }
+    sample_candidates = candidates;
+    sample_scratch_count = logits_count;
+    return 0;
+}
+
+/*
+ * Bias and penalties mutate logits, which forces the working copy; plain
+ * temperature sampling reads the caller's logits directly. Mirrors the
+ * no-op conditions of apply_bias_and_penalties exactly.
+ */
+static bool sample_needs_working_copy(const kipp_sample_params *params) {
+    bool has_penalty = params->frequency_penalty != 0.0f ||
+                       params->presence_penalty != 0.0f ||
+                       (params->repetition_penalty != 0.0f &&
+                        params->repetition_penalty != 1.0f);
+    return params->logit_bias_count > 0 ||
+           (params->recent_count > 0 && has_penalty);
 }
 
 /*
@@ -3028,40 +3276,46 @@ int kipp_sample_ex(const float *logits, size_t logits_count,
                     "logits, params, and an output token are required");
     }
 
-    /* Bias and penalties can reorder logits, so work on a copy. */
-    float *working = malloc(logits_count * sizeof(*working));
-    if (working == NULL) {
-        return fail(error, KIPP_ERROR_MEMORY,
-                    "unable to allocate sampling logits");
+    /*
+     * Bias and penalties can reorder logits, so they work on a copy; plain
+     * temperature sampling reads the caller's logits in place. The values
+     * are bitwise-identical either way (the copy is an exact memcpy), so
+     * every downstream draw matches the always-copy behavior exactly.
+     */
+    const float *values = logits;
+    if (sample_needs_working_copy(params)) {
+        if (ensure_sample_scratch(logits_count, error) != 0) {
+            return -1;
+        }
+        memcpy(sample_working, logits, logits_count * sizeof(*sample_working));
+        apply_bias_and_penalties(sample_working, logits_count, params);
+        values = sample_working;
     }
-    memcpy(working, logits, logits_count * sizeof(*working));
-    apply_bias_and_penalties(working, logits_count, params);
 
     size_t argmax = 0;
     for (size_t index = 1; index < logits_count; ++index) {
-        if (working[index] > working[argmax]) {
+        if (values[index] > values[argmax]) {
             argmax = index;
         }
     }
     if (params->temperature <= 0.0f) {
         *out_token = (uint32_t)argmax;
-        free(working);
         return 0;
     }
     if (!(params->top_p > 0.0f && params->top_p <= 1.0f)) {
-        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "top_p must be greater than 0 and at most 1");
     }
     if (params->min_p < 0.0f || params->min_p > 1.0f) {
-        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "min_p must be between 0 and 1");
     }
     if (rng_state == NULL || *rng_state == 0) {
-        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "sampling requires a nonzero RNG state");
+    }
+    if (ensure_sample_scratch(logits_count, error) != 0) {
+        return -1;
     }
 
     /*
@@ -3070,25 +3324,18 @@ int kipp_sample_ex(const float *logits, size_t logits_count,
      * skipping them keeps the sort small during ordinary decoding.
      */
     float inverse_temperature = 1.0f / params->temperature;
-    float scaled_maximum = working[argmax] * inverse_temperature;
+    float scaled_maximum = values[argmax] * inverse_temperature;
     float cutoff = scaled_maximum - 20.0f;
-    sample_candidate *candidates =
-        malloc(logits_count * sizeof(*candidates));
-    if (candidates == NULL) {
-        free(working);
-        return fail(error, KIPP_ERROR_MEMORY,
-                    "unable to allocate sampling candidates");
-    }
+    sample_candidate *candidates = sample_candidates;
     size_t candidate_count = 0;
     for (size_t index = 0; index < logits_count; ++index) {
-        float scaled = working[index] * inverse_temperature;
+        float scaled = values[index] * inverse_temperature;
         if (scaled >= cutoff) {
             candidates[candidate_count].token = (uint32_t)index;
             candidates[candidate_count].logit = scaled;
             ++candidate_count;
         }
     }
-    free(working);
     qsort(candidates, candidate_count, sizeof(*candidates),
           compare_sample_candidates);
 
@@ -3143,7 +3390,6 @@ int kipp_sample_ex(const float *logits, size_t logits_count,
             break;
         }
     }
-    free(candidates);
     *out_token = token;
     return 0;
 }
@@ -3183,9 +3429,77 @@ int kipp_model_eval(const kipp_model *model, const uint32_t *tokens,
         }
     }
     kipp_eval_item item = {
-        NULL, tokens, (uint32_t)token_count, 0, logits, 1,
+        NULL, tokens, (uint32_t)token_count, 0, logits, 1, NULL, false,
     };
     return model->backend_ops->eval(model->backend_model, &item, 1, error);
+}
+
+static bool session_is_pooled(const kipp_session *session) {
+    return session->model->kv_pool != NULL;
+}
+
+static uint32_t session_block_capacity(const kipp_session *session) {
+    return (session->capacity + KIPP_KV_BLOCK_TOKENS - 1) /
+           KIPP_KV_BLOCK_TOKENS;
+}
+
+/*
+ * Map every logical block covering positions [0, new_length) that is not yet
+ * mapped, claiming private pool blocks. On exhaustion the just-claimed blocks
+ * are released and the session is left untouched. Returns the previous
+ * mapped count through *first_new so a failed backend call can roll back.
+ */
+static int pooled_map_blocks(kipp_session *session, uint32_t new_length,
+                             uint32_t *first_new, kipp_error *error) {
+    kipp_kv_pool *pool = session->model->kv_pool;
+    uint32_t needed =
+        (new_length + KIPP_KV_BLOCK_TOKENS - 1) / KIPP_KV_BLOCK_TOKENS;
+    *first_new = session->mapped_blocks;
+    while (session->mapped_blocks < needed) {
+        uint32_t id = kipp_kv_pool_alloc(pool);
+        if (id == KIPP_KV_INVALID_BLOCK) {
+            while (session->mapped_blocks > *first_new) {
+                --session->mapped_blocks;
+                kipp_kv_pool_release(
+                    pool, session->block_ids[session->mapped_blocks]);
+            }
+            return fail(error, KIPP_ERROR_RANGE, "KV pool exhausted");
+        }
+        session->block_ids[session->mapped_blocks++] = id;
+    }
+    return 0;
+}
+
+static void pooled_unmap_from(kipp_session *session, uint32_t first_new) {
+    kipp_kv_pool *pool = session->model->kv_pool;
+    while (session->mapped_blocks > first_new) {
+        --session->mapped_blocks;
+        kipp_kv_pool_release(pool,
+                             session->block_ids[session->mapped_blocks]);
+    }
+}
+
+/*
+ * Publish-at-finish: seal each fully evaluated, non-adopted block so later
+ * sessions can adopt the prefix, then release every mapped block. Runs on
+ * reset and destroy — never mid-generation, which is what keeps truncation
+ * (speculative rollback) away from shared blocks.
+ */
+static void pooled_publish_and_release(kipp_session *session) {
+    kipp_kv_pool *pool = session->model->kv_pool;
+    uint32_t full_blocks = session->length / KIPP_KV_BLOCK_TOKENS;
+    uint64_t parent = 0;
+    for (uint32_t block = 0; block < full_blocks; ++block) {
+        const uint32_t *tokens =
+            session->timeline + (size_t)block * KIPP_KV_BLOCK_TOKENS;
+        if (block >= session->adopted_blocks) {
+            (void)kipp_kv_pool_seal(pool, session->block_ids[block], parent,
+                                    tokens);
+        }
+        parent = kipp_kv_pool_hash(parent, tokens, KIPP_KV_BLOCK_TOKENS);
+    }
+    pooled_unmap_from(session, 0);
+    session->adopted_blocks = 0;
 }
 
 int kipp_session_create(kipp_model *model, uint32_t capacity,
@@ -3209,9 +3523,26 @@ int kipp_session_create(kipp_model *model, uint32_t capacity,
     if (session == NULL) {
         return fail(error, KIPP_ERROR_MEMORY, "unable to allocate session");
     }
+    if (model->kv_pool != NULL) {
+        uint32_t blocks = (capacity + KIPP_KV_BLOCK_TOKENS - 1) /
+                          KIPP_KV_BLOCK_TOKENS;
+        session->timeline =
+            malloc((size_t)capacity * sizeof(*session->timeline));
+        session->block_ids =
+            malloc((size_t)blocks * sizeof(*session->block_ids));
+        if (session->timeline == NULL || session->block_ids == NULL) {
+            free(session->timeline);
+            free(session->block_ids);
+            free(session);
+            return fail(error, KIPP_ERROR_MEMORY,
+                        "unable to allocate pooled session bookkeeping");
+        }
+    }
     if (model->backend_ops->session_create(model->backend_model, capacity,
                                            &session->backend_session,
                                            error) != 0) {
+        free(session->timeline);
+        free(session->block_ids);
         free(session);
         return -1;
     }
@@ -3228,6 +3559,9 @@ int kipp_session_reset(kipp_session *session, kipp_error *error) {
     clear_error(error);
     if (session == NULL) {
         return fail(error, KIPP_ERROR_ARGUMENT, "session is required");
+    }
+    if (session_is_pooled(session)) {
+        pooled_publish_and_release(session);
     }
     if (session->model->backend_ops->session_reset(session->backend_session,
                                                    error) != 0) {
@@ -3253,6 +3587,20 @@ int kipp_session_truncate(kipp_session *session, uint32_t length,
         return fail(error, KIPP_ERROR_UNSUPPORTED,
                     "this backend does not support session truncation");
     }
+    if (session_is_pooled(session)) {
+        /* Publish-at-finish guarantees every block past the adopted prefix
+         * is private, so truncation only releases private blocks. */
+        if (length < session->adopted_blocks * KIPP_KV_BLOCK_TOKENS) {
+            return fail(error, KIPP_ERROR_RANGE,
+                        "cannot truncate into an adopted shared prefix");
+        }
+        uint32_t keep =
+            (length + KIPP_KV_BLOCK_TOKENS - 1) / KIPP_KV_BLOCK_TOKENS;
+        if (keep < session->adopted_blocks) {
+            keep = session->adopted_blocks;
+        }
+        pooled_unmap_from(session, keep);
+    }
     if (ops->session_truncate(session->backend_session, length, error) != 0) {
         return -1;
     }
@@ -3265,11 +3613,69 @@ void kipp_session_destroy(kipp_session *session) {
         return;
     }
     kipp_model *model = session->model;
+    if (session_is_pooled(session)) {
+        pooled_publish_and_release(session);
+    }
     model->backend_ops->session_destroy(session->backend_session);
     if (model->active_session_count > 0) {
         --model->active_session_count;
     }
+    free(session->timeline);
+    free(session->block_ids);
     free(session);
+}
+
+int kipp_session_match_prefix(kipp_session *session, const uint32_t *tokens,
+                              size_t token_count, uint32_t *matched_tokens,
+                              kipp_error *error) {
+    clear_error(error);
+    if (matched_tokens != NULL) {
+        *matched_tokens = 0;
+    }
+    if (session == NULL || tokens == NULL || token_count == 0) {
+        return fail(error, KIPP_ERROR_ARGUMENT,
+                    "session and tokens are required");
+    }
+    if (!session_is_pooled(session)) {
+        return fail(error, KIPP_ERROR_UNSUPPORTED,
+                    "prefix matching requires a pooled model");
+    }
+    if (session->length != 0 || session->mapped_blocks != 0) {
+        return fail(error, KIPP_ERROR_ARGUMENT,
+                    "prefix matching requires a fresh session");
+    }
+    if (token_count > session->capacity) {
+        token_count = session->capacity;
+    }
+    uint32_t matched = 0;
+    uint32_t blocks = kipp_kv_pool_prefix_match(
+        session->model->kv_pool, tokens, (uint32_t)token_count,
+        session->block_ids, session_block_capacity(session), &matched, NULL);
+    if (blocks != 0) {
+        memcpy(session->timeline, tokens,
+               (size_t)matched * sizeof(*session->timeline));
+        session->mapped_blocks = blocks;
+        session->adopted_blocks = blocks;
+        session->length = matched;
+    }
+    if (matched_tokens != NULL) {
+        *matched_tokens = matched;
+    }
+    return 0;
+}
+
+int kipp_model_kv_pool_stats(const kipp_model *model,
+                             kipp_kv_pool_stats_public *out_stats) {
+    if (model == NULL || out_stats == NULL || model->kv_pool == NULL) {
+        return -1;
+    }
+    kipp_kv_pool_stats stats;
+    kipp_kv_pool_get_stats(model->kv_pool, &stats);
+    out_stats->total_blocks = stats.total_blocks;
+    out_stats->free_blocks = stats.free_blocks;
+    out_stats->reused_blocks_total = stats.reused_blocks_total;
+    out_stats->evicted_blocks_total = stats.evicted_blocks_total;
+    return 0;
 }
 
 int kipp_session_get_info(const kipp_session *session,
@@ -3314,19 +3720,35 @@ int kipp_session_eval(kipp_session *session, const uint32_t *tokens,
     }
     kipp_eval_item item = {
         session->backend_session, tokens, (uint32_t)token_count,
-        session->length,         logits, 1,
+        session->length,         logits, 1,      NULL, false,
     };
+    uint32_t first_new = 0;
+    if (session_is_pooled(session)) {
+        if (pooled_map_blocks(session,
+                              session->length + (uint32_t)token_count,
+                              &first_new, error) != 0) {
+            return -1;
+        }
+        item.block_table = session->block_ids;
+    }
     if (session->model->backend_ops->eval(session->model->backend_model,
                                           &item, 1, error) != 0) {
+        if (session_is_pooled(session)) {
+            pooled_unmap_from(session, first_new);
+        }
         return -1;
+    }
+    if (session_is_pooled(session)) {
+        memcpy(session->timeline + session->length, tokens,
+               token_count * sizeof(*tokens));
     }
     session->length += (uint32_t)token_count;
     return 0;
 }
 
-int kipp_session_eval_n(kipp_session *session, const uint32_t *tokens,
-                        size_t token_count, float *logits, uint32_t rows,
-                        kipp_error *error) {
+static int session_eval_rows(kipp_session *session, const uint32_t *tokens,
+                             size_t token_count, float *logits, uint32_t rows,
+                             bool relaxed_order, kipp_error *error) {
     clear_error(error);
     if (session == NULL || tokens == NULL || logits == NULL) {
         return fail(error, KIPP_ERROR_ARGUMENT,
@@ -3353,14 +3775,45 @@ int kipp_session_eval_n(kipp_session *session, const uint32_t *tokens,
     }
     kipp_eval_item item = {
         session->backend_session, tokens, (uint32_t)token_count,
-        session->length,          logits, rows,
+        session->length,          logits, rows,   NULL,
+        relaxed_order,
     };
+    uint32_t first_new = 0;
+    if (session_is_pooled(session)) {
+        if (pooled_map_blocks(session,
+                              session->length + (uint32_t)token_count,
+                              &first_new, error) != 0) {
+            return -1;
+        }
+        item.block_table = session->block_ids;
+    }
     if (session->model->backend_ops->eval(session->model->backend_model,
                                           &item, 1, error) != 0) {
+        if (session_is_pooled(session)) {
+            pooled_unmap_from(session, first_new);
+        }
         return -1;
+    }
+    if (session_is_pooled(session)) {
+        memcpy(session->timeline + session->length, tokens,
+               token_count * sizeof(*tokens));
     }
     session->length += (uint32_t)token_count;
     return 0;
+}
+
+int kipp_session_eval_n(kipp_session *session, const uint32_t *tokens,
+                        size_t token_count, float *logits, uint32_t rows,
+                        kipp_error *error) {
+    return session_eval_rows(session, tokens, token_count, logits, rows,
+                             false, error);
+}
+
+int kipp_session_eval_scored(kipp_session *session, const uint32_t *tokens,
+                             size_t token_count, float *logits, uint32_t rows,
+                             kipp_error *error) {
+    return session_eval_rows(session, tokens, token_count, logits, rows,
+                             true, error);
 }
 
 int kipp_eval_batch(kipp_model *model, kipp_batch_item *items,
@@ -3416,14 +3869,49 @@ int kipp_eval_batch(kipp_model *model, kipp_batch_item *items,
             session->length,
             item->logits,
             1,
+            NULL,
+            false,
         };
+    }
+    /* Map pooled blocks for every item before the single backend call; on
+     * any failure, unmap exactly what this call mapped. */
+    uint32_t first_new[KIPP_EVAL_BATCH_LIMIT];
+    for (size_t index = 0; index < item_count; ++index) {
+        kipp_session *session = items[index].session;
+        first_new[index] = session->mapped_blocks;
+        if (!session_is_pooled(session)) {
+            continue;
+        }
+        if (pooled_map_blocks(session,
+                              session->length +
+                                  (uint32_t)items[index].token_count,
+                              &first_new[index], error) != 0) {
+            for (size_t previous = 0; previous < index; ++previous) {
+                if (session_is_pooled(items[previous].session)) {
+                    pooled_unmap_from(items[previous].session,
+                                      first_new[previous]);
+                }
+            }
+            return -1;
+        }
+        backend_items[index].block_table = session->block_ids;
     }
     if (model->backend_ops->eval(model->backend_model, backend_items,
                                  item_count, error) != 0) {
+        for (size_t index = 0; index < item_count; ++index) {
+            if (session_is_pooled(items[index].session)) {
+                pooled_unmap_from(items[index].session, first_new[index]);
+            }
+        }
         return -1;
     }
     for (size_t index = 0; index < item_count; ++index) {
-        items[index].session->length += (uint32_t)items[index].token_count;
+        kipp_session *session = items[index].session;
+        if (session_is_pooled(session)) {
+            memcpy(session->timeline + session->length, items[index].tokens,
+                   items[index].token_count * sizeof(uint32_t));
+        }
+        session->length += (uint32_t)items[index].token_count;
     }
     return 0;
 }
@@ -3478,6 +3966,9 @@ int kipp_test_scramble_session_kv(kipp_session *session) {
     /* Reverse the block table so every logical block resolves to a different
      * physical block; a correct paged read/write path yields identical
      * results regardless of physical placement. Must precede any eval. */
+    if (session->model->kv_pool != NULL) {
+        return -1; /* pooled sessions have no private identity table */
+    }
     if (session->model->backend_ops == cpu_backend_operations()) {
         cpu_backend_session *cpu = session->backend_session;
         uint32_t low = 0;

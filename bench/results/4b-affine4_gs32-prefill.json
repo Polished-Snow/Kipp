@@ -1,0 +1,89 @@
+{
+  "configuration": {
+    "batch_size": 1,
+    "concurrency": 1,
+    "decode_tokens": 8,
+    "measured_runs": 5,
+    "prompt": "The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today.",
+    "sampling": "greedy",
+    "warmup_runs": 1
+  },
+  "decode_tokens_per_second": {
+    "maximum": 121.39789678143826,
+    "median": 121.1698953395029,
+    "median_absolute_deviation": 0.12650128273354255,
+    "minimum": 120.88426842351804
+  },
+  "engine": {
+    "backend": "metal",
+    "binary": "build/kipp-metal",
+    "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
+    "commit": "8a04db95b27141350469c6091bf24e0004a9c6be",
+    "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "dirty": false
+  },
+  "hardware": {
+    "gpu_cores": 40,
+    "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+    "processor": "Apple M5 Max",
+    "unified_memory_bytes": 137438953472
+  },
+  "model": {
+    "artifact_bytes": 3053318496,
+    "checkpoint": "qwen3-4b-base",
+    "format": "GGUF-v3 Kipp Qwen3 subset",
+    "repository": "Qwen/Qwen3-4B-Base",
+    "revision": "906bfd4b4dc7f14ee4320094d8b41684abff8539",
+    "scheme": "affine4_gs32",
+    "sha256": "33868c6b1317c61954d203b27d8b8b6c94e653ff74c88d5942c248756455a7b2"
+  },
+  "peak_resident_bytes": {
+    "maximum": 40861696.0,
+    "median": 40812544.0,
+    "median_absolute_deviation": 32768.0,
+    "minimum": 40730624.0
+  },
+  "prefill_tokens_per_second": {
+    "maximum": 509.38408438210837,
+    "median": 508.88352708927397,
+    "median_absolute_deviation": 0.06177152853001644,
+    "minimum": 508.5592866140766
+  },
+  "runs": [
+    {
+      "decode_seconds": 0.066002,
+      "decode_tokens_per_second": 121.20844822884155,
+      "peak_resident_bytes": 40812544,
+      "prefill_seconds": 0.683925,
+      "prefill_tokens_per_second": 508.8277223379757
+    },
+    {
+      "decode_seconds": 0.065899,
+      "decode_tokens_per_second": 121.39789678143826,
+      "peak_resident_bytes": 40845312,
+      "prefill_seconds": 0.683178,
+      "prefill_tokens_per_second": 509.38408438210837
+    },
+    {
+      "decode_seconds": 0.066092,
+      "decode_tokens_per_second": 121.04339405676936,
+      "peak_resident_bytes": 40861696,
+      "prefill_seconds": 0.684286,
+      "prefill_tokens_per_second": 508.5592866140766
+    },
+    {
+      "decode_seconds": 0.066179,
+      "decode_tokens_per_second": 120.88426842351804,
+      "peak_resident_bytes": 40730624,
+      "prefill_seconds": 0.683767,
+      "prefill_tokens_per_second": 508.945298617804
+    },
+    {
+      "decode_seconds": 0.066023,
+      "decode_tokens_per_second": 121.1698953395029,
+      "peak_resident_bytes": 40812544,
+      "prefill_seconds": 0.68385,
+      "prefill_tokens_per_second": 508.88352708927397
+    }
+  ]
+}

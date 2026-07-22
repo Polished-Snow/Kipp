@@ -1,0 +1,70 @@
+{
+  "description": "CUDA correctness gates on a disposable Verda GPU instance via tools/ops/verda_cuda_gate.sh: --model (CPU logits vs pinned vectors, built and run on the instance) and --phase4-cuda (CUDA vs CPU oracle, arg max exact + NMSE <= 1e-4) per checkpoint, plus the CUDA operator suite.",
+  "engine_commit": "6d3c11346a4cdfd785abe9471ebaabdfc0b95f27",
+  "hardware": {
+    "provider": "Verda",
+    "instance_type": "1H100.80S.32V",
+    "image": "ubuntu-24.04-cuda-12.8-open",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "driver": "580.126.09"
+  },
+  "checkpoints": {
+    "qwen3-4b-base": {
+      "model": {
+        "verdict": "PASS",
+        "nmse": 4.36003643e-07,
+        "nmse_max": 5e-05,
+        "argmax_match": true
+      },
+      "phase4-cuda": {
+        "verdict": "PASS",
+        "nmse_max_observed": 2.3853077e-08,
+        "positions_checked": 6
+      }
+    },
+    "qwen3-0.6b-base": {
+      "model": {
+        "verdict": "PASS",
+        "nmse": 1.84186099e-05,
+        "nmse_max": 5e-05,
+        "argmax_match": true
+      },
+      "phase4-cuda": {
+        "verdict": "PASS",
+        "nmse_max_observed": 5.86249531e-07,
+        "positions_checked": 6
+      }
+    },
+    "qwen3-4b-instruct-2507": {
+      "model": {
+        "verdict": "PASS",
+        "nmse": 8.15508075e-06,
+        "nmse_max": 5e-05,
+        "argmax_match": true
+      },
+      "phase4-cuda": {
+        "verdict": "PASS",
+        "nmse_max_observed": 2.51967783e-07,
+        "positions_checked": 6
+      }
+    },
+    "qwen3-8b-base": {
+      "model": {
+        "verdict": "PASS",
+        "nmse": 3.83561792e-07,
+        "nmse_max": 5e-05,
+        "argmax_match": true
+      },
+      "phase4-cuda": {
+        "verdict": "PASS",
+        "nmse_max_observed": 4.97562912e-08,
+        "positions_checked": 6
+      }
+    }
+  },
+  "cuda_operators": {
+    "verdict": "PASS",
+    "device": "NVIDIA H100 80GB HBM3"
+  },
+  "failures": []
+}

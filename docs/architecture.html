@@ -181,8 +181,11 @@ with <code>columns % 32 == 0</code> (true for every family dimension):</p>
 bytes/group (5.0 bpw), <code>w = scale·q + bias</code>, <code>q ∈ [0,15]</code>. Q4-class.</li>
 </ul>
 <p>The CPU reference dequantizes per block inside a type-dispatched matvec;
-Metal adds token-tiled <code>kipp_matvec_q8_0</code>/<code>kipp_matvec_affine4</code> decode and
-prefill kernels selected by the weight tensor's type. Quantized artifacts
+Metal selects kernels by the weight tensor's type: token-tiled
+<code>kipp_matvec_q8_0</code>/<code>kipp_matvec_affine4</code> vector kernels for decode, and
+simdgroup-matrix <code>kipp_matmul_q8_0</code>/<code>kipp_matmul_affine4</code> kernels for
+prefill (each 32-weight block dequantized once per 16-token tile, keeping
+quantized prefill at near-parity with BF16). Quantized artifacts
 gate as ordinary artifacts: argmax must match the BF16 reference exactly,
 with a format-appropriate full-logit NMSE bound (Q8_0 near-lossless; 4-bit
 Q4-class), and Metal must match CPU within the standard <code>1e-4</code>. The
@@ -245,9 +248,30 @@ remains contiguous for now. The shared cross-request block pool
 the core drive both backends are the next Phase 5 steps.</p>
 <p>Sessions support truncation back to a prefix of their timeline
 (<code>kipp_session_truncate</code>), which is the primitive behind the server's
-serial prefix reuse. Cross-session prefix sharing, persistence, and
-eviction through the block pool remain future Phase 5 work and do not change
-the backend contract.</p>
+serial prefix reuse.</p>
+<p>Cross-session prefix sharing is available on the CPU and Metal backends
+behind <code>kipp_model_open_pooled</code>: the backend model owns one shared KV slab
+(host memory on CPU, a shared <code>MTLBuffer</code> pair on Metal), pooled sessions
+map their block tables onto it through the eval-item <code>block_table</code> field,
+and a finished session's full 32-token blocks are published to the
+content-addressed pool (<code>src/kipp_kv_pool.c</code>) at reset/destroy
+(&quot;publish-at-finish&quot;) so a later session can adopt a matching prefix with
+<code>kipp_session_match_prefix</code> instead of re-evaluating it. Shared blocks are
+always complete and immutable; the block being appended to is always
+private, which is what keeps <code>kipp_session_truncate</code> — speculative rollback
+— away from shared state. On Metal the pooled path changes no shader code:
+sessions bind the model pool buffers with the pool stride, and the
+<code>kipp_kv_write</code>/<code>kipp_flash_gqa</code> kernels resolve the same per-item block
+table they always have. The <code>--pooled-cpu</code> and <code>--pooled-metal</code> gates prove
+pooled identity and shared-prefix evaluation bitwise-equal to unshared
+runs on the same backend, batched mixed evaluation equal within the
+backend's batching contract (bitwise on CPU, whose scalar path is
+packing-independent; <code>1e-4</code> NMSE with identical arg max on Metal, where
+kernel selection legitimately differs between batched rounds and isolated
+evaluation), clean pool-exhaustion failure,
+truncation into the private tail, and eviction. Server integration,
+persistence, and cache-pressure admission remain future Phase 5 work and do
+not change the backend contract.</p>
 <h3>SSD streaming</h3>
 <p>SSD streaming is not part of Kipp v1.</p>
 <p>ds4 keeps model loading mmap-backed and uses backend-specific placement:
@@ -360,20 +384,32 @@ admitted while the total choice count fits the batch limit; each scheduler
 step evaluates one prompt chunk (chunked prefill, 32 tokens) or one decode
 token per active choice through <code>kipp_eval_batch</code>, so concurrent requests
 read the weights once per step. Slow or disconnected clients are cancelled
-without disturbing other requests. A single cached session plus its
-evaluated token timeline provides serial prefix reuse: when an idle
-single-choice request shares a prefix with the timeline, the session is
-rolled back with <code>kipp_session_truncate</code> and only the suffix is prefilled.
-Multi-entry prefix caching and production KV block pooling remain future
-reviewed work and must not change this API surface.</p>
+without disturbing other requests.</p>
+<p>On CPU and Metal the server opens the model pooled by default
+(<code>--kv-pool-mib</code> overrides the pool size, which defaults to the
+checkpoint's context length; <code>--kv-pool-mib 0</code> disables). Every choice of
+every request gets a pooled session that adopts the longest published
+prefix of its prompt at admission (<code>kipp_session_match_prefix</code>), so
+cross-request — and cross-choice — prefix reuse needs no cache slot and no
+rollback bookkeeping: finished or cancelled requests publish their full
+blocks on release, and the published pool is the cache. Admission reserves
+worst-case pool blocks (the new request's unmatched blocks plus every
+active choice's remaining budget) before committing; under pool pressure a
+request simply stays in the FIFO, so exhaustion delays admission and can
+never corrupt active sequences. <code>GET /metrics</code> exposes pool occupancy and
+reuse counters. On CUDA (non-pooled), the previous single-slot serial
+prefix cache remains: an idle single-choice request sharing a prefix with
+the cached timeline is rolled back with <code>kipp_session_truncate</code> and only
+the suffix is prefilled.</p>
 <p>Greedy self-speculative decoding is available (CLI <code>--spec</code>): each step
 drafts the continuation with a prompt-lookup n-gram matcher
 (<code>src/kipp_spec.c</code>), verifies the whole draft in one multi-logit forward,
 and accepts the longest greedy-matching prefix — rolling the KV back with
 <code>kipp_session_truncate</code> for rejected drafts. The emitted sequence is exactly
 the plain greedy sequence (a gated invariant); it just takes fewer forward
-passes (measured ~1.9x on repetitive/structured content, multiplicative with
-quantization).</p>
+passes (measured ~3.2x on repetitive/copy-heavy content with the adaptive
+gate, which also holds low-acceptance workloads at 0.80x or better; see
+<code>bench/results/spec-gated.json</code>).</p>
 <p>The v1 server does not claim support for Anthropic Messages, tools,
 structured output, embeddings, multimodal input, authentication, TLS,
 distributed execution, or multi-model serving. Chat APIs require an explicitly approved instruction

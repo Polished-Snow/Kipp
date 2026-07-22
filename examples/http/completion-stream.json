@@ -1,0 +1,9 @@
+{
+  "model": "qwen3-4b-base",
+  "prompt": "Once upon a time",
+  "max_tokens": 48,
+  "temperature": 0.8,
+  "seed": 7,
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}

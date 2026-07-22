@@ -1,8 +1,10 @@
 .PHONY: all cpu server server-metal server-cuda test test-tools test-sanitize \
-	tools-env model convert vectors chat-vectors test-model test-phase2 \
-	test-paged-cpu test-multilogit metal test-metal-ops \
-	test-multilogit-metal test-metal test-server cuda-spark cuda-generic \
-	test-cuda-ops test-cuda docs docs-check clean
+	tools-env model convert vectors chat-vectors test-model test-ppl test-phase2 \
+	test-paged-cpu test-pooled-cpu test-multilogit metal test-metal-ops \
+	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
+	test-chat test-server \
+	cuda-spark cuda-generic \
+	test-cuda-ops test-cuda docs docs-check paper-data paper-check clean
 
 BUILD_DIR := build
 TOOLS_DIR := tools
@@ -15,6 +17,7 @@ MODEL_GGUF := $(MODEL_DIR)/kipp-$(CHECKPOINT)-bf16.gguf
 VECTOR_DIR := tests/test-vectors/$(CHECKPOINT)
 CHAT_SOURCE := models/$(CHAT_CHECKPOINT)/source
 CHAT_VECTOR := tests/test-vectors/$(CHAT_CHECKPOINT)/chat-cases.json
+CHAT_MODEL_GGUF := models/$(CHAT_CHECKPOINT)/kipp-$(CHAT_CHECKPOINT)-bf16.gguf
 
 CPPFLAGS := -Isrc
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
@@ -32,9 +35,13 @@ CUDA_GENERIC_ARCH_FLAGS ?= \
 CUDA_SPARK_ARCH_FLAGS ?= -gencode arch=compute_121,code=sm_121
 CORE_HEADERS := src/kipp.h src/kipp_backend.h src/kipp_checkpoints.h \
 	src/kipp_kv_pool.h src/kipp_unicode.inc
-CLI_OBJECTS := $(BUILD_DIR)/kipp_cli.o $(BUILD_DIR)/kipp_spec.o
-SERVER_OBJECTS := $(BUILD_DIR)/kipp_server.o $(BUILD_DIR)/kipp_chat.o
-TEST_SUPPORT_SOURCES := src/kipp_chat.c src/kipp_spec.c src/kipp_kv_pool.c
+CLI_OBJECTS := $(BUILD_DIR)/kipp_cli.o $(BUILD_DIR)/kipp_spec.o \
+	$(BUILD_DIR)/kipp_chat.o $(BUILD_DIR)/kipp_kv_pool.o
+SERVER_OBJECTS := $(BUILD_DIR)/kipp_server.o $(BUILD_DIR)/kipp_chat.o \
+	$(BUILD_DIR)/kipp_json.o $(BUILD_DIR)/kipp_http.o \
+	$(BUILD_DIR)/kipp_kv_pool.o
+TEST_SUPPORT_SOURCES := src/kipp_chat.c src/kipp_spec.c src/kipp_kv_pool.c \
+	src/kipp_json.c src/kipp_http.c
 
 all: cpu
 
@@ -46,13 +53,14 @@ $(BUILD_DIR):
 $(BUILD_DIR)/kipp.o: src/kipp.c $(CORE_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp.c -o $@
 
-$(BUILD_DIR)/kipp_cli.o: src/kipp_cli.c src/kipp.h | $(BUILD_DIR)
+$(BUILD_DIR)/kipp_cli.o: src/kipp_cli.c src/kipp.h src/kipp_chat.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_cli.c -o $@
 
 $(BUILD_DIR)/kipp: $(BUILD_DIR)/kipp.o $(CLI_OBJECTS)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-$(BUILD_DIR)/kipp_server.o: src/kipp_server.c src/kipp.h src/kipp_chat.h | $(BUILD_DIR)
+$(BUILD_DIR)/kipp_server.o: src/kipp_server.c src/kipp.h src/kipp_chat.h \
+		src/kipp_json.h src/kipp_http.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_server.c -o $@
 
 $(BUILD_DIR)/kipp-server: $(BUILD_DIR)/kipp.o $(SERVER_OBJECTS)
@@ -95,6 +103,17 @@ $(BUILD_DIR)/kipp_test: src/kipp.c $(TEST_SUPPORT_SOURCES) \
 		src/kipp.c $(TEST_SUPPORT_SOURCES) \
 		tests/kipp_test.c $(LDLIBS) -o $@
 
+# Mutation-study binary: the CPU oracle with KIPP_FAULT-selected seeded
+# paging bugs (see kipp.c's KIPP_FAULT_INJECT block). Research tooling only —
+# never a production or default-test target.
+$(BUILD_DIR)/kipp_test_fault: src/kipp.c $(TEST_SUPPORT_SOURCES) \
+		$(CORE_HEADERS) src/kipp_chat.h \
+		src/kipp_spec.h src/kipp_kv_pool.h src/kipp_unicode.inc \
+		tests/kipp_test.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKIPP_TESTING -DKIPP_FAULT_INJECT \
+		src/kipp.c $(TEST_SUPPORT_SOURCES) \
+		tests/kipp_test.c $(LDLIBS) -o $@
+
 $(BUILD_DIR)/kipp_test_metal: src/kipp.c src/kipp_chat.c src/kipp.h \
 		src/kipp_backend.h src/kipp_checkpoints.h src/kipp_chat.h \
 		src/kipp_kv_pool.h src/metal/kipp_metal.h src/kipp_unicode.inc \
@@ -102,7 +121,8 @@ $(BUILD_DIR)/kipp_test_metal: src/kipp.c src/kipp_chat.c src/kipp.h \
 		$(BUILD_DIR)/kipp_metal_bridge.o | $(BUILD_DIR)
 	xcrun --sdk macosx clang $(CPPFLAGS) $(CFLAGS) \
 		-DKIPP_TESTING -DKIPP_ENABLE_METAL src/kipp.c src/kipp_chat.c \
-		src/kipp_spec.c src/kipp_kv_pool.c tests/kipp_test.c \
+		src/kipp_spec.c src/kipp_kv_pool.c src/kipp_json.c \
+		src/kipp_http.c tests/kipp_test.c \
 		$(BUILD_DIR)/kipp_metal_bridge.o $(LDLIBS) $(METAL_FRAMEWORKS) -o $@
 
 test: $(BUILD_DIR)/kipp_test test-tools
@@ -129,6 +149,13 @@ docs-check: tools-env
 test-tools: docs-check
 	uv run --project $(TOOLS_DIR) --python 3.12 \
 		python -m unittest tests/test_tooling.py
+	python3 tools/paper_data.py --check
+
+paper-data:
+	python3 tools/paper_data.py
+
+paper-check:
+	python3 tools/paper_data.py --check
 
 model: tools-env
 	tools/download_model.sh --checkpoint $(CHECKPOINT)
@@ -154,11 +181,22 @@ chat-vectors: tools-env
 test-model: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --model $(MODEL_GGUF) $(VECTOR_DIR)
 
+# Smoke-check the CLI perplexity mode against the pinned prompt tokens
+# (already LE uint32, the --ppl input format). Model-gated like test-model.
+test-ppl: $(BUILD_DIR)/kipp vectors
+	$(BUILD_DIR)/kipp --model $(MODEL_GGUF) \
+		--ppl $(VECTOR_DIR)/tokens.u32 --ppl-window 128 2>&1 | \
+		grep -E 'KIPP_PPL .* ppl=[0-9]+\.[0-9]+' >/dev/null && \
+		echo "PASS test-ppl"
+
 test-phase2: test-paged-cpu test-multilogit
 	$(BUILD_DIR)/kipp_test --phase2-model $(MODEL_GGUF) $(VECTOR_DIR)
 
 test-paged-cpu: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --paged-cpu $(MODEL_GGUF) $(VECTOR_DIR)
+
+test-pooled-cpu: $(BUILD_DIR)/kipp_test vectors
+	$(BUILD_DIR)/kipp_test --pooled-cpu $(MODEL_GGUF) $(VECTOR_DIR)
 
 test-multilogit: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --multilogit $(MODEL_GGUF) $(VECTOR_DIR)
@@ -171,8 +209,21 @@ test-metal-ops: $(BUILD_DIR)/kipp_test_metal
 test-multilogit-metal: $(BUILD_DIR)/kipp_test_metal vectors
 	$(BUILD_DIR)/kipp_test_metal --multilogit-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
-test-metal: test-metal-ops test-multilogit-metal
+test-paged-metal: $(BUILD_DIR)/kipp_test_metal vectors
+	$(BUILD_DIR)/kipp_test_metal --paged-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
+test-pooled-metal: $(BUILD_DIR)/kipp_test_metal vectors
+	$(BUILD_DIR)/kipp_test_metal --pooled-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
+test-metal: test-metal-ops test-multilogit-metal test-paged-metal
 	$(BUILD_DIR)/kipp_test_metal --phase3-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
+# Chat REPL smoke test against an already-converted instruct GGUF; does not
+# run the vectors/convert chain (which rewrites the multi-GB artifact).
+test-chat: $(BUILD_DIR)/kipp-metal
+	printf 'Say hi\nexit\n' | $(BUILD_DIR)/kipp-metal --backend metal \
+		--model $(CHAT_MODEL_GGUF) --chat --decode 8 --temperature 0 \
+		| grep -q .
 
 test-server: $(BUILD_DIR)/kipp-server-metal
 	KIPP_SERVER_BINARY=$(BUILD_DIR)/kipp-server-metal \
@@ -224,8 +275,21 @@ $(BUILD_DIR)/kipp_cuda_test.o: tests/kipp_test.c src/kipp.h src/kipp_chat.h \
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DKIPP_TESTING -DKIPP_ENABLE_CUDA \
 		-c tests/kipp_test.c -o $@
 
+# The KV pool's KIPP_TESTING collision hook is referenced by the test
+# binary, so the CUDA test links a testing-compiled pool object rather
+# than the production one.
+$(BUILD_DIR)/kipp_kv_pool_testing.o: src/kipp_kv_pool.c src/kipp_kv_pool.h \
+		| $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DKIPP_TESTING -c src/kipp_kv_pool.c -o $@
+
 $(BUILD_DIR)/kipp_chat.o: src/kipp_chat.c src/kipp_chat.h src/kipp.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_chat.c -o $@
+
+$(BUILD_DIR)/kipp_json.o: src/kipp_json.c src/kipp_json.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_json.c -o $@
+
+$(BUILD_DIR)/kipp_http.o: src/kipp_http.c src/kipp_http.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_http.c -o $@
 
 $(BUILD_DIR)/kipp_spec.o: src/kipp_spec.c src/kipp_spec.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_spec.c -o $@
@@ -240,7 +304,8 @@ $(BUILD_DIR)/kipp-server-cuda: $(BUILD_DIR)/kipp_cuda_core.o \
 
 $(BUILD_DIR)/kipp_test_cuda: $(BUILD_DIR)/kipp_cuda_test_core.o \
 		$(BUILD_DIR)/kipp_cuda_test.o $(BUILD_DIR)/kipp_chat.o \
-		$(BUILD_DIR)/kipp_spec.o $(BUILD_DIR)/kipp_kv_pool.o \
+		$(BUILD_DIR)/kipp_spec.o $(BUILD_DIR)/kipp_kv_pool_testing.o \
+		$(BUILD_DIR)/kipp_json.o $(BUILD_DIR)/kipp_http.o \
 		$(BUILD_DIR)/kipp_cuda_bridge_generic.o \
 		$(BUILD_DIR)/kipp_cuda_kernels_generic.o
 	$(NVCC) $(NVCCFLAGS) $(CUDA_GENERIC_ARCH_FLAGS) $^ $(LDLIBS) -o $@

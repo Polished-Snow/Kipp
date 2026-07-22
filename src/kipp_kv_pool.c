@@ -27,9 +27,21 @@ struct kipp_kv_pool {
     uint32_t free_head; /* least-recently-used: evicted first */
     uint32_t free_tail; /* most-recently-used: evicted last */
     uint32_t free_blocks;
+    uint64_t reused_total;
+    uint64_t evicted_total;
+    bool force_hash; /* KIPP_TESTING collision hook */
     kv_block *blocks;
     uint32_t *buckets;
 };
+
+/* Internal hash: the public function unless the collision hook is armed. */
+static uint64_t pool_hash(const kipp_kv_pool *pool, uint64_t parent_hash,
+                          const uint32_t *tokens, uint32_t count) {
+    if (pool->force_hash) {
+        return UINT64_C(0x1234);
+    }
+    return kipp_kv_pool_hash(parent_hash, tokens, count);
+}
 
 /* FNV-1a over the parent hash then the block's tokens: deterministic and
  * order-sensitive so the chain distinguishes prefixes. */
@@ -185,6 +197,21 @@ static void claim(kipp_kv_pool *pool, uint32_t id) {
     ++pool->blocks[id].ref_count;
 }
 
+/* Pop the LRU free block, evicting any stale indexed content it holds.
+ * KIPP_KV_INVALID_BLOCK when nothing is evictable. */
+static uint32_t claim_free_block(kipp_kv_pool *pool) {
+    if (pool->free_head == KIPP_KV_INVALID_BLOCK) {
+        return KIPP_KV_INVALID_BLOCK;
+    }
+    uint32_t id = pool->free_head;
+    free_list_remove(pool, id);
+    if (pool->blocks[id].in_index) {
+        index_remove(pool, id);
+        ++pool->evicted_total;
+    }
+    return id;
+}
+
 /* --------------------------------------------------------------- public ops */
 
 uint32_t kipp_kv_pool_acquire(kipp_kv_pool *pool, uint64_t parent_hash,
@@ -198,26 +225,23 @@ uint32_t kipp_kv_pool_acquire(kipp_kv_pool *pool, uint64_t parent_hash,
         return KIPP_KV_INVALID_BLOCK;
     }
     bool full = count == KIPP_KV_BLOCK_TOKENS;
-    uint64_t hash = full ? kipp_kv_pool_hash(parent_hash, tokens, count) : 0;
+    uint64_t hash = full ? pool_hash(pool, parent_hash, tokens, count) : 0;
     if (full) {
         uint32_t hit = find_full_block(pool, hash, tokens);
         if (hit != KIPP_KV_INVALID_BLOCK) {
             claim(pool, hit);
+            ++pool->reused_total;
             if (reused != NULL) {
                 *reused = true;
             }
             return hit;
         }
     }
-    if (pool->free_head == KIPP_KV_INVALID_BLOCK) {
+    uint32_t id = claim_free_block(pool);
+    if (id == KIPP_KV_INVALID_BLOCK) {
         return KIPP_KV_INVALID_BLOCK; /* exhausted: nothing evictable */
     }
-    uint32_t id = pool->free_head;
-    free_list_remove(pool, id);
     kv_block *block = &pool->blocks[id];
-    if (block->in_index) {
-        index_remove(pool, id); /* evict stale cached content */
-    }
     memcpy(block->tokens, tokens, count * sizeof(*tokens));
     block->token_count = count;
     block->ref_count = 1;
@@ -258,12 +282,13 @@ uint32_t kipp_kv_pool_prefix_match(kipp_kv_pool *pool, const uint32_t *tokens,
             const uint32_t *block_tokens =
                 tokens + (size_t)matched * KIPP_KV_BLOCK_TOKENS;
             uint64_t hash =
-                kipp_kv_pool_hash(parent, block_tokens, KIPP_KV_BLOCK_TOKENS);
+                pool_hash(pool, parent, block_tokens, KIPP_KV_BLOCK_TOKENS);
             uint32_t hit = find_full_block(pool, hash, block_tokens);
             if (hit == KIPP_KV_INVALID_BLOCK) {
                 break;
             }
             claim(pool, hit);
+            ++pool->reused_total;
             out_blocks[matched] = hit;
             parent = hash;
             ++matched;
@@ -277,3 +302,66 @@ uint32_t kipp_kv_pool_prefix_match(kipp_kv_pool *pool, const uint32_t *tokens,
     }
     return matched;
 }
+
+uint32_t kipp_kv_pool_alloc(kipp_kv_pool *pool) {
+    if (pool == NULL) {
+        return KIPP_KV_INVALID_BLOCK;
+    }
+    uint32_t id = claim_free_block(pool);
+    if (id == KIPP_KV_INVALID_BLOCK) {
+        return KIPP_KV_INVALID_BLOCK;
+    }
+    kv_block *block = &pool->blocks[id];
+    block->ref_count = 1;
+    block->token_count = 0;
+    block->hash = 0;
+    block->in_index = false;
+    block->hash_next = KIPP_KV_INVALID_BLOCK;
+    return id;
+}
+
+int kipp_kv_pool_seal(kipp_kv_pool *pool, uint32_t block_id,
+                      uint64_t parent_hash, const uint32_t *tokens) {
+    if (pool == NULL || block_id >= pool->block_count || tokens == NULL) {
+        return -1;
+    }
+    kv_block *block = &pool->blocks[block_id];
+    if (block->ref_count == 0 || block->in_index) {
+        return -1;
+    }
+    uint64_t hash =
+        pool_hash(pool, parent_hash, tokens, KIPP_KV_BLOCK_TOKENS);
+    memcpy(block->tokens, tokens,
+           KIPP_KV_BLOCK_TOKENS * sizeof(*tokens));
+    block->token_count = KIPP_KV_BLOCK_TOKENS;
+    block->hash = hash;
+    /* One indexed copy per content: if an identical block is already
+     * published, this one stays private and the index keeps the original. */
+    if (find_full_block(pool, hash, tokens) == KIPP_KV_INVALID_BLOCK) {
+        index_insert(pool, block_id);
+    }
+    return 0;
+}
+
+void kipp_kv_pool_get_stats(const kipp_kv_pool *pool,
+                            kipp_kv_pool_stats *out_stats) {
+    if (out_stats == NULL) {
+        return;
+    }
+    memset(out_stats, 0, sizeof(*out_stats));
+    if (pool == NULL) {
+        return;
+    }
+    out_stats->total_blocks = pool->block_count;
+    out_stats->free_blocks = pool->free_blocks;
+    out_stats->reused_blocks_total = pool->reused_total;
+    out_stats->evicted_blocks_total = pool->evicted_total;
+}
+
+#ifdef KIPP_TESTING
+void kipp_kv_pool_test_force_hash(kipp_kv_pool *pool, bool force) {
+    if (pool != NULL) {
+        pool->force_hash = force;
+    }
+}
+#endif

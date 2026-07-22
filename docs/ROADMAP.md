@@ -4,6 +4,27 @@ This sequence is binding unless `ARCHITECTURE.md` is explicitly revised.
 Correctness gates every phase; dates and speculative performance claims are
 intentionally absent.
 
+**Status (v0.0.3, in preparation):** Since v0.0.2, Kipp delivered the
+items that release deferred and hardened the serving path. **Cross-request
+KV prefix sharing is now the CPU/Metal serving default**: pooled sessions
+share one model-owned slab through a content-addressed 32-token block pool
+(publish-at-finish, memcmp-verified), gated by `--pooled-cpu` /
+`--pooled-metal` and measured at 175× TTFT on a repeated 6,890-token
+prompt. The Metal **flash-attention prefill kernel is live** (a
+reserved-MSL-keyword bug had silently disabled every simdgroup-matrix
+kernel for two days; the benchmark harness now refuses to record numbers
+from a fallback build), putting quantized prefill at BF16 parity
+(528/488/509 tok/s at 348 tokens on the M5 Max). The server gained 32-way
+concurrent decode, idle-connection reaping, and TTFT/queue-wait metrics;
+the CLI gained a multi-turn `--chat` REPL (suffix-only KV evaluation) and
+a wikitext `--ppl` perplexity mode; sampling gained zero-copy fast paths;
+`kipp_session_eval_scored` exposes tolerance-bound multi-row scoring; the
+JSON and HTTP parsers moved to their own fuzz-tested translation units;
+and the whole registry surface was revalidated on an ephemeral NVIDIA
+H100 (four checkpoints, worst NMSE 5.9e-7). Speculation now measures a
+paired-baseline A/B with an adaptive-gate floor of 0.84× and above-parity
+code decoding.
+
 **Status (v0.0.2):** This release expands Kipp from the single pinned
 checkpoint of v0.0.1 to the **Qwen3 dense family** (0.6B–32B, base +
 instruct) behind a strict compiled-in checkpoint registry, with the BF16
@@ -19,9 +40,9 @@ both the CPU oracle and the Metal backend — a per-session 32-position block
 table gated bitwise-equal to the contiguous layout (`--paged-cpu`,
 `--paged-metal`). Everything is gated on Apple M5 (CPU + Metal); the whole
 family plus quantization is additionally validated on NVIDIA A100 via
-ephemeral cloud runs. Still deferred: the cross-request KV block pool
-(`src/kipp_kv_pool.c` exists and is unit-tested but not yet wired into the
-backends), Metal flash-attention prefill, and quantized KV.
+ephemeral cloud runs. Still deferred at that point (since delivered — see the v0.0.3 status
+above): the cross-request KV block pool, Metal flash-attention prefill.
+Quantized KV remains deferred.
 
 **v2 expansion (approved 2026-07-16):** scope grew from one pinned
 checkpoint to the pinned Qwen3 dense family via a compiled-in registry
@@ -35,10 +56,11 @@ Delivered since: validated checkpoints spanning Qwen3 dense 0.6B through
 surface (top-k, min-p, penalties, logit_bias); a `/metrics` endpoint; and
 **weight quantization** — Q8_0 (near-lossless, ~1.6x decode, brings 8B
 under the M5 Metal buffer cap) and affine 4-bit gs32 (~2x decode, 2.6x
-smaller, coherent output), both gated on CPU + Metal. Remaining: production
-KV block pooling with cross-request prefix caching, a token-budget scheduler,
-and quantized KV — each behind its own CPU-vs-GPU gate. Prompt-lookup
-speculative decoding and generated-token logprobs are already delivered.
+smaller, coherent output), both gated on CPU + Metal. Production KV block pooling with
+cross-request prefix caching is delivered (the serving default on
+CPU/Metal). Remaining: a token-budget scheduler and quantized KV — each
+behind its own CPU-vs-GPU gate. Prompt-lookup speculative decoding and
+generated-token logprobs are already delivered.
 
 ## Phase 0 — Specify the model
 
@@ -95,5 +117,6 @@ Still deferred:
 - ROCm/HIP support, on a separate community-maintained branch
 - additional model families
 - generic tensor-runtime or arbitrary-GGUF compatibility
-- cross-session prefix/radix caching, SSD streaming, and quantized KV
+- radix-tree prefix indexing, SSD streaming, and quantized KV
+  (cross-session prefix caching itself is delivered)
 - broad API parity with llama.cpp, vLLM, or SGLang
