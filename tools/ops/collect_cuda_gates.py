@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Parse a verda_cuda_gate.sh log into bench/results/cuda-a100-gates.json.
+"""Parse a verda_cuda_gate.sh log into bench/results/cuda-h100-gates.json.
 
 The gate binaries already print machine-parseable lines (MODEL nmse=...,
 PHASE4 ... nmse=..., PASS/FAIL ...); verda_cuda_gate.sh adds
@@ -69,7 +69,7 @@ def main():
                 if line.startswith("FAIL ")]
 
     doc = {
-        "description": ("CUDA correctness gates on a disposable Verda A100 "
+        "description": ("CUDA correctness gates on a disposable Verda GPU instance "
                         "via tools/ops/verda_cuda_gate.sh: --model (CPU "
                         "logits vs pinned vectors, built and run on the "
                         "instance) and --phase4-cuda (CUDA vs CPU oracle, "
@@ -90,7 +90,7 @@ def main():
         },
         "failures": failures,
     }
-    out = ROOT / "bench/results/cuda-a100-gates.json"
+    out = ROOT / "bench/results/cuda-h100-gates.json"
     out.write_text(json.dumps(doc, indent=2) + "\n")
     print(f"wrote {out}")
     print(f"checkpoints: {list(checkpoints)}")

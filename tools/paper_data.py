@@ -49,7 +49,7 @@ EXPECTED_INPUTS = [
     "spec.json", "spec-gated.json",
     "server-batch.json", "prefix-reuse.json", "load.json",
     "ppl-4b.json", "llamacpp-qwen3-4b.json",
-    "gate-costs.json", "faults.json",
+    "gate-costs.json", "faults.json", "cuda-h100-gates.json",
 ]
 
 CTX_POINTS = [3, 200, 800, 1600, 3200, 6400, 12800]
@@ -556,6 +556,26 @@ def generate(loaded):
             macros.macro("MetalNmse",
                          fmt_nmse(costs["metal_full_logit_nmse"]),
                          "gate-costs.json", "metal_full_logit_nmse", commit)
+
+    # CUDA gate revalidation on an ephemeral cloud GPU.
+    if "cuda-h100-gates.json" in loaded:
+        cuda = loaded["cuda-h100-gates.json"]
+        commit = result_commit(cuda)
+        macros.section("CUDA gates (cuda-h100-gates.json)")
+        macros.macro("CudaGpuName", cuda["hardware"]["gpu"],
+                     "cuda-h100-gates.json", "hardware.gpu", commit)
+        macros.macro("CudaCheckpointCount",
+                     NUMBER_WORDS.get(len(cuda["checkpoints"]),
+                                      str(len(cuda["checkpoints"]))),
+                     "cuda-h100-gates.json", "len(checkpoints)", commit)
+        phase4_max = max(entry["phase4-cuda"]["nmse_max_observed"]
+                         for entry in cuda["checkpoints"].values()
+                         if entry.get("phase4-cuda", {}).get(
+                             "nmse_max_observed") is not None)
+        macros.macro("CudaMaxNmse", fmt_nmse(phase4_max),
+                     "cuda-h100-gates.json",
+                     "max checkpoints.*.phase4-cuda.nmse_max_observed",
+                     commit)
 
     outputs["generated/results-macros.tex"] = macros.text()
     return outputs, macros.count
