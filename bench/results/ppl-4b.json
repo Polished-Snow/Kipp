@@ -3,7 +3,7 @@
   "engine": {
     "backend": "metal",
     "binary": "build/kipp-metal",
-    "commit": "1ca49c3a76b2532d290b7b6b67eb63b272d61304",
+    "commit": "8a04db95b27141350469c6091bf24e0004a9c6be",
     "dirty": false,
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
@@ -59,27 +59,27 @@
       "tokens": 298938,
       "tokens_scored": 298792,
       "window": 2048,
-      "nll": 611112.046527206,
-      "ppl": 7.731291,
-      "seconds": 3959.955,
+      "nll": 611119.531373952,
+      "ppl": 7.731484,
+      "seconds": 1120.092,
       "windows": 146
     },
     "q8_0": {
       "tokens": 298938,
       "tokens_scored": 298792,
       "window": 2048,
-      "nll": 611183.077838519,
-      "ppl": 7.733129,
-      "seconds": 3455.929,
+      "nll": 611185.133307683,
+      "ppl": 7.733182,
+      "seconds": 5636.644,
       "windows": 146
     },
     "affine4_gs32": {
       "tokens": 298938,
       "tokens_scored": 298792,
       "window": 2048,
-      "nll": 627618.249582172,
-      "ppl": 8.170409,
-      "seconds": 3720.959,
+      "nll": 627622.064032937,
+      "ppl": 8.170513,
+      "seconds": 8737.245,
       "windows": 146
     }
   },
@@ -87,8 +87,8 @@
     "model": "kipp-qwen3-0.6b-base-bf16.gguf",
     "tokens": 1024,
     "cpu_ppl": 8.193116,
-    "metal_ppl": 8.193114,
-    "rel_diff": 2.4410737017266155e-07,
+    "metal_ppl": 8.189413,
+    "rel_diff": 0.0004519647958114825,
     "tolerance": 0.001,
     "pass": true
   }

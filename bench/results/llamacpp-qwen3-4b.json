@@ -1,5 +1,5 @@
 {
-  "description": "llama.cpp head-to-head on identical hardware and the same pinned Qwen3-4B-Base HF revision, converted independently from the same safetensors. Reps use p=2048/n=256 so each measurement is long enough to hold sustained GPU clocks; Kipp prefill at the matched 2048-token prompt is in 4b-*-prefill2k.json. llama-bench reports mean+stddev (Kipp files report median+MAD). Q4_0 is scale-only 4-bit gs32 vs Kipp's scale+bias affine4_gs32 - closest match, not identical. We quote llama.cpp's best stable session of the day (GPU pre-warmed, stddev <= 6%); repeated sessions under accumulated thermal load measured up to 35% lower. Quoting the best llama.cpp figures is conservative for every comparison drawn in the paper.",
+  "description": "llama.cpp head-to-head on identical hardware and the same pinned Qwen3-4B-Base HF revision. llama.cpp converted independently from the same safetensors; measured with llama-bench on an otherwise idle machine. Note: llama-bench reports mean and stddev over runs, whereas Kipp results report median and MAD. Q4_0 is llama.cpp's scale-only 4-bit gs32 format; Kipp's affine4_gs32 is scale+bias 4-bit gs32 - closest available match, not identical. Reps use p=2048/n=256 so each measurement is long enough to hold sustained GPU clocks; Kipp prefill at the matched 2048-token prompt is in 4b-*-prefill2k.json.",
   "llamacpp": {
     "repository": "https://github.com/ggml-org/llama.cpp",
     "commit": "178a6c44937154dc4c4eff0d166f4a044c4fceba",
@@ -15,42 +15,42 @@
   "results": {
     "bf16": {
       "prefill": {
-        "avg_tokens_per_second": 2183.2,
-        "stddev": 133.9,
+        "avg_tokens_per_second": 2173.760328,
+        "stddev": 51.086536,
         "n_prompt": 2048,
         "n_gen": 0
       },
       "decode": {
-        "avg_tokens_per_second": 39.9,
-        "stddev": 0.7,
+        "avg_tokens_per_second": 34.989279,
+        "stddev": 0.23583,
         "n_prompt": 0,
         "n_gen": 256
       }
     },
     "q8_0": {
       "prefill": {
-        "avg_tokens_per_second": 2505.9,
-        "stddev": 42.6,
+        "avg_tokens_per_second": 2329.013867,
+        "stddev": 84.972847,
         "n_prompt": 2048,
         "n_gen": 0
       },
       "decode": {
-        "avg_tokens_per_second": 64.3,
-        "stddev": 1.4,
+        "avg_tokens_per_second": 56.541199,
+        "stddev": 0.796507,
         "n_prompt": 0,
         "n_gen": 256
       }
     },
     "q4_0": {
       "prefill": {
-        "avg_tokens_per_second": 2536.6,
-        "stddev": 39.0,
+        "avg_tokens_per_second": 2419.718814,
+        "stddev": 54.714785,
         "n_prompt": 2048,
         "n_gen": 0
       },
       "decode": {
-        "avg_tokens_per_second": 96.9,
-        "stddev": 3.0,
+        "avg_tokens_per_second": 89.148762,
+        "stddev": 1.769097,
         "n_prompt": 0,
         "n_gen": 256
       }

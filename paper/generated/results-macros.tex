@@ -3,90 +3,90 @@
 % read from. Regenerate with `make paper-data`; CI verifies
 % byte-identical regeneration with `make paper-check`.
 % -- decode / prefill by weight scheme, Qwen3-4B --
-\newcommand{\DecodeBF}{60.3}% 4b-bf16-decode.json decode_tokens_per_second.median commit 4cb3e5e MAD 0.67
-\newcommand{\PrefillBF}{355}% 4b-bf16-prefill.json prefill_tokens_per_second.median commit 1ca49c3 MAD 0.082
-\newcommand{\DecodeQEight}{98.2}% 4b-q8_0-decode.json decode_tokens_per_second.median commit 1ca49c3 MAD 0.035
-\newcommand{\PrefillQEight}{218}% 4b-q8_0-prefill.json prefill_tokens_per_second.median commit 1ca49c3 MAD 0.045
-\newcommand{\DecodeAffineFour}{130}% 4b-affine4_gs32-decode.json decode_tokens_per_second.median commit 1ca49c3 MAD 0.12
-\newcommand{\PrefillAffine}{297}% 4b-affine4_gs32-prefill.json prefill_tokens_per_second.median commit 1ca49c3 MAD 0.14
-\newcommand{\PrefillTwoKBF}{278}% 4b-bf16-prefill2k.json prefill_tokens_per_second.median commit 9506fd1 MAD 13
-\newcommand{\PrefillTwoKQEight}{70.4}% 4b-q8_0-prefill2k.json prefill_tokens_per_second.median commit 9506fd1 MAD 11
-\newcommand{\PrefillTwoKAffine}{102}% 4b-affine4_gs32-prefill2k.json prefill_tokens_per_second.median commit 9506fd1 MAD 9.5
-\newcommand{\PeakRSS}{41}% 4b-bf16-decode.json peak_resident_bytes.median (MB, scheme-invariant) commit 4cb3e5e
+\newcommand{\DecodeBF}{60.7}% 4b-bf16-decode.json decode_tokens_per_second.median commit 8a04db9 MAD 0.4
+\newcommand{\PrefillBF}{527}% 4b-bf16-prefill.json prefill_tokens_per_second.median commit 8a04db9 MAD 0.95
+\newcommand{\DecodeQEight}{97.9}% 4b-q8_0-decode.json decode_tokens_per_second.median commit 8a04db9 MAD 0.054
+\newcommand{\PrefillQEight}{488}% 4b-q8_0-prefill.json prefill_tokens_per_second.median commit 8a04db9 MAD 0.6
+\newcommand{\DecodeAffineFour}{130}% 4b-affine4_gs32-decode.json decode_tokens_per_second.median commit 8a04db9 MAD 0.13
+\newcommand{\PrefillAffine}{509}% 4b-affine4_gs32-prefill.json prefill_tokens_per_second.median commit 8a04db9 MAD 0.062
+\newcommand{\PrefillTwoKBF}{481}% 4b-bf16-prefill2k.json prefill_tokens_per_second.median commit 8a04db9 MAD 0.45
+\newcommand{\PrefillTwoKQEight}{441}% 4b-q8_0-prefill2k.json prefill_tokens_per_second.median commit 8a04db9 MAD 0.68
+\newcommand{\PrefillTwoKAffine}{466}% 4b-affine4_gs32-prefill2k.json prefill_tokens_per_second.median commit 8a04db9 MAD 0.022
+\newcommand{\PeakRSS}{41}% 4b-bf16-decode.json peak_resident_bytes.median (MB, scheme-invariant) commit 8a04db9
 % -- context scaling (q8_0, decode 32) --
-\newcommand{\CtxDecodeShort}{98.4}% ctx-3.json decode_tokens_per_second.median commit 1ca49c3
-\newcommand{\CtxDecodeLongest}{21.5}% ctx-12800.json decode_tokens_per_second.median commit 9506fd1
-\newcommand{\CtxDecodeTwoHundred}{95.2}% ctx-200.json decode_tokens_per_second.median commit 1ca49c3
-\newcommand{\CtxPrefillPeak}{217}% ctx-200.json prefill_tokens_per_second.median commit 1ca49c3
+\newcommand{\CtxDecodeShort}{98.4}% ctx-3.json decode_tokens_per_second.median commit 8a04db9
+\newcommand{\CtxDecodeLongest}{26.0}% ctx-12800.json decode_tokens_per_second.median commit 8a04db9
+\newcommand{\CtxDecodeTwoHundred}{95.2}% ctx-200.json decode_tokens_per_second.median commit 8a04db9
+\newcommand{\CtxPrefillPeak}{485}% ctx-800.json prefill_tokens_per_second.median commit 8a04db9
 % -- model-size sweep --
-\newcommand{\DecodeZeroSixBBF}{268}% 06b-bf16-decode.json decode_tokens_per_second.median commit 9506fd1
-\newcommand{\PrefillZeroSixBBF}{2100}% 06b-bf16-prefill.json prefill_tokens_per_second.median commit 9506fd1
-\newcommand{\DecodeEightBBF}{28.7}% 8b-bf16-decode.json decode_tokens_per_second.median commit 9506fd1
-\newcommand{\PrefillEightBBF}{82.9}% 8b-bf16-prefill.json prefill_tokens_per_second.median commit 9506fd1
-\newcommand{\DecodeEightBQEight}{46.3}% 8b-q8_0-decode.json decode_tokens_per_second.median commit 9506fd1
-\newcommand{\PrefillEightBQEight}{53.7}% 8b-q8_0-prefill.json prefill_tokens_per_second.median commit 9506fd1
+\newcommand{\DecodeZeroSixBBF}{269}% 06b-bf16-decode.json decode_tokens_per_second.median commit 8a04db9
+\newcommand{\PrefillZeroSixBBF}{1663}% 06b-bf16-prefill.json prefill_tokens_per_second.median commit 8a04db9
+\newcommand{\DecodeEightBBF}{33.5}% 8b-bf16-decode.json decode_tokens_per_second.median commit 8a04db9
+\newcommand{\PrefillEightBBF}{316}% 8b-bf16-prefill.json prefill_tokens_per_second.median commit 8a04db9
+\newcommand{\DecodeEightBQEight}{57.8}% 8b-q8_0-decode.json decode_tokens_per_second.median commit 8a04db9
+\newcommand{\PrefillEightBQEight}{331}% 8b-q8_0-prefill.json prefill_tokens_per_second.median commit 8a04db9
 % -- speculative decoding, ungated (spec.json) --
-\newcommand{\SpecBaseRep}{55.9}% spec.json repetitive.baseline_decode_tps commit c50eede
-\newcommand{\SpecDecodeRep}{173}% spec.json repetitive.spec_decode_tps commit c50eede
-\newcommand{\SpecSpeedupRep}{3.09}% spec.json repetitive.speedup commit c50eede
-\newcommand{\SpecSpeedupCode}{0.72}% spec.json code.speedup commit c50eede
-\newcommand{\SpecSpeedupGrounded}{0.40}% spec.json grounded.speedup commit c50eede
-\newcommand{\SpecSpeedupChat}{0.62}% spec.json chat.speedup commit c50eede
+\newcommand{\SpecBaseRep}{90.6}% spec.json repetitive.baseline_decode_tps commit 8a04db9
+\newcommand{\SpecDecodeRep}{190}% spec.json repetitive.spec_decode_tps commit 8a04db9
+\newcommand{\SpecSpeedupRep}{2.10}% spec.json repetitive.speedup commit 8a04db9
+\newcommand{\SpecSpeedupCode}{0.73}% spec.json code.speedup commit 8a04db9
+\newcommand{\SpecSpeedupGrounded}{0.27}% spec.json grounded.speedup commit 8a04db9
+\newcommand{\SpecSpeedupChat}{0.62}% spec.json chat.speedup commit 8a04db9
 % -- speculative decoding, adaptive gate (spec-gated.json) --
-\newcommand{\SpecAlphaRep}{1.00}% spec-gated.json repetitive.accept_rate commit c50eede
-\newcommand{\SpecAlphaCode}{0.19}% spec-gated.json code.accept_rate commit c50eede
-\newcommand{\SpecAlphaGrounded}{0.00}% spec-gated.json grounded.accept_rate commit c50eede
-\newcommand{\SpecAlphaChat}{0.09}% spec-gated.json chat.accept_rate commit c50eede
-\newcommand{\SpecBlkRep}{4.00}% spec-gated.json repetitive.block_efficiency commit c50eede
-\newcommand{\SpecBlkCode}{1.09}% spec-gated.json code.block_efficiency commit c50eede
-\newcommand{\SpecBlkGrounded}{1.00}% spec-gated.json grounded.block_efficiency commit c50eede
-\newcommand{\SpecBlkChat}{1.07}% spec-gated.json chat.block_efficiency commit c50eede
-\newcommand{\GatedSpeedupRep}{3.17}% spec-gated.json repetitive.speedup commit c50eede
-\newcommand{\GatedSpeedupCode}{0.89}% spec-gated.json code.speedup commit c50eede
-\newcommand{\GatedSpeedupGrounded}{0.89}% spec-gated.json grounded.speedup commit c50eede
-\newcommand{\GatedSpeedupChat}{0.80}% spec-gated.json chat.speedup commit c50eede
-\newcommand{\GatedDutyRep}{1.00}% spec-gated.json repetitive.draft_duty commit c50eede
-\newcommand{\GatedDutyCode}{0.06}% spec-gated.json code.draft_duty commit c50eede
-\newcommand{\GatedDutyGrounded}{0.04}% spec-gated.json grounded.draft_duty commit c50eede
-\newcommand{\GatedDutyChat}{0.10}% spec-gated.json chat.draft_duty commit c50eede
+\newcommand{\SpecAlphaRep}{1.00}% spec-gated.json repetitive.accept_rate commit 8a04db9
+\newcommand{\SpecAlphaCode}{0.19}% spec-gated.json code.accept_rate commit 8a04db9
+\newcommand{\SpecAlphaGrounded}{0.00}% spec-gated.json grounded.accept_rate commit 8a04db9
+\newcommand{\SpecAlphaChat}{0.09}% spec-gated.json chat.accept_rate commit 8a04db9
+\newcommand{\SpecBlkRep}{4.00}% spec-gated.json repetitive.block_efficiency commit 8a04db9
+\newcommand{\SpecBlkCode}{1.09}% spec-gated.json code.block_efficiency commit 8a04db9
+\newcommand{\SpecBlkGrounded}{1.00}% spec-gated.json grounded.block_efficiency commit 8a04db9
+\newcommand{\SpecBlkChat}{1.07}% spec-gated.json chat.block_efficiency commit 8a04db9
+\newcommand{\GatedSpeedupRep}{2.27}% spec-gated.json repetitive.speedup commit 8a04db9
+\newcommand{\GatedSpeedupCode}{1.24}% spec-gated.json code.speedup commit 8a04db9
+\newcommand{\GatedSpeedupGrounded}{0.90}% spec-gated.json grounded.speedup commit 8a04db9
+\newcommand{\GatedSpeedupChat}{0.84}% spec-gated.json chat.speedup commit 8a04db9
+\newcommand{\GatedDutyRep}{1.00}% spec-gated.json repetitive.draft_duty commit 8a04db9
+\newcommand{\GatedDutyCode}{0.06}% spec-gated.json code.draft_duty commit 8a04db9
+\newcommand{\GatedDutyGrounded}{0.04}% spec-gated.json grounded.draft_duty commit 8a04db9
+\newcommand{\GatedDutyChat}{0.10}% spec-gated.json chat.draft_duty commit 8a04db9
 % -- server batch scaling (server-batch.json) --
-\newcommand{\BatchChoicesTpsOne}{76.5}% server-batch.json aggregate_tokens_per_second.choices.1 commit 9506fd1
-\newcommand{\BatchConnsTpsOne}{60.7}% server-batch.json aggregate_tokens_per_second.concurrent.1 commit 9506fd1
-\newcommand{\BatchChoicesTpsTwo}{100}% server-batch.json aggregate_tokens_per_second.choices.2 commit 9506fd1
-\newcommand{\BatchConnsTpsTwo}{67.0}% server-batch.json aggregate_tokens_per_second.concurrent.2 commit 9506fd1
-\newcommand{\BatchChoicesTpsFour}{143}% server-batch.json aggregate_tokens_per_second.choices.4 commit 9506fd1
-\newcommand{\BatchConnsTpsFour}{70.2}% server-batch.json aggregate_tokens_per_second.concurrent.4 commit 9506fd1
-\newcommand{\BatchChoicesTpsEight}{78.0}% server-batch.json aggregate_tokens_per_second.choices.8 commit 9506fd1
-\newcommand{\BatchConnsTpsEight}{77.8}% server-batch.json aggregate_tokens_per_second.concurrent.8 commit 9506fd1
+\newcommand{\BatchChoicesTpsOne}{76.9}% server-batch.json aggregate_tokens_per_second.choices.1 commit 8a04db9
+\newcommand{\BatchConnsTpsOne}{55.9}% server-batch.json aggregate_tokens_per_second.concurrent.1 commit 8a04db9
+\newcommand{\BatchChoicesTpsTwo}{96.8}% server-batch.json aggregate_tokens_per_second.choices.2 commit 8a04db9
+\newcommand{\BatchConnsTpsTwo}{61.3}% server-batch.json aggregate_tokens_per_second.concurrent.2 commit 8a04db9
+\newcommand{\BatchChoicesTpsFour}{89.8}% server-batch.json aggregate_tokens_per_second.choices.4 commit 8a04db9
+\newcommand{\BatchConnsTpsFour}{78.5}% server-batch.json aggregate_tokens_per_second.concurrent.4 commit 8a04db9
+\newcommand{\BatchChoicesTpsEight}{80.1}% server-batch.json aggregate_tokens_per_second.choices.8 commit 8a04db9
+\newcommand{\BatchConnsTpsEight}{80.8}% server-batch.json aggregate_tokens_per_second.concurrent.8 commit 8a04db9
 % -- cross-request prefix reuse (prefix-reuse.json) --
-\newcommand{\PrefixPromptTokens}{6,890}% prefix-reuse.json prompt_tokens commit 9506fd1
-\newcommand{\PrefixAdoptedTokens}{6,880}% prefix-reuse.json adopted_tokens commit 9506fd1
-\newcommand{\PrefixColdSeconds}{70.1}% prefix-reuse.json cold_prompt_ms / 1000 commit 9506fd1
-\newcommand{\PrefixWarmMs}{122}% prefix-reuse.json warm_prompt_ms commit 9506fd1
-\newcommand{\PrefixSpeedup}{575}% prefix-reuse.json cold_prompt_ms / warm_prompt_ms (displayed operands) commit 9506fd1
+\newcommand{\PrefixPromptTokens}{6,890}% prefix-reuse.json prompt_tokens commit 8a04db9
+\newcommand{\PrefixAdoptedTokens}{6,880}% prefix-reuse.json adopted_tokens commit 8a04db9
+\newcommand{\PrefixColdSeconds}{30.4}% prefix-reuse.json cold_prompt_ms / 1000 commit 8a04db9
+\newcommand{\PrefixWarmMs}{174}% prefix-reuse.json warm_prompt_ms commit 8a04db9
+\newcommand{\PrefixSpeedup}{175}% prefix-reuse.json cold_prompt_ms / warm_prompt_ms (displayed operands) commit 8a04db9
 % -- serving under open-loop load (load.json) --
-\newcommand{\LoadPeakTps}{19.4}% load.json max output_tokens_per_s commit 9506fd1
-\newcommand{\LoadRateHigh}{4}% load.json max request_rate_per_s commit 9506fd1
-\newcommand{\LoadTtftPFiftyLow}{20560}% load.json lowest-rate ttft_s.p50 (ms) commit 9506fd1
-\newcommand{\LoadTtftPNinetyNineHigh}{93.9}% load.json highest-rate ttft_s.p99 (s) commit 9506fd1
-\newcommand{\LoadTtftPNinetyNinePeak}{108.5}% load.json max ttft_s.p99 across rates (s) commit 9506fd1
-\newcommand{\LoadRatePeakTtft}{2}% load.json rate of max ttft_s.p99 commit 9506fd1
-\newcommand{\LoadGoodputHigh}{0.00}% load.json highest-rate goodput_fraction commit 9506fd1
+\newcommand{\LoadPeakTps}{61.9}% load.json max output_tokens_per_s commit 8a04db9
+\newcommand{\LoadRateHigh}{4}% load.json max request_rate_per_s commit 8a04db9
+\newcommand{\LoadTtftPFiftyLow}{1290}% load.json lowest-rate ttft_s.p50 (ms) commit 8a04db9
+\newcommand{\LoadTtftPNinetyNineHigh}{16.6}% load.json highest-rate ttft_s.p99 (s) commit 8a04db9
+\newcommand{\LoadTtftPNinetyNinePeak}{16.6}% load.json max ttft_s.p99 across rates (s) commit 8a04db9
+\newcommand{\LoadRatePeakTtft}{4}% load.json rate of max ttft_s.p99 commit 8a04db9
+\newcommand{\LoadGoodputHigh}{0.00}% load.json highest-rate goodput_fraction commit 8a04db9
 % -- perplexity by weight scheme (ppl-4b.json) --
-\newcommand{\PplBF}{7.731}% ppl-4b.json results.bf16.ppl commit 1ca49c3
-\newcommand{\PplQEight}{7.733}% ppl-4b.json results.q8_0.ppl commit 1ca49c3
-\newcommand{\PplAffine}{8.170}% ppl-4b.json results.affine4_gs32.ppl commit 1ca49c3
-\newcommand{\PplDeltaQEightPct}{0.024}% ppl-4b.json (q8_0 - bf16)/bf16 * 100 commit 1ca49c3
-\newcommand{\PplDeltaAffinePct}{5.7}% ppl-4b.json (affine4_gs32 - bf16)/bf16 * 100 commit 1ca49c3
+\newcommand{\PplBF}{7.731}% ppl-4b.json results.bf16.ppl commit 8a04db9
+\newcommand{\PplQEight}{7.733}% ppl-4b.json results.q8_0.ppl commit 8a04db9
+\newcommand{\PplAffine}{8.171}% ppl-4b.json results.affine4_gs32.ppl commit 8a04db9
+\newcommand{\PplDeltaQEightPct}{0.022}% ppl-4b.json (q8_0 - bf16)/bf16 * 100 commit 8a04db9
+\newcommand{\PplDeltaAffinePct}{5.7}% ppl-4b.json (affine4_gs32 - bf16)/bf16 * 100 commit 8a04db9
 % -- llama.cpp head-to-head (llamacpp-qwen3-4b.json) --
-\newcommand{\LlamaDecodeBF}{39.9}% llamacpp-qwen3-4b.json results.bf16.decode.avg_tokens_per_second commit 178a6c4 stddev 0.7
-\newcommand{\LlamaPrefillBF}{2183}% llamacpp-qwen3-4b.json results.bf16.prefill.avg_tokens_per_second commit 178a6c4 stddev 1.3e+02
-\newcommand{\LlamaDecodeQEight}{64.3}% llamacpp-qwen3-4b.json results.q8_0.decode.avg_tokens_per_second commit 178a6c4 stddev 1.4
-\newcommand{\LlamaPrefillQEight}{2506}% llamacpp-qwen3-4b.json results.q8_0.prefill.avg_tokens_per_second commit 178a6c4 stddev 43
-\newcommand{\LlamaDecodeQFour}{96.9}% llamacpp-qwen3-4b.json results.q4_0.decode.avg_tokens_per_second commit 178a6c4 stddev 3
-\newcommand{\LlamaPrefillQFour}{2537}% llamacpp-qwen3-4b.json results.q4_0.prefill.avg_tokens_per_second commit 178a6c4 stddev 39
-\newcommand{\LlamaPrefillRatioBF}{7.9}% llamacpp-qwen3-4b.json bf16 prefill / kipp bf16 prefill2k median commit 178a6c4
-\newcommand{\LlamaDecodeRatioQEight}{1.53}% llamacpp-qwen3-4b.json kipp q8_0 decode median / llama q8_0 decode avg commit 178a6c4
+\newcommand{\LlamaDecodeBF}{35.0}% llamacpp-qwen3-4b.json results.bf16.decode.avg_tokens_per_second commit 178a6c4 stddev 0.24
+\newcommand{\LlamaPrefillBF}{2174}% llamacpp-qwen3-4b.json results.bf16.prefill.avg_tokens_per_second commit 178a6c4 stddev 51
+\newcommand{\LlamaDecodeQEight}{56.5}% llamacpp-qwen3-4b.json results.q8_0.decode.avg_tokens_per_second commit 178a6c4 stddev 0.8
+\newcommand{\LlamaPrefillQEight}{2329}% llamacpp-qwen3-4b.json results.q8_0.prefill.avg_tokens_per_second commit 178a6c4 stddev 85
+\newcommand{\LlamaDecodeQFour}{89.1}% llamacpp-qwen3-4b.json results.q4_0.decode.avg_tokens_per_second commit 178a6c4 stddev 1.8
+\newcommand{\LlamaPrefillQFour}{2420}% llamacpp-qwen3-4b.json results.q4_0.prefill.avg_tokens_per_second commit 178a6c4 stddev 55
+\newcommand{\LlamaPrefillRatioBF}{4.5}% llamacpp-qwen3-4b.json bf16 prefill / kipp bf16 prefill2k median commit 178a6c4
+\newcommand{\LlamaDecodeRatioQEight}{1.73}% llamacpp-qwen3-4b.json kipp q8_0 decode median / llama q8_0 decode avg commit 178a6c4
 % -- fault injection (faults.json) --
 \newcommand{\FaultCount}{four}% faults.json seeded fault modes commit 9cb357d
 \newcommand{\FaultControlNmse}{0}% faults.json faults.control.reference_nmse commit 9cb357d
@@ -95,16 +95,20 @@
 \newcommand{\FaultNmseRollover}{0}% faults.json faults.rollover.reference_nmse commit 9cb357d
 \newcommand{\FaultNmseSwapKv}{1.6\times 10^{0}}% faults.json faults.swap-kv.reference_nmse commit 9cb357d
 % -- gate costs (gate-costs.json) --
-\newcommand{\GateCostModel}{11.6}% gate-costs.json gates.model.seconds commit 1ca49c3
-\newcommand{\GateCostMultilogit}{15.4}% gate-costs.json gates.multilogit.seconds commit 1ca49c3
-\newcommand{\GateCostPhaseTwoModel}{49.6}% gate-costs.json gates.phase2-model.seconds commit 1ca49c3
-\newcommand{\GateCostPagedCpu}{340.8}% gate-costs.json gates.paged-cpu.seconds commit 1ca49c3
-\newcommand{\GateCostPooledCpu}{1378.5}% gate-costs.json gates.pooled-cpu.seconds commit 1ca49c3
-\newcommand{\GateCostMetalOperators}{0.4}% gate-costs.json gates.metal-operators.seconds commit 1ca49c3
-\newcommand{\GateCostPhaseThreeMetal}{35.4}% gate-costs.json gates.phase3-metal.seconds commit 1ca49c3
-\newcommand{\GateCostPagedMetal}{4.3}% gate-costs.json gates.paged-metal.seconds commit 1ca49c3
-\newcommand{\GateCostMultilogitMetal}{13.4}% gate-costs.json gates.multilogit-metal.seconds commit 1ca49c3
-\newcommand{\GateCostPooledMetal}{180.9}% gate-costs.json gates.pooled-metal.seconds commit 1ca49c3
-\newcommand{\GateCostTotalMinutes}{34}% gate-costs.json total_seconds 2030.3 -> minutes commit 1ca49c3
-\newcommand{\GateCostTotal}{34}% gate-costs.json total_seconds 2030.3 -> minutes commit 1ca49c3
-\newcommand{\MetalNmse}{3\times 10^{-8}}% gate-costs.json metal_full_logit_nmse commit 1ca49c3
+\newcommand{\GateCostModel}{9.2}% gate-costs.json gates.model.seconds commit 278828a
+\newcommand{\GateCostMultilogit}{15.5}% gate-costs.json gates.multilogit.seconds commit 278828a
+\newcommand{\GateCostPhaseTwoModel}{48.7}% gate-costs.json gates.phase2-model.seconds commit 278828a
+\newcommand{\GateCostPagedCpu}{335.4}% gate-costs.json gates.paged-cpu.seconds commit 278828a
+\newcommand{\GateCostPooledCpu}{1390.2}% gate-costs.json gates.pooled-cpu.seconds commit 278828a
+\newcommand{\GateCostMetalOperators}{0.6}% gate-costs.json gates.metal-operators.seconds commit 278828a
+\newcommand{\GateCostPhaseThreeMetal}{35.6}% gate-costs.json gates.phase3-metal.seconds commit 278828a
+\newcommand{\GateCostPagedMetal}{4.1}% gate-costs.json gates.paged-metal.seconds commit 278828a
+\newcommand{\GateCostMultilogitMetal}{13.5}% gate-costs.json gates.multilogit-metal.seconds commit 278828a
+\newcommand{\GateCostPooledMetal}{184.2}% gate-costs.json gates.pooled-metal.seconds commit 278828a
+\newcommand{\GateCostTotalMinutes}{34}% gate-costs.json total_seconds 2037.0 -> minutes commit 278828a
+\newcommand{\GateCostTotal}{34}% gate-costs.json total_seconds 2037.0 -> minutes commit 278828a
+\newcommand{\MetalNmse}{3\times 10^{-8}}% gate-costs.json metal_full_logit_nmse commit 278828a
+% -- CUDA gates (cuda-h100-gates.json) --
+\newcommand{\CudaGpuName}{NVIDIA H100 80GB HBM3}% cuda-h100-gates.json hardware.gpu commit 6d3c113
+\newcommand{\CudaCheckpointCount}{four}% cuda-h100-gates.json len(checkpoints) commit 6d3c113
+\newcommand{\CudaMaxNmse}{5.9\times 10^{-7}}% cuda-h100-gates.json max checkpoints.*.phase4-cuda.nmse_max_observed commit 6d3c113

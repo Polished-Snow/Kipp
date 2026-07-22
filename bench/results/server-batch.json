@@ -3,7 +3,7 @@
   "engine": {
     "backend": "metal",
     "binary": "build/kipp-server-metal",
-    "commit": "9506fd1b3ea1b4d404ff271af12ffbfeed663797",
+    "commit": "8a04db95b27141350469c6091bf24e0004a9c6be",
     "dirty": false,
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
@@ -27,16 +27,16 @@
   "runs": 3,
   "aggregate_tokens_per_second": {
     "choices": {
-      "1": 76.46,
-      "2": 100.01,
-      "4": 142.95,
-      "8": 78.03
+      "1": 76.93,
+      "2": 96.75,
+      "4": 89.85,
+      "8": 80.13
     },
     "concurrent": {
-      "1": 60.66,
-      "2": 67.05,
-      "4": 70.21,
-      "8": 77.83
+      "1": 55.87,
+      "2": 61.3,
+      "4": 78.55,
+      "8": 80.85
     }
   }
 }
