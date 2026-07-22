@@ -46,6 +46,7 @@ build/kipp_test_metal  --paged-metal $M $V  # same, Metal backend
 build/kipp_test_metal  --phase3-metal $M $V # Metal vs CPU oracle (argmax exact, NMSE <= 1e-4)
 build/kipp_test_metal  --metal-operators    # per-kernel operator tests
 make test-server                            # OpenAI Completions + Chat Completions
+make test-chat                              # --chat REPL smoke on the instruct GGUF
 ```
 
 Convenience targets that wire the same gates to the default checkpoint:
