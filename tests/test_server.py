@@ -477,6 +477,51 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("between 1 and 8", body["error"]["message"])
 
+    def test_choice_boundary_accepted(self) -> None:
+        status, body = self.completion(
+            prompt="hi", n=8, max_tokens=2, temperature=0
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["choices"]), 8)
+
+    def test_stop_boundary(self) -> None:
+        four = ["alpha", "beta", "gamma", "delta"]
+        status, _ = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, stop=four
+        )
+        self.assertEqual(status, 200)
+        status, body = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, stop=four + ["epsilon"]
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("stop", body["error"]["message"])
+
+    def test_logit_bias_boundary(self) -> None:
+        bias = {str(token): 1.0 for token in range(64)}
+        status, _ = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, logit_bias=bias
+        )
+        self.assertEqual(status, 200)
+        bias[str(64)] = 1.0
+        status, body = self.completion(
+            prompt="hi", max_tokens=2, temperature=0, logit_bias=bias
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("logit_bias", body["error"]["message"])
+
+    def test_logit_bias_forces_token(self) -> None:
+        # +100 on <|endoftext|> dominates every greedy step, so the first
+        # sampled token is the stop token: empty text, finish "stop".
+        status, body = self.completion(
+            prompt="The capital of France is",
+            max_tokens=8,
+            temperature=0,
+            logit_bias={"151643": 100.0},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["choices"][0]["text"], "")
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
     def test_streaming_multiple_choices(self) -> None:
         _, chunks, saw_done = self.stream_completion(
             prompt="The capital of France is", max_tokens=4, temperature=0,

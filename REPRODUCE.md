@@ -36,6 +36,7 @@ make test-sanitize   # ASan + UBSan
 
 Model gates run the built test binary directly against the pinned vectors
 (do **not** use `make test-model`'s vectors->convert chain for a quick gate —
+make test-ppl                         # CLI perplexity smoke over the pinned tokens
 it rewrites the multi-GB GGUF). With a converted `qwen3-4b-base` BF16 GGUF at
 `$M` and vectors at `$V`:
 

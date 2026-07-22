@@ -1,5 +1,5 @@
 .PHONY: all cpu server server-metal server-cuda test test-tools test-sanitize \
-	tools-env model convert vectors chat-vectors test-model test-phase2 \
+	tools-env model convert vectors chat-vectors test-model test-ppl test-phase2 \
 	test-paged-cpu test-pooled-cpu test-multilogit metal test-metal-ops \
 	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
 	test-server \
@@ -179,6 +179,14 @@ chat-vectors: tools-env
 
 test-model: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --model $(MODEL_GGUF) $(VECTOR_DIR)
+
+# Smoke-check the CLI perplexity mode against the pinned prompt tokens
+# (already LE uint32, the --ppl input format). Model-gated like test-model.
+test-ppl: $(BUILD_DIR)/kipp vectors
+	$(BUILD_DIR)/kipp --model $(MODEL_GGUF) \
+		--ppl $(VECTOR_DIR)/tokens.u32 --ppl-window 128 2>&1 | \
+		grep -E 'KIPP_PPL .* ppl=[0-9]+\.[0-9]+' >/dev/null && \
+		echo "PASS test-ppl"
 
 test-phase2: test-paged-cpu test-multilogit
 	$(BUILD_DIR)/kipp_test --phase2-model $(MODEL_GGUF) $(VECTOR_DIR)
