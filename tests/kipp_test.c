@@ -488,6 +488,49 @@ static void test_sample_ex(void) {
     CHECK(error.code == KIPP_ERROR_ARGUMENT);
 }
 
+/*
+ * The sampler skips the working copy when no bias or penalty can mutate the
+ * logits. A zero-valued bias entry forces the copy path without changing
+ * any value, so both paths must produce the same token from the same RNG
+ * state and leave the RNG in the same final state.
+ */
+static void test_sample_fast_paths(void) {
+    kipp_error error = {0};
+    float logits[64];
+    for (int index = 0; index < 64; ++index) {
+        logits[index] = (float)((index * 37 + 11) % 29) * 0.35f -
+                        (float)((index * 13) % 7);
+    }
+    uint32_t forced_token = 3;
+    float forced_value = 0.0f;
+    float temperatures[2] = {0.0f, 0.8f};
+    uint64_t seeds[4] = {1, 7, 99, 12345};
+    for (int temp_index = 0; temp_index < 2; ++temp_index) {
+        for (int seed_index = 0; seed_index < 4; ++seed_index) {
+            kipp_sample_params fast = {0};
+            fast.temperature = temperatures[temp_index];
+            fast.top_p = 0.9f;
+            fast.top_k = 40;
+            fast.repetition_penalty = 1.0f;
+            kipp_sample_params slow = fast;
+            slow.logit_bias_tokens = &forced_token;
+            slow.logit_bias_values = &forced_value;
+            slow.logit_bias_count = 1;
+
+            uint64_t fast_rng = seeds[seed_index];
+            uint64_t slow_rng = seeds[seed_index];
+            uint32_t fast_token = UINT32_MAX;
+            uint32_t slow_token = UINT32_MAX;
+            CHECK(kipp_sample_ex(logits, 64, &fast, &fast_rng, &fast_token,
+                                 &error) == 0);
+            CHECK(kipp_sample_ex(logits, 64, &slow, &slow_rng, &slow_token,
+                                 &error) == 0);
+            CHECK(fast_token == slow_token);
+            CHECK(fast_rng == slow_rng);
+        }
+    }
+}
+
 static void test_public_argument_checks(void) {
     kipp_error error = {0};
     kipp_model *model = (kipp_model *)(uintptr_t)1;
@@ -2668,6 +2711,7 @@ int main(int argc, char **argv) {
     RUN(test_gguf_reject_fuzz);
     RUN(test_sampler);
     RUN(test_sample_ex);
+    RUN(test_sample_fast_paths);
     RUN(test_public_argument_checks);
     RUN(test_registry_rejection);
     RUN(test_prompt_lookup);

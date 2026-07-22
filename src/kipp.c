@@ -3169,6 +3169,53 @@ static double uniform_unit(uint64_t *state) {
 }
 
 /*
+ * Sampling scratch. kipp_sample_ex runs once per generated token per choice,
+ * and a fresh working-copy + candidate malloc/free pair per call dominated
+ * its cost at the full 151,936-entry vocabulary. The scratch is thread-local
+ * so the library stays safe if a host embeds it in threads, lazily grown to
+ * the largest vocabulary seen, and never shrunk or freed.
+ */
+static _Thread_local float *sample_working;
+static _Thread_local sample_candidate *sample_candidates;
+static _Thread_local size_t sample_scratch_count;
+
+static int ensure_sample_scratch(size_t logits_count, kipp_error *error) {
+    if (logits_count <= sample_scratch_count) {
+        return 0;
+    }
+    float *working = realloc(sample_working,
+                             logits_count * sizeof(*sample_working));
+    if (working == NULL) {
+        return fail(error, KIPP_ERROR_MEMORY,
+                    "unable to allocate sampling logits");
+    }
+    sample_working = working;
+    sample_candidate *candidates =
+        realloc(sample_candidates, logits_count * sizeof(*sample_candidates));
+    if (candidates == NULL) {
+        return fail(error, KIPP_ERROR_MEMORY,
+                    "unable to allocate sampling candidates");
+    }
+    sample_candidates = candidates;
+    sample_scratch_count = logits_count;
+    return 0;
+}
+
+/*
+ * Bias and penalties mutate logits, which forces the working copy; plain
+ * temperature sampling reads the caller's logits directly. Mirrors the
+ * no-op conditions of apply_bias_and_penalties exactly.
+ */
+static bool sample_needs_working_copy(const kipp_sample_params *params) {
+    bool has_penalty = params->frequency_penalty != 0.0f ||
+                       params->presence_penalty != 0.0f ||
+                       (params->repetition_penalty != 0.0f &&
+                        params->repetition_penalty != 1.0f);
+    return params->logit_bias_count > 0 ||
+           (params->recent_count > 0 && has_penalty);
+}
+
+/*
  * Apply logit_bias and the recent-token penalties in place on a working
  * copy of the logits. Penalties look back over params->recent_tokens.
  */
@@ -3229,40 +3276,46 @@ int kipp_sample_ex(const float *logits, size_t logits_count,
                     "logits, params, and an output token are required");
     }
 
-    /* Bias and penalties can reorder logits, so work on a copy. */
-    float *working = malloc(logits_count * sizeof(*working));
-    if (working == NULL) {
-        return fail(error, KIPP_ERROR_MEMORY,
-                    "unable to allocate sampling logits");
+    /*
+     * Bias and penalties can reorder logits, so they work on a copy; plain
+     * temperature sampling reads the caller's logits in place. The values
+     * are bitwise-identical either way (the copy is an exact memcpy), so
+     * every downstream draw matches the always-copy behavior exactly.
+     */
+    const float *values = logits;
+    if (sample_needs_working_copy(params)) {
+        if (ensure_sample_scratch(logits_count, error) != 0) {
+            return -1;
+        }
+        memcpy(sample_working, logits, logits_count * sizeof(*sample_working));
+        apply_bias_and_penalties(sample_working, logits_count, params);
+        values = sample_working;
     }
-    memcpy(working, logits, logits_count * sizeof(*working));
-    apply_bias_and_penalties(working, logits_count, params);
 
     size_t argmax = 0;
     for (size_t index = 1; index < logits_count; ++index) {
-        if (working[index] > working[argmax]) {
+        if (values[index] > values[argmax]) {
             argmax = index;
         }
     }
     if (params->temperature <= 0.0f) {
         *out_token = (uint32_t)argmax;
-        free(working);
         return 0;
     }
     if (!(params->top_p > 0.0f && params->top_p <= 1.0f)) {
-        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "top_p must be greater than 0 and at most 1");
     }
     if (params->min_p < 0.0f || params->min_p > 1.0f) {
-        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "min_p must be between 0 and 1");
     }
     if (rng_state == NULL || *rng_state == 0) {
-        free(working);
         return fail(error, KIPP_ERROR_ARGUMENT,
                     "sampling requires a nonzero RNG state");
+    }
+    if (ensure_sample_scratch(logits_count, error) != 0) {
+        return -1;
     }
 
     /*
@@ -3271,25 +3324,18 @@ int kipp_sample_ex(const float *logits, size_t logits_count,
      * skipping them keeps the sort small during ordinary decoding.
      */
     float inverse_temperature = 1.0f / params->temperature;
-    float scaled_maximum = working[argmax] * inverse_temperature;
+    float scaled_maximum = values[argmax] * inverse_temperature;
     float cutoff = scaled_maximum - 20.0f;
-    sample_candidate *candidates =
-        malloc(logits_count * sizeof(*candidates));
-    if (candidates == NULL) {
-        free(working);
-        return fail(error, KIPP_ERROR_MEMORY,
-                    "unable to allocate sampling candidates");
-    }
+    sample_candidate *candidates = sample_candidates;
     size_t candidate_count = 0;
     for (size_t index = 0; index < logits_count; ++index) {
-        float scaled = working[index] * inverse_temperature;
+        float scaled = values[index] * inverse_temperature;
         if (scaled >= cutoff) {
             candidates[candidate_count].token = (uint32_t)index;
             candidates[candidate_count].logit = scaled;
             ++candidate_count;
         }
     }
-    free(working);
     qsort(candidates, candidate_count, sizeof(*candidates),
           compare_sample_candidates);
 
@@ -3344,7 +3390,6 @@ int kipp_sample_ex(const float *logits, size_t logits_count,
             break;
         }
     }
-    free(candidates);
     *out_token = token;
     return 0;
 }
