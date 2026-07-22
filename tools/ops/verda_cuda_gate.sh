@@ -147,8 +147,15 @@ remote "apt-get install -y python3-dev >/dev/null 2>&1 || true"
 log "building CUDA targets"
 remote "cd /root/kipp && make build/kipp_test_cuda NVCC=/usr/local/cuda/bin/nvcc"
 
+# Machine identity for the gate log; tools/ops/collect_cuda_gates.py parses
+# these lines into bench/results/cuda-a100-gates.json.
+echo "KIPP_CUDA_GATE_GPU $(remote 'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader' 2>/dev/null)"
+echo "KIPP_CUDA_GATE_COMMIT $(git -C "$ROOT" rev-parse HEAD)"
+echo "KIPP_CUDA_GATE_INSTANCE $INSTANCE_TYPE $IMAGE"
+
 for id in $CHECKPOINTS; do
     log "gating $id"
+    echo "KIPP_CUDA_GATE_CHECKPOINT $id"
     case "$id" in
         qwen3-32b) VEC_FLAGS="--device cuda --dtype bfloat16" ;;
         *) VEC_FLAGS="" ;;
