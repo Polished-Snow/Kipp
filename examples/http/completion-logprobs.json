@@ -1,0 +1,7 @@
+{
+  "model": "qwen3-4b-base",
+  "prompt": "The capital of France is",
+  "max_tokens": 4,
+  "temperature": 0,
+  "logprobs": 3
+}

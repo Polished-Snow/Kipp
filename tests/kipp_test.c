@@ -967,6 +967,79 @@ static void test_chat_render(void) {
     CHECK(out == NULL);
 }
 
+/*
+ * The --chat REPL evaluates only each render's byte suffix. That is sound
+ * iff the previous render plus the generated reply is a byte prefix of the
+ * next render, which holds exactly when the assistant history content is
+ * recorded as the generation prompt's thinking suffix plus the reply; the
+ * unevaluated suffix then begins at the <|im_end|> special-token boundary
+ * (the sampled stop token never enters the KV cache).
+ */
+static void test_chat_prefix_invariant(void) {
+    static const struct {
+        kipp_variant variant;
+        bool enable_thinking;
+        const char *think_prefix;
+    } cases[] = {
+        {KIPP_VARIANT_INSTRUCT, true, ""},
+        {KIPP_VARIANT_INSTRUCT, false, "<think>\n\n</think>\n\n"},
+        {KIPP_VARIANT_INSTRUCT_2507, true, ""},
+        {KIPP_VARIANT_THINKING_2507, true, "<think>\n"},
+    };
+    static const char continuation[] = "<|im_end|>\n<|im_start|>user\n";
+    for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]);
+         ++index) {
+        kipp_error error = {0};
+        kipp_chat_options options = {cases[index].variant, true,
+                                     cases[index].enable_thinking};
+        kipp_chat_message first_turn[] = {{KIPP_ROLE_USER, "hi"}};
+        char *first_render = NULL;
+        CHECK(kipp_chat_render(first_turn, 1, &options, &first_render,
+                               &error) == 0);
+        if (first_render == NULL) {
+            continue;
+        }
+
+        const char *reply = "Hello.";
+        char content[64];
+        (void)snprintf(content, sizeof(content), "%s%s",
+                       cases[index].think_prefix, reply);
+        kipp_chat_message second_turn[] = {
+            {KIPP_ROLE_USER, "hi"},
+            {KIPP_ROLE_ASSISTANT, content},
+            {KIPP_ROLE_USER, "again"},
+        };
+        char *second_render = NULL;
+        CHECK(kipp_chat_render(second_turn, 3, &options, &second_render,
+                               &error) == 0);
+        if (second_render == NULL) {
+            kipp_text_free(first_render);
+            continue;
+        }
+
+        size_t first_length = strlen(first_render);
+        size_t reply_length = strlen(reply);
+        int prefix_holds =
+            strncmp(second_render, first_render, first_length) == 0 &&
+            strncmp(second_render + first_length, reply,
+                    reply_length) == 0 &&
+            strncmp(second_render + first_length + reply_length,
+                    continuation, sizeof(continuation) - 1) == 0;
+        CHECK(prefix_holds);
+        if (!prefix_holds) {
+            fprintf(stderr,
+                    "chat prefix invariant broke for variant %d "
+                    "(thinking %d)\nevaluated bytes:\n%s%s\n"
+                    "second render:\n%s\n",
+                    (int)cases[index].variant,
+                    (int)cases[index].enable_thinking, first_render, reply,
+                    second_render);
+        }
+        kipp_text_free(first_render);
+        kipp_text_free(second_render);
+    }
+}
+
 static void test_malformed_gguf(void) {
     char path[] = "/tmp/kipp-malformed-XXXXXX";
     int descriptor = mkstemp(path);
@@ -2890,6 +2963,7 @@ int main(int argc, char **argv) {
     RUN(test_prompt_lookup);
     RUN(test_spec_gate);
     RUN(test_chat_render);
+    RUN(test_chat_prefix_invariant);
     RUN(test_kv_pool_reuse);
     RUN(test_kv_pool_refcount);
     RUN(test_kv_pool_revive);

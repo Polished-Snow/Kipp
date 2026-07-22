@@ -2,7 +2,7 @@
 	tools-env model convert vectors chat-vectors test-model test-ppl test-phase2 \
 	test-paged-cpu test-pooled-cpu test-multilogit metal test-metal-ops \
 	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
-	test-server \
+	test-chat test-server \
 	cuda-spark cuda-generic \
 	test-cuda-ops test-cuda docs docs-check paper-data paper-check clean
 
@@ -17,6 +17,7 @@ MODEL_GGUF := $(MODEL_DIR)/kipp-$(CHECKPOINT)-bf16.gguf
 VECTOR_DIR := tests/test-vectors/$(CHECKPOINT)
 CHAT_SOURCE := models/$(CHAT_CHECKPOINT)/source
 CHAT_VECTOR := tests/test-vectors/$(CHAT_CHECKPOINT)/chat-cases.json
+CHAT_MODEL_GGUF := models/$(CHAT_CHECKPOINT)/kipp-$(CHAT_CHECKPOINT)-bf16.gguf
 
 CPPFLAGS := -Isrc
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
@@ -35,7 +36,7 @@ CUDA_SPARK_ARCH_FLAGS ?= -gencode arch=compute_121,code=sm_121
 CORE_HEADERS := src/kipp.h src/kipp_backend.h src/kipp_checkpoints.h \
 	src/kipp_kv_pool.h src/kipp_unicode.inc
 CLI_OBJECTS := $(BUILD_DIR)/kipp_cli.o $(BUILD_DIR)/kipp_spec.o \
-	$(BUILD_DIR)/kipp_kv_pool.o
+	$(BUILD_DIR)/kipp_chat.o $(BUILD_DIR)/kipp_kv_pool.o
 SERVER_OBJECTS := $(BUILD_DIR)/kipp_server.o $(BUILD_DIR)/kipp_chat.o \
 	$(BUILD_DIR)/kipp_json.o $(BUILD_DIR)/kipp_http.o \
 	$(BUILD_DIR)/kipp_kv_pool.o
@@ -52,7 +53,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/kipp.o: src/kipp.c $(CORE_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp.c -o $@
 
-$(BUILD_DIR)/kipp_cli.o: src/kipp_cli.c src/kipp.h | $(BUILD_DIR)
+$(BUILD_DIR)/kipp_cli.o: src/kipp_cli.c src/kipp.h src/kipp_chat.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/kipp_cli.c -o $@
 
 $(BUILD_DIR)/kipp: $(BUILD_DIR)/kipp.o $(CLI_OBJECTS)
@@ -216,6 +217,13 @@ test-pooled-metal: $(BUILD_DIR)/kipp_test_metal vectors
 
 test-metal: test-metal-ops test-multilogit-metal test-paged-metal
 	$(BUILD_DIR)/kipp_test_metal --phase3-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
+# Chat REPL smoke test against an already-converted instruct GGUF; does not
+# run the vectors/convert chain (which rewrites the multi-GB artifact).
+test-chat: $(BUILD_DIR)/kipp-metal
+	printf 'Say hi\nexit\n' | $(BUILD_DIR)/kipp-metal --backend metal \
+		--model $(CHAT_MODEL_GGUF) --chat --decode 8 --temperature 0 \
+		| grep -q .
 
 test-server: $(BUILD_DIR)/kipp-server-metal
 	KIPP_SERVER_BINARY=$(BUILD_DIR)/kipp-server-metal \
