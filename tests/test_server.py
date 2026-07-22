@@ -563,6 +563,59 @@ class ServerTests(unittest.TestCase):
                 body["choices"][0]["text"], serial[1]["choices"][0]["text"]
             )
 
+    def test_more_than_eight_concurrent_decode(self) -> None:
+        # 12 concurrent n=1 requests must all decode together now that the
+        # generation cap matches the 32-item batch limit (it was 8).
+        request = {
+            "prompt": "The capital of France is",
+            "max_tokens": 48,
+            "temperature": 0,
+        }
+        serial = self.completion(**request)
+        self.assertEqual(serial[0], 200)
+        running_high = {"value": 0}
+        stop_polling = {"value": False}
+
+        def poll_running() -> None:
+            import re
+
+            while not stop_polling["value"]:
+                try:
+                    _, text = self.raw_get("/metrics")
+                    match = re.search(
+                        r"^kipp_requests_running (\d+)$", text, re.M
+                    )
+                    if match:
+                        running_high["value"] = max(
+                            running_high["value"], int(match.group(1))
+                        )
+                except OSError:
+                    pass
+                time.sleep(0.05)
+
+        import threading
+
+        poller = threading.Thread(target=poll_running)
+        poller.start()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=12
+            ) as pool:
+                futures = [
+                    pool.submit(self.completion, **request)
+                    for _ in range(12)
+                ]
+                results = [f.result(timeout=300) for f in futures]
+        finally:
+            stop_polling["value"] = True
+            poller.join(timeout=10)
+        for status, body in results:
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                body["choices"][0]["text"], serial[1]["choices"][0]["text"]
+            )
+        self.assertGreaterEqual(running_high["value"], 9)
+
     def test_concurrent_mixed_prompts(self) -> None:
         prompts = [
             "The capital of France is",

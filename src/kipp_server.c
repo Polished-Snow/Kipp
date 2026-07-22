@@ -52,7 +52,13 @@
 #define SERVER_STOP_LIMIT 4u
 #define SERVER_CHOICE_LIMIT 8u
 #define SERVER_MAX_CONNECTIONS 64u
-#define SERVER_MAX_GENERATIONS 8u
+/*
+ * Concurrent in-flight generations. Matched to KIPP_EVAL_BATCH_LIMIT so a
+ * full batch of n=1 requests can decode together; total *choices* across
+ * generations are still admission-capped at the batch limit, so the
+ * scheduler's per-step item array can never overflow.
+ */
+#define SERVER_MAX_GENERATIONS 32u
 #define SERVER_PREFILL_CHUNK 32u
 #define SERVER_OUTPUT_LIMIT (4u * 1024u * 1024u)
 
