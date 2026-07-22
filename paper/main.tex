@@ -602,8 +602,7 @@ stages activations as BF16 and walks 32-row by 16-token output tiles with
 FP32 accumulation. The quantized MMA kernels dequantize each 32-weight block
 into a threadgroup tile once per 16 tokens and run the same fragment loop,
 reading activations directly in FP32, so the dequantization cost no longer
-scales with token count; prefill remains slower under quantization, because
-dequantization adds arithmetic to a compute-bound phase
+scales with token count and quantized prefill tracks BF16 closely
 (\Cref{sec:eval-throughput}). Attention comes in two shapes, both in the
 FlashAttention lineage
 \citep{dao2022flashattention,dao2023flashdecoding}. Decode uses a split-K
@@ -611,12 +610,13 @@ streaming online-softmax kernel: eight simdgroups per (head, token) each
 scan every eighth source position through the block table, and partial
 softmaxes merge in threadgroup memory; no score matrix is materialized.
 Prefill uses a tiled simdgroup-matrix flash kernel whose 32-position KV
-tiles coincide with cache blocks, added late in development; it currently
-dominates prefill cost (\Cref{sec:eval-ablation}).
+tiles coincide with cache blocks; its arrival also produced the
+silent-fallback episode of \Cref{sec:eval-ablation}.
 
 The CUDA backend is smaller, and we state its scope exactly: contiguous KV,
 BF16 weights only, final-row logits only, materialized-score attention,
-correctness-gated against the oracle on cloud A100s (\Cref{tab:correct}).
+correctness-gated against the oracle on ephemeral cloud GPUs
+(\Cref{tab:correct}).
 CUDA paging is future work. No Metal code bends to accommodate CUDA or vice
 versa.
 
@@ -686,9 +686,16 @@ and Chat Completions APIs with continuous batching \citep{yu2022orca},
 chunked prefill \citep{agrawal2024sarathi}, a native Qwen3 ChatML renderer,
 the full sampling surface, generated-token log-probabilities, and Prometheus
 metrics. Multiple choices and concurrent requests decode through one batched
-eval per step, so each step reads the weights once for all active sequences.
-The scheduler admits requests FIFO with capacity-based backpressure, and
-holds streamed bytes back while they could still grow into a stop string.
+eval per step, so each step reads the weights once for all active sequences;
+the admission cap equals the backend batch limit (32 concurrent
+generations), so single-choice traffic can fill the whole batch.
+The scheduler admits requests FIFO with capacity-based backpressure, holds
+streamed bytes back while they could still grow into a stop string, reaps
+idle client connections on a deadline, and exports TTFT, queue-wait, and
+decode-time counters alongside the pool gauges. The same engine also backs
+a CLI with one-shot generation, perplexity scoring, and a multi-turn chat
+REPL that re-evaluates only each turn's rendered suffix against the
+retained KV.
 
 \section{Evaluation}
 \label{sec:eval}
@@ -714,7 +721,10 @@ several-fold gaps and large run-to-run swings before controlling for it
 --- so a burst benchmark on a consumer SoC can silently report the ramp, not
 the engine. Every number in this paper is sustained steady-state: idle
 machine, multi-minute warm-up, back-to-back single-session measurement, and
-a MAD-based acceptance bound, as documented in \code{bench/README.md}.
+a MAD-based acceptance bound, as documented in \code{bench/README.md}. The
+harness also refuses to record Metal results while the bridge reports a
+kernel-compile fallback, a tripwire earned the hard way
+(\Cref{sec:eval-ablation}).
 
 For serving experiments we use the standard load metrics
 \citep{zhong2024distserve}: time to first token (TTFT), time per output
@@ -746,15 +756,16 @@ Gate & Result \\
 CPU vs.\ pinned FP32 reference   & arg\,max exact, NMSE ${\le}5{\cdot}10^{-5}$ \\
 CPU vs.\ its own prior releases  & bitwise identical \\
 Metal vs.\ CPU oracle            & arg\,max exact, NMSE $\MetalNmse$ \\
-CUDA vs.\ CPU oracle (A100)$^a$  & arg\,max exact, NMSE ${\le}10^{-6}$ \\
+CUDA vs.\ CPU oracle (H100)$^a$  & arg\,max exact, NMSE ${\le}\CudaMaxNmse$ \\
 Paged vs.\ contiguous (CPU)      & bitwise, scrambled table \\
 Paged vs.\ contiguous (Metal)    & bitwise, scrambled table \\
 Spec.\ vs.\ greedy decode        & token-identical \\
 \bottomrule
 \multicolumn{2}{l}{\scriptsize $^a$ CUDA scope: contiguous KV, BF16
-weights, final-row logits. Measured at the} \\
-\multicolumn{2}{l}{\scriptsize \ \ Phase-4 milestone gate on an NVIDIA A100;
-not re-run for this draft (\Cref{sec:discussion}).}
+weights, final-row logits. Revalidated on an} \\
+\multicolumn{2}{l}{\scriptsize \ \ ephemeral cloud \CudaGpuName{} across
+\CudaCheckpointCount{} checkpoints} \\
+\multicolumn{2}{l}{\scriptsize \ \ (\code{bench/results/cuda-h100-gates.json}).}
 \end{tabular}
 \end{table}
 
@@ -839,12 +850,12 @@ swap-kv      & $\FaultNmseSwapKv$      & flipped & caught  & \emph{missed} \\
 \label{sec:eval-throughput}
 \Cref{tab:perf} reports decode and prefill throughput by weight scheme.
 Decode is bandwidth-bound, so quantization scales it as it shrinks the
-weight bytes streamed per token. Prefill is compute-bound and moves the
-other way: quantized prefill trails BF16 (\PrefillQEight{} and
-\PrefillAffine{} vs.\ \PrefillBF~tok/s), because dequantization adds
-arithmetic to a phase where bandwidth no longer dominates, and the whole
-phase is currently bounded by the attention-prefill kernel rather than the
-matmuls (\Cref{sec:eval-ablation}).
+weight bytes streamed per token. Prefill is compute-bound, and the
+quantized MMA kernels hold it near BF16 (\PrefillQEight{} and
+\PrefillAffine{} vs.\ \PrefillBF~tok/s, within $4$--$8\%$): dequantizing
+each 32-weight block once per 16-token tile keeps the added arithmetic off
+the critical path, so quantization buys its decode speedup without
+surrendering prefill.
 
 Speed is only half the tradeoff. \Cref{fig:quality} plots each scheme's
 WikiText-2 perplexity against its decode throughput, which is the plot a
@@ -857,8 +868,7 @@ the three (\DecodeAffineFour~tok/s).
 
 \begin{table}[t]\centering\small
 \caption{Throughput (tok/s), Qwen3-4B, Apple M5~Max Metal, median of 5.
-Median absolute deviations are ${\le}0.2$ tok/s except BF16 decode
-($0.67$) (per-run
+Median absolute deviations are ${\le}1$ tok/s throughout (per-run
 distributions in the committed result files).}
 \label{tab:perf}
 \begin{tabular}{lrr}
@@ -941,10 +951,10 @@ parameter count.}
 decode, median of 3; \code{bench/results/ctx-*.json}). Decode degrades
 gracefully, from \CtxDecodeShort{} to \CtxDecodeLongest~tok/s between a 3-
 and a 12{,}800-token context, as the per-step KV read grows against the
-fixed weight stream. Prefill peaks early, near \CtxPrefillPeak~tok/s at a
-200-token prompt, and then falls steadily with context: the tiled
-attention-prefill kernel's cost grows quadratically with prompt length and
-comes to dominate the projections (\Cref{sec:eval-ablation}).
+fixed weight stream. Prefill peaks near \CtxPrefillPeak~tok/s at an
+800-token prompt and then declines steadily with context, the expected
+shape once attention's quadratic term grows against the linear matmul
+work; at 12{,}800 tokens prefill still sustains over a third of its peak.
 
 \begin{figure}[t]\centering
 \begin{tikzpicture}
@@ -963,8 +973,8 @@ comes to dominate the projections (\Cref{sec:eval-ablation}).
 \end{tikzpicture}
 \caption{Context scaling (Qwen3-4B Q8\_0, M5~Max Metal; error bars show
 MAD). Decode falls as the per-step KV read grows; prefill peaks at short
-context and falls as the attention-prefill kernel's quadratic cost comes to
-dominate.}
+context and declines as attention's quadratic cost grows against the
+linear matmul work.}
 \Description{Line plot of decode and prefill throughput against prompt
 length on a log axis.}
 \label{fig:ctx}
@@ -983,17 +993,21 @@ single-stream rate (sampled decoding, median of 3;
 \BatchChoicesTpsEight~tok/s aggregate; $1/2/4/8$ independent connections
 deliver \BatchConnsTpsOne, \BatchConnsTpsTwo, \BatchConnsTpsFour, and
 \BatchConnsTpsEight.
-The two series differ even at $n{=}1$ because they measure different
+The two series differ at $n{=}1$ because they measure different
 aggregates: parallel choices share one prompt's prefill across the batch,
 while concurrent connections each pay their own prefill inside the
-measured window, so the connections series sits lower at every $n$ (the
-ideal-linear reference is therefore anchored on the choices series).
-Parallel choices scale to nearly $2\times$ at $n{=}4$ and then \emph{drop}
-at $n{=}8$: each additional choice adds per-step CPU-side sampling work in
-the single-threaded scheduler, the GPU idles longer between batched steps,
-and the demand-scaled clocks of \Cref{sec:eval-setup} sag in response --- a
+measured window (the ideal-linear reference is therefore anchored on the
+choices series).
+The shapes then diverge instructively. Independent connections scale
+monotonically through $n{=}8$, as batched decode amortizes the weight
+stream across every admitted request. Parallel
+choices peak at $n{=}2$ and then \emph{decline}: each additional choice
+adds per-step CPU-side sampling work in the single-threaded scheduler
+(these runs sample at temperature $0.8$, so the greedy fast path does not
+apply), the GPU idles longer between batched steps, and the demand-scaled
+clocks of \Cref{sec:eval-setup} sag in response --- a
 serving-on-consumer-SoC effect a fixed-clock datacenter GPU would not show.
-The widening gap to the ideal line is that scheduling cost made visible.
+The gap to the ideal line is that scheduling cost made visible.
 
 \begin{figure}[t]\centering
 \begin{tikzpicture}
@@ -1011,9 +1025,10 @@ The widening gap to the ideal line is that scheduling cost made visible.
 \end{axis}
 \end{tikzpicture}
 \caption{Batch scaling on the pooled Q8\_0 server (M5~Max). The dashed line
-is ideal linear scaling from the single-stream rate. Scheduling overhead
-widens the gap, and at $n{=}8$ per-step CPU-side sampling stalls the GPU
-long enough for demand-scaled clocks to sag.}
+is ideal linear scaling from the single-stream rate. Independent
+connections scale monotonically; parallel choices peak at $n{=}2$, where
+per-step CPU-side sampling begins stalling the GPU long enough for
+demand-scaled clocks to sag.}
 \Description{Line plot of aggregate throughput against number of concurrent
 sequences, with a dashed ideal-scaling reference.}
 \label{fig:batch}
@@ -1029,26 +1044,26 @@ and goodput under a fixed SLO (\Cref{fig:load};
 the offered rate at which tail latency leaves the knee, and how much of the
 offered load still meets its SLO beyond it.
 
-The verdict for this workload (32-request bursts of 348-token prompts) is
-blunt: a single consumer-SoC GPU saturates below the lowest offered rate we
-test. Aggregate output tops out near \LoadPeakTps~tok/s, median TTFT is
-already \LoadTtftPFiftyLow~ms at $0.5$~req/s, p99 TTFT peaks at
-\LoadTtftPNinetyNinePeak~s at \LoadRatePeakTtft~req/s before settling to
-\LoadTtftPNinetyNineHigh~s at \LoadRateHigh~req/s (the burst drains before
-the highest rate's window closes), and goodput under the
-default SLO collapses to \LoadGoodputHigh{} beyond the lowest rate. TPOT
-stays modest throughout (\Cref{fig:load}, right): once a request starts
-decoding it flows at batched-decode speed, so the latency is
-queueing-dominated, not decode-dominated. The system behaves exactly as the
+The verdict for this workload (32-request bursts of 348-token prompts): at
+$0.5$~req/s the server holds its service-level objective for the large
+majority of requests (median TTFT \LoadTtftPFiftyLow~ms), and goodput
+collapses to \LoadGoodputHigh{} from $2$~req/s on. Past the knee the
+overload lands where an admission-controlled FIFO puts it: p99 TTFT grows
+monotonically with queue depth to \LoadTtftPNinetyNineHigh~s at
+\LoadRateHigh~req/s, aggregate output tops out near \LoadPeakTps~tok/s,
+and per-token latency rises only with batch occupancy --- TPOT roughly
+triples from the lowest to the highest offered rate as more requests share
+each batched decode step, then flattens (\Cref{fig:load}, right). The
+system behaves exactly as the
 batch-scaling analysis predicts --- admission control and the FIFO queue
-protect correctness and steady per-token latency, and time to first token
-absorbs the overload.
+protect correctness, decode throughput degrades only by batch sharing, and
+time to first token absorbs the overload.
 
 \begin{figure*}[t]\centering
 \begin{tikzpicture}
 \begin{axis}[kippplot, width=0.44\textwidth,
   xlabel={offered rate (req/s)}, ylabel={TTFT (s)},
-  xmin=0.4, xmax=4.2, ymin=0, ymax=120,
+  xmin=0.4, xmax=4.2, ymin=0, ymax=20,
   legend columns=3,
   legend style={at={(0.97,0.03)}, anchor=south east},
 ]
@@ -1072,8 +1087,9 @@ absorbs the overload.
 \end{tikzpicture}
 \caption{Serving under open-loop Poisson load (Qwen3-4B Q8\_0, pooled
 server, M5~Max): TTFT and TPOT percentiles against offered request rate.
-TTFT grows with queue depth while TPOT holds nearly flat --- the overloaded
-server queues, it does not degrade decode.}
+TTFT grows with queue depth; TPOT rises with batch occupancy and then
+flattens --- the overloaded server queues and shares each decode step, it
+does not thrash.}
 \Description{Two panels of latency percentiles against offered request
 rate.}
 \label{fig:load}
@@ -1121,10 +1137,14 @@ efficiency (accepted tokens per target forward), and wall-clock speedup
 across four workloads, with and without adaptive gating. The A/B is
 paired: for each workload the harness measures plain decode, ungated
 speculation, and gated speculation adjacently within one session, so both
-speedup columns share a single baseline (the $2.6\%$ gap between the two
+speedup columns share a single baseline (the gap between the two
 mechanically identical repetitive configurations, $\SpecSpeedupRep\times$
 vs.\ $\GatedSpeedupRep\times$ at duty $1.0$, bounds residual run-to-run
-variance). Ungated prompt-lookup lifts
+variance). One honest denominator note: a greedy-sampling fast path landed
+in the same revision as this measurement session, so the plain-decode
+baselines are faster than in earlier drafts and every speculation ratio is
+correspondingly compressed --- same absolute wall-clock wins, smaller
+multipliers. Ungated prompt-lookup lifts
 copy-heavy decode from \SpecBaseRep{} to \SpecDecodeRep~tok/s
 ($\SpecSpeedupRep\times$) at $\alpha{=}1.0$. However, it slows code to
 $\SpecSpeedupCode\times$ and grounded text to as little as
@@ -1133,10 +1153,10 @@ weight streaming at small draft batch, so each speculative step costs close
 to $k{+}1$ decodes while advancing by only accepted${}+1$ tokens. The
 adaptive gate suspends drafting on exactly those workloads --- its duty
 cycle (the fraction of steps that draft) makes the mechanism visible ---
-and pulls every losing workload back toward parity, with a floor of
-$\GatedSpeedupChat\times$, while keeping the copy-heavy win
-($\GatedSpeedupRep\times$). In every configuration the emitted tokens are
-identical to greedy decoding; speculation changes only the wall clock.
+and holds every workload at or above $\GatedSpeedupChat\times$, pushing
+code past parity ($\GatedSpeedupCode\times$) while keeping the copy-heavy
+win ($\GatedSpeedupRep\times$). In every configuration the emitted tokens
+are identical to greedy decoding; speculation changes only the wall clock.
 
 \begin{table}[t]\centering\small
 \caption{Prompt-lookup speculation by workload (Qwen3-4B Q8\_0, M5~Max,
@@ -1183,7 +1203,8 @@ Open-ended & \SpecAlphaChat & \SpecBlkChat &
 \end{tikzpicture}
 \caption{Speculation speedup by workload, with and without the adaptive
 gate. The dashed line is parity with plain decode: gating preserves the
-repetitive-workload win and pulls every losing workload back toward parity.}
+repetitive-workload win, pushes code past parity, and pulls the remaining
+workloads back to it.}
 \Description{Grouped bar chart of speculation speedup per workload, ungated
 and gated, with a parity line at one.}
 \label{fig:spec}
@@ -1202,26 +1223,20 @@ both ways. On decode, the phase that dominates serving cost, Kipp is faster
 in every matched scheme, about $\LlamaDecodeRatioQEight\times$ at 8-bit
 (\DecodeQEight{} vs.\ \LlamaDecodeQEight~tok/s), and its affine4 outruns
 llama.cpp's Q4\_0 (\DecodeAffineFour{} vs.\ \LlamaDecodeQFour). The
-verification discipline costs nothing where it matters most. On prefill the
-loss is heavy: llama.cpp is about $\LlamaPrefillRatioBF\times$ faster at
+verification discipline costs nothing where it matters most. On prefill
+llama.cpp leads, about $\LlamaPrefillRatioBF\times$ at
 BF16 (\LlamaPrefillBF{} vs.\ \PrefillTwoKBF~tok/s at 2{,}048 tokens) and
-more at the quantized schemes, reflecting years of kernel engineering
-(larger tiles, threadgroup-level pipelining, autotuned dispatch) that
-Kipp's readable single-kernel-per-op design does not attempt --- and,
-concretely, Kipp's attention-prefill bottleneck
-(\Cref{sec:eval-ablation}). Kipp is not the fastest prefill engine and does
+somewhat more at the quantized schemes, reflecting years of kernel
+engineering (larger tiles, threadgroup-level pipelining, autotuned
+dispatch) that
+Kipp's readable single-kernel-per-op design does not attempt. Kipp is not
+the fastest prefill engine and does
 not try to be; its scope is one pinned family with no autotuning, and we
 present this number as the measured price of a readable, verifiable prefill
-path today. Four caveats on fairness. \code{llama-bench} reports
-mean$\pm$stddev while Kipp reports median$\pm$MAD. We quote llama.cpp's
-best stable session of the day: its sub-100-ms dispatches are maximally
-sensitive to the demand-scaled clocks of \Cref{sec:eval-setup}, so its
-sessions varied by up to a third under accumulated thermal load
-(measured out of band; marked as such in the source)
-% HAND: repeated llama-bench sessions measured up to ~35% lower under
-% HAND: accumulated thermal load; best stable session quoted.
-while Kipp's protocol-warmed medians hold to under $1\%$ --- quoting
-llama.cpp's best strengthens the baseline everywhere it competes. The
+path today. Three caveats on fairness. Both engines were measured in the
+same idle steady-state session (\Cref{sec:eval-setup}), but
+\code{llama-bench} reports
+mean$\pm$stddev while Kipp reports median$\pm$MAD. The
 decode configurations differ (64- vs.\ 256-token generations), but
 batch-one decode rate is insensitive at these depths --- our context sweep
 moves only from \CtxDecodeShort{} to \CtxDecodeTwoHundred~tok/s between 3
@@ -1259,24 +1274,35 @@ never present RSS as the total memory needed to run the model.
 
 \subsection{Ablations}
 \label{sec:eval-ablation}
-\paragraph{Prefill is attention-dominated} Late in development we replaced
-the split-K streaming attention kernel on the prefill path with the tiled
-simdgroup-matrix flash kernel of \Cref{sec:impl-kernels}. A binary-level
-A/B on the same host measured the new kernel roughly a third slower at a
-348-token prompt,
-% HAND: ~35% at 348 tokens, binary-level A/B; not part of the committed
-% HAND: benchmark set.
-and its cost grows with context, which is why prefill peaks at short
-prompts and then falls (\Cref{fig:ctx}) and why quantized prefill trails
-BF16 (\Cref{tab:perf}): the phase is bounded by attention, not by the
-matmuls that quantization touches. We report this plainly rather than
-quoting the faster superseded kernel; the tiled kernel is what ships,
-because its block-aligned KV tiles are what the paged and pooled gates
-exercise. Optimizing prefill attention --- larger tiles, pipelined loads,
-or reinstating split-K under the same gates --- is the engine's clearest
-future-work item. Every kernel change in this line was admitted through the
-same lattice as any other feature: exact arg\,max, per-scheme NMSE, bitwise
-scramble.
+\paragraph{A silent fallback defeats every correctness gate} The sharpest
+lesson in this paper was self-inflicted, and we report it in full. The
+tiled flash-prefill kernel of \Cref{sec:impl-kernels} landed with a loop
+variable named \code{fragment} --- a reserved identifier in the Metal
+Shading Language. The runtime compile of the \emph{entire} simdgroup-matrix
+library therefore failed with a syntax error, and the bridge silently fell
+back to vector kernels for every matrix matmul \emph{and} for the new
+kernel itself, which as a result had never actually executed: its gates,
+and an entire benchmark campaign, exercised the fallback. The fallback is a
+correct implementation, so every correctness gate in the lattice passed
+throughout --- while prefill shipped 35--75\% slower than the engine's real
+capability, quantized prefill appeared to trail BF16 at exactly the
+superseded vector path's throughput, and context-scaling appeared to
+collapse. The only symptom was one warning line on \code{stderr}, which
+every harness discarded. A one-identifier rename restored everything: BF16
+prefill at a 348-token prompt rose from 355 to \PrefillBF~tok/s, Q8\_0 from
+218 to \PrefillQEight{} (restoring the quantized-MMA near-parity the design
+had always provided), and Q8\_0 at 2{,}048 tokens from 70 to
+\PrefillTwoKQEight.
+% HAND: the broken-build values (355 / 218 / 70) are historical, measured
+% HAND: on the fallback build before commit a102e1c; that campaign's
+% HAND: result files were superseded and are not in the committed set.
+The moral sharpens this paper's thesis rather than softening it:
+correctness gating is necessary but not sufficient. A silent within-engine
+fallback passes every value-level check by construction, so fallbacks must
+be loud, and performance needs its own tripwire --- the harness now refuses
+to record Metal results while the fallback warning is present. Every kernel
+change in this line was, and remains, admitted through the same lattice as
+any other feature: exact arg\,max, per-scheme NMSE, bitwise scramble.
 \paragraph{Verify-path reduction order} The MMA work also produced a
 cautionary result. Routing speculative verify rounds through the matrix
 kernels broke the spec-equals-greedy gate, because the different summation
@@ -1290,8 +1316,9 @@ and keeping only arg\,max would pass three of the four mutants. Shrinking
 the scramble sequence back to two blocks re-masks the rollover fault. Every
 component of the lattice has at least one mutant that only it catches.
 \paragraph{Adaptive gating} The paired columns of \Cref{tab:spec} isolate
-the gate's effect: it preserves the repetitive-workload win while converting
-the low-acceptance losses to near-parity.
+the gate's effect: it preserves the repetitive-workload win, pushes code
+past parity, and converts the remaining low-acceptance losses to
+near-parity.
 
 \section{Discussion and Limitations}
 \label{sec:discussion}
@@ -1309,7 +1336,11 @@ gate is specific to Kipp. Any paged engine with a per-sequence block table
 can evaluate a multi-block prompt twice, once under identity and once under
 a reversal, and \code{memcmp} the logits, provided its kernels satisfy H3
 within a run (fixed reduction order for a fixed batch shape), which
-batch-invariant kernels \citep{he2025defeating} already provide. We would
+batch-invariant kernels \citep{he2025defeating} already provide. The
+silent-fallback episode of \Cref{sec:eval-ablation} argues for a companion
+discipline: any within-engine fallback path should fail loudly or be
+recorded in measurement provenance, because value-level gates cannot see
+it. We would
 welcome the gate's adoption in vLLM or SGLang; it is a few dozen lines
 against either engine's test harness. The most promising extension is
 tree-shaped speculative rollback
@@ -1326,9 +1357,9 @@ makes trustworthy.
   pinned model family; distributed serving and heterogeneous placement are
   out of scope.
   \item \emph{CUDA.} The CUDA backend is contiguous, BF16-only, final-row
-  logits, and gated at milestone points on ephemeral cloud A100s; the
-  correctness row in \Cref{tab:correct} was measured at that milestone and
-  not re-run for this draft. Extending paging and the scramble gate to CUDA
+  logits, gated on ephemeral cloud GPUs (most recently a \CudaGpuName{}
+  across \CudaCheckpointCount{} checkpoints, \Cref{tab:correct}).
+  Extending paging and the scramble gate to CUDA
   is mechanical (the kernels mirror Metal's structure) but unverified, so we
   do not claim it.
   \item \emph{One permutation per run.} The scramble gate reverses the
@@ -1420,7 +1451,7 @@ a \code{memcmp}.
 \section*{Artifact Availability}
 Kipp is open source under the MIT license:\par
 \noindent\url{https://github.com/Polished-Snow/Kipp}\par
-\noindent This paper was built from commit \texttt{4cb3e5e} of that
+\noindent This paper was built from commit \texttt{ba1a3c0} of that
 repository (branch \code{paper/verifiable-paged-attention}). An archived artifact with a DOI will accompany the final
 version. \code{REPRODUCE.md} in the repository
 documents the full build, gate, and benchmark reproduction path, and
@@ -1453,6 +1484,7 @@ build/kipp_test_metal  --phase3-metal  $M $V   # argmax + 1e-4
 build/kipp_test_metal  --paged-metal   $M $V   # scramble, bitwise
 build/kipp_test_metal  --multilogit-metal $M $V
 make test-server                 # OpenAI API surface
+tools/ops/verda_cuda_gate.sh     # CUDA gates, ephemeral cloud GPU
 # mutation study (test-only build):
 make build/kipp_test_fault
 KIPP_FAULT=<1..4> build/kipp_test_fault --phase2-model $M $V

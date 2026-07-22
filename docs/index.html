@@ -48,22 +48,25 @@
   </a>
 </p>
 <blockquote>
-<p><strong>Status (v0.0.2):</strong> Kipp targets the <strong>pinned Qwen3 dense family</strong>
+<p><strong>Status (v0.0.2 + main):</strong> Kipp targets the <strong>pinned Qwen3 dense family</strong>
 (0.6B–32B, base + instruct) through a compiled-in checkpoint registry —
 strict validation, per-checkpoint pinned revisions and hashes, one shared
 forward pass. Validated checkpoints run on the CPU oracle plus <strong>Metal</strong> on
-Apple M5 or <strong>CUDA</strong> on an NVIDIA A100; registry-only entries are not
+Apple M5 or <strong>CUDA</strong> on an NVIDIA H100; registry-only entries are not
 presented as validated. Kipp runs
 <strong>BF16, Q8_0, and 4-bit affine</strong> weights — from near-lossless Q8
 (+0.02% wikitext-2 perplexity) to a smaller Q4-class option (+5.7%),
-with ~1.6–2.2× faster decode and larger checkpoints
-under Apple's Metal single-buffer cap. The server speaks the OpenAI
-<strong>Completions and Chat Completions</strong> subset (SSE streaming, batched
-multi-sequence decode), a full sampling surface
-(temperature, top-p, top-k, min-p, penalties, logit_bias, seed), and a
-Prometheus <code>/metrics</code> endpoint — with <strong>cross-request KV prefix caching</strong>
-on CPU/Metal through a content-addressed block pool, gated bitwise
-against unshared evaluation.</p>
+with ~1.6–2.2× faster decode, quantized prefill at BF16 parity on the
+simdgroup-matrix kernels, and larger checkpoints
+under Apple's Metal single-buffer cap. The CLI has a multi-turn
+<strong><code>--chat</code> REPL</strong> (suffix-only KV evaluation across turns) and a
+wikitext <strong><code>--ppl</code></strong> perplexity mode. The server speaks the OpenAI
+<strong>Completions and Chat Completions</strong> subset (SSE streaming, 32-way
+batched multi-sequence decode, idle-connection reaping), a full sampling
+surface (temperature, top-p, top-k, min-p, penalties, logit_bias, seed),
+and a Prometheus <code>/metrics</code> endpoint with latency counters — with
+<strong>cross-request KV prefix caching</strong> on CPU/Metal through a
+content-addressed block pool, gated against unshared evaluation.</p>
 </blockquote>
 <h2>What is Kipp?</h2>
 <p>Kipp is a small, <strong>hand-written Qwen3 inference engine</strong> for local hardware. Most engines try to run everything; Kipp deliberately runs <em>one pinned model family</em>, and aims to run it well enough that you can read the entire engine in an afternoon.</p>

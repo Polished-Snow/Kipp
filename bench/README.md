@@ -59,13 +59,20 @@ measured in the same session under the same conditions. Result files with
 tight dispersion (MAD well under 1%) indicate the protocol held; a wide
 MAD means the session was contaminated and should be re-run.
 
+One more tripwire, learned the hard way: the Metal bridge falls back to
+vector kernels when its matrix-pipeline compile fails, with only a stderr
+warning. In July 2026 a reserved MSL keyword silently disabled every MMA
+kernel for two days — all correctness gates still passed, and a full
+benchmark campaign recorded the degraded build. `tools/bench.py` now
+refuses to record Metal numbers when the fallback warning is present.
+
 ## Results (`results/*.json`)
 
 Committed per configuration. Naming: `<model>-<scheme>-<decode|prefill>.json`,
 `ctx-<tokens>.json` (context scaling), `spec.json` / `spec-gated.json`
 (speculation without/with the adaptive gate), `server-batch.json`,
 `llamacpp-*.json` (external A/B), `faults.json` (mutation study), and
-`cuda-a100-...` for cloud CUDA runs.
+`cuda-h100-gates.json` for cloud CUDA gate runs.
 
 ## Reference numbers — Apple M5 Max (Qwen3-4B, Metal, greedy, median of 5)
 
@@ -74,35 +81,38 @@ the steady-state protocol above. Numbers from earlier releases were measured
 on a base M5 (10-core GPU, 24 GB) and are roughly 4× lower across the board;
 see each result file's recorded hardware.
 
-| Weight scheme | Decode tok/s | Prefill tok/s (348 tokens) | Wikitext-2 PPL |
+| Weight scheme | Decode tok/s | Prefill tok/s (348 / 2,048 tokens) | Wikitext-2 PPL |
 |---|---|---|---|
-| BF16 | 60.3 | 355 | 7.731 |
-| Q8_0 (8-bit) | 98.2 | 218 | 7.733 |
-| affine4 (4-bit) | 130 | 297 | 8.170 |
+| BF16 | 60.7 | 528 / 481 | 7.731 |
+| Q8_0 (8-bit) | 97.9 | 488 / 441 | 7.733 |
+| affine4 (4-bit) | 130 | 509 / 466 | 8.171 |
 
 Peak process RSS ≈ 41 MB (weights are mmap-ed; RSS understates GPU-touched
 residency). Decode is bandwidth-bound, so quantization scales it with the
 weight-byte reduction at unmeasurable quality cost for Q8_0 (+0.02% PPL)
-and a Q4-class cost for affine4 (+5.7% PPL). Prefill is currently
-dominated by the tiled flash-attention prefill kernel, whose cost grows
-with context (355 tok/s at 348 tokens down to ~62 tok/s at 12.8k for
-Q8_0) and which trails BF16 for quantized weights; optimizing it is open
-work — see the paper's ablation section.
+and a Q4-class cost for affine4 (+5.7% PPL). Prefill runs on the
+simdgroup-matrix (MMA) kernels — matmuls and the tiled flash-attention
+kernel — so quantized prefill stays near BF16 parity; the O(n²) attention
+tail brings Q8_0 prefill from ~485 tok/s at short context down to
+177 tok/s at 12.8k tokens.
 
 Speculative decoding (Q8_0, 256-token decode, paired-baseline A/B via
 `--gate both`, median of 3):
 
 | Workload | α | Ungated | Gated | Duty |
 |---|---|---|---|---|
-| Repetitive / copy-heavy | 1.00 | 3.09× | 3.17× | 1.00 |
-| Code | 0.19 | 0.72× | 0.89× | 0.06 |
-| Grounded QA | 0.00 | 0.40× | 0.89× | 0.04 |
-| Open-ended | 0.09 | 0.62× | 0.80× | 0.10 |
+| Repetitive / copy-heavy | 1.00 | 2.10× | 2.27× | 1.00 |
+| Code | 0.19 | 0.73× | 1.24× | 0.06 |
+| Grounded QA | 0.00 | 0.27× | 0.90× | 0.04 |
+| Open-ended | 0.09 | 0.62× | 0.84× | 0.10 |
 
 Prompt-lookup only pays at high acceptance; the adaptive gate suspends
 drafting when a short acceptance EMA collapses and probes periodically, which
-converts the low-acceptance losses to near-parity while keeping the
-copy-heavy win. Gated speculative output remains token-identical to greedy.
+holds every low-acceptance workload at or near parity (0.84× floor, and
+above parity on code) while keeping the copy-heavy win. Speedups are
+smaller than earlier drafts because the sampling fast path made the plain
+decode baseline itself faster. Gated speculative output remains
+token-identical to greedy.
 
 ## Reproduce
 

@@ -13,8 +13,11 @@
  * verify-by-tokens on every hit (collision-proof), keep freed blocks in the
  * index for O(1) revival, and cap a prefix match one token short so a
  * sequence always has a token left to produce logits. This module is pure
- * bookkeeping and is unit-tested without any GPU backend. It is Phase 5
- * groundwork: production sessions and the server do not use this pool yet.
+ * bookkeeping and is unit-tested without any GPU backend. It backs
+ * cross-request KV prefix sharing in production: pooled models
+ * (kipp_model_open_pooled, the server default on CPU and Metal) publish a
+ * finished session's full blocks here at reset/destroy and later sessions
+ * adopt matching prefixes via kipp_session_match_prefix.
  */
 #ifndef KIPP_KV_POOL_H
 #define KIPP_KV_POOL_H

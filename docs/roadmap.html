@@ -27,6 +27,26 @@
 <p>This sequence is binding unless <code>ARCHITECTURE.md</code> is explicitly revised.
 Correctness gates every phase; dates and speculative performance claims are
 intentionally absent.</p>
+<p><strong>Status (v0.0.3, in preparation):</strong> Since v0.0.2, Kipp delivered the
+items that release deferred and hardened the serving path. <strong>Cross-request
+KV prefix sharing is now the CPU/Metal serving default</strong>: pooled sessions
+share one model-owned slab through a content-addressed 32-token block pool
+(publish-at-finish, memcmp-verified), gated by <code>--pooled-cpu</code> /
+<code>--pooled-metal</code> and measured at 175× TTFT on a repeated 6,890-token
+prompt. The Metal <strong>flash-attention prefill kernel is live</strong> (a
+reserved-MSL-keyword bug had silently disabled every simdgroup-matrix
+kernel for two days; the benchmark harness now refuses to record numbers
+from a fallback build), putting quantized prefill at BF16 parity
+(528/488/509 tok/s at 348 tokens on the M5 Max). The server gained 32-way
+concurrent decode, idle-connection reaping, and TTFT/queue-wait metrics;
+the CLI gained a multi-turn <code>--chat</code> REPL (suffix-only KV evaluation) and
+a wikitext <code>--ppl</code> perplexity mode; sampling gained zero-copy fast paths;
+<code>kipp_session_eval_scored</code> exposes tolerance-bound multi-row scoring; the
+JSON and HTTP parsers moved to their own fuzz-tested translation units;
+and the whole registry surface was revalidated on an ephemeral NVIDIA
+H100 (four checkpoints, worst NMSE 5.9e-7). Speculation now measures a
+paired-baseline A/B with an adaptive-gate floor of 0.84× and above-parity
+code decoding.</p>
 <p><strong>Status (v0.0.2):</strong> This release expands Kipp from the single pinned
 checkpoint of v0.0.1 to the <strong>Qwen3 dense family</strong> (0.6B–32B, base +
 instruct) behind a strict compiled-in checkpoint registry, with the BF16
@@ -42,9 +62,9 @@ both the CPU oracle and the Metal backend — a per-session 32-position block
 table gated bitwise-equal to the contiguous layout (<code>--paged-cpu</code>,
 <code>--paged-metal</code>). Everything is gated on Apple M5 (CPU + Metal); the whole
 family plus quantization is additionally validated on NVIDIA A100 via
-ephemeral cloud runs. Still deferred: the cross-request KV block pool
-(<code>src/kipp_kv_pool.c</code> exists and is unit-tested but not yet wired into the
-backends), Metal flash-attention prefill, and quantized KV.</p>
+ephemeral cloud runs. Still deferred at that point (since delivered — see the v0.0.3 status
+above): the cross-request KV block pool, Metal flash-attention prefill.
+Quantized KV remains deferred.</p>
 <p><strong>v2 expansion (approved 2026-07-16):</strong> scope grew from one pinned
 checkpoint to the pinned Qwen3 dense family via a compiled-in registry
 (<code>src/kipp_checkpoints.h</code>); dimensions, context, RoPE theta, embedding
@@ -56,10 +76,11 @@ tying, and stop tokens became per-checkpoint runtime configuration with the
 surface (top-k, min-p, penalties, logit_bias); a <code>/metrics</code> endpoint; and
 <strong>weight quantization</strong> — Q8_0 (near-lossless, ~1.6x decode, brings 8B
 under the M5 Metal buffer cap) and affine 4-bit gs32 (~2x decode, 2.6x
-smaller, coherent output), both gated on CPU + Metal. Remaining: production
-KV block pooling with cross-request prefix caching, a token-budget scheduler,
-and quantized KV — each behind its own CPU-vs-GPU gate. Prompt-lookup
-speculative decoding and generated-token logprobs are already delivered.</p>
+smaller, coherent output), both gated on CPU + Metal. Production KV block pooling with
+cross-request prefix caching is delivered (the serving default on
+CPU/Metal). Remaining: a token-budget scheduler and quantized KV — each
+behind its own CPU-vs-GPU gate. Prompt-lookup speculative decoding and
+generated-token logprobs are already delivered.</p>
 <h2>Phase 0 — Specify the model</h2>
 <ul>
 <li>Pin <code>Qwen/Qwen3-4B-Base</code> and its exact revision.</li>
@@ -114,7 +135,8 @@ optional SSE streaming and Prometheus metrics.</li>
 <li>ROCm/HIP support, on a separate community-maintained branch</li>
 <li>additional model families</li>
 <li>generic tensor-runtime or arbitrary-GGUF compatibility</li>
-<li>cross-session prefix/radix caching, SSD streaming, and quantized KV</li>
+<li>radix-tree prefix indexing, SSD streaming, and quantized KV
+(cross-session prefix caching itself is delivered)</li>
 <li>broad API parity with llama.cpp, vLLM, or SGLang</li>
 </ul>
   </main>

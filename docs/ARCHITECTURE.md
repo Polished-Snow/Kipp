@@ -176,8 +176,11 @@ with `columns % 32 == 0` (true for every family dimension):
   bytes/group (5.0 bpw), `w = scale·q + bias`, `q ∈ [0,15]`. Q4-class.
 
 The CPU reference dequantizes per block inside a type-dispatched matvec;
-Metal adds token-tiled `kipp_matvec_q8_0`/`kipp_matvec_affine4` decode and
-prefill kernels selected by the weight tensor's type. Quantized artifacts
+Metal selects kernels by the weight tensor's type: token-tiled
+`kipp_matvec_q8_0`/`kipp_matvec_affine4` vector kernels for decode, and
+simdgroup-matrix `kipp_matmul_q8_0`/`kipp_matmul_affine4` kernels for
+prefill (each 32-weight block dequantized once per 16-token tile, keeping
+quantized prefill at near-parity with BF16). Quantized artifacts
 gate as ordinary artifacts: argmax must match the BF16 reference exactly,
 with a format-appropriate full-logit NMSE bound (Q8_0 near-lossless; 4-bit
 Q4-class), and Metal must match CPU within the standard `1e-4`. The

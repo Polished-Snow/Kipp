@@ -52,8 +52,6 @@ adversarially scrambled block table** (`--paged-cpu`, `--paged-metal`).
 ## Limitations
 
 - Not a general model runner; unpinned checkpoints are rejected by design.
-- Quantized **prefill** on Metal uses the vector kernel (no quantized
-  simdgroup-matrix path yet), so quantization trades faster decode for slower
-  prefill on long prompts.
-- CUDA paged addressing and the shared cross-request KV block pool are not yet
-  wired into the serving path.
+- CUDA paged addressing is not wired: the CUDA backend stays contiguous,
+  BF16-only, final-row logits, and does not participate in the pooled
+  cross-request prefix cache (CPU and Metal serve pooled by default).
