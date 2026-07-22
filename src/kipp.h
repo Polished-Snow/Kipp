@@ -169,6 +169,19 @@ int kipp_session_eval_n(kipp_session *session, const uint32_t *tokens,
                         kipp_error *error);
 
 /*
+ * Like kipp_session_eval_n, but the rows are guaranteed to match
+ * single-token evaluation only within the backend's documented tolerance:
+ * the backend may batch the rows through kernels whose parallel reduction
+ * order differs from decode. Use for scoring — perplexity and prompt
+ * logprobs — where logits feed tolerance-based math. Speculative-decode
+ * verification must keep using kipp_session_eval_n, whose rows reproduce
+ * the decode path bitwise so greedy arg max ties cannot flip.
+ */
+int kipp_session_eval_scored(kipp_session *session, const uint32_t *tokens,
+                             size_t token_count, float *logits, uint32_t rows,
+                             kipp_error *error);
+
+/*
  * On a fresh (length 0) session of a pooled model: adopt the longest
  * published prefix of `tokens` from the pool — whole 32-token blocks only,
  * capped one token short of token_count so evaluation always has a token

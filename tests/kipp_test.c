@@ -1722,8 +1722,10 @@ static int run_multilogit_metal_test(const char *model_path,
     kipp_model *metal_model = NULL;
     kipp_model *cpu_model = NULL;
     kipp_session *metal_session = NULL;
+    kipp_session *scored_session = NULL;
     kipp_session *cpu_session = NULL;
     float *rows = NULL;
+    float *scored_rows = NULL;
     float *reference = NULL;
     kipp_error error = {0};
     int result = -1;
@@ -1737,8 +1739,9 @@ static int run_multilogit_metal_test(const char *model_path,
     token_count = token_bytes / sizeof(*tokens);
     uint32_t n = (uint32_t)token_count;
     rows = malloc((size_t)n * KIPP_VOCAB_SIZE * sizeof(*rows));
-    reference = malloc(KIPP_VOCAB_SIZE * sizeof(*reference));
-    if (rows == NULL || reference == NULL ||
+    scored_rows = malloc((size_t)n * KIPP_VOCAB_SIZE * sizeof(*scored_rows));
+    reference = malloc((size_t)n * KIPP_VOCAB_SIZE * sizeof(*reference));
+    if (rows == NULL || scored_rows == NULL || reference == NULL ||
         kipp_model_open_backend(model_path, KIPP_BACKEND_METAL, &metal_model,
                                 &error) != 0 ||
         kipp_model_open_backend(model_path, KIPP_BACKEND_CPU, &cpu_model,
@@ -1750,28 +1753,46 @@ static int run_multilogit_metal_test(const char *model_path,
                             &error) != 0 ||
         kipp_session_eval_n(metal_session, tokens, token_count, rows, n,
                             &error) != 0 ||
+        kipp_session_create(metal_model, (uint32_t)token_count,
+                            &scored_session, &error) != 0 ||
+        kipp_session_eval_scored(scored_session, tokens, token_count,
+                                 scored_rows, n, &error) != 0 ||
         kipp_session_create(cpu_model, (uint32_t)token_count, &cpu_session,
                             &error) != 0) {
         fprintf(stderr, "multi-logit metal eval failed: %s\n", error.message);
         goto cleanup;
     }
     for (uint32_t position = 0; position < n; ++position) {
-        if (kipp_session_eval(cpu_session, &tokens[position], 1, reference,
+        float *cpu_row = reference + (size_t)position * KIPP_VOCAB_SIZE;
+        if (kipp_session_eval(cpu_session, &tokens[position], 1, cpu_row,
                               KIPP_VOCAB_SIZE, &error) != 0) {
             goto cleanup;
         }
-        char label[40];
+        char label[48];
         (void)snprintf(label, sizeof(label), "multilogit-row-%u", position);
         if (phase2_compare(label, rows + (size_t)position * KIPP_VOCAB_SIZE,
-                           reference, 1.0e-4) != 0) {
+                           cpu_row, 1.0e-4) != 0) {
+            goto cleanup;
+        }
+        /* The relaxed-order (scored) rows may batch through the matrix
+         * kernels; they must hold the same tolerance and arg max. */
+        (void)snprintf(label, sizeof(label), "multilogit-scored-row-%u",
+                       position);
+        if (phase2_compare(label,
+                           scored_rows + (size_t)position * KIPP_VOCAB_SIZE,
+                           cpu_row, 1.0e-4) != 0) {
             goto cleanup;
         }
     }
-    fprintf(stderr, "MULTILOGIT-METAL %u rows match CPU within 1e-4\n", n);
+    fprintf(stderr,
+            "MULTILOGIT-METAL %u rows (eval_n and scored) match CPU within "
+            "1e-4\n",
+            n);
     result = 0;
 
 cleanup:
     kipp_session_destroy(cpu_session);
+    kipp_session_destroy(scored_session);
     kipp_session_destroy(metal_session);
     if (cpu_model != NULL) {
         (void)kipp_model_close(cpu_model, NULL);
@@ -1782,6 +1803,7 @@ cleanup:
     free(tokens_path);
     free(tokens);
     free(rows);
+    free(scored_rows);
     free(reference);
     return result;
 }

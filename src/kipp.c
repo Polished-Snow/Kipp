@@ -3429,7 +3429,7 @@ int kipp_model_eval(const kipp_model *model, const uint32_t *tokens,
         }
     }
     kipp_eval_item item = {
-        NULL, tokens, (uint32_t)token_count, 0, logits, 1, NULL,
+        NULL, tokens, (uint32_t)token_count, 0, logits, 1, NULL, false,
     };
     return model->backend_ops->eval(model->backend_model, &item, 1, error);
 }
@@ -3720,7 +3720,63 @@ int kipp_session_eval(kipp_session *session, const uint32_t *tokens,
     }
     kipp_eval_item item = {
         session->backend_session, tokens, (uint32_t)token_count,
-        session->length,         logits, 1,      NULL,
+        session->length,         logits, 1,      NULL, false,
+    };
+    uint32_t first_new = 0;
+    if (session_is_pooled(session)) {
+        if (pooled_map_blocks(session,
+                              session->length + (uint32_t)token_count,
+                              &first_new, error) != 0) {
+            return -1;
+        }
+        item.block_table = session->block_ids;
+    }
+    if (session->model->backend_ops->eval(session->model->backend_model,
+                                          &item, 1, error) != 0) {
+        if (session_is_pooled(session)) {
+            pooled_unmap_from(session, first_new);
+        }
+        return -1;
+    }
+    if (session_is_pooled(session)) {
+        memcpy(session->timeline + session->length, tokens,
+               token_count * sizeof(*tokens));
+    }
+    session->length += (uint32_t)token_count;
+    return 0;
+}
+
+static int session_eval_rows(kipp_session *session, const uint32_t *tokens,
+                             size_t token_count, float *logits, uint32_t rows,
+                             bool relaxed_order, kipp_error *error) {
+    clear_error(error);
+    if (session == NULL || tokens == NULL || logits == NULL) {
+        return fail(error, KIPP_ERROR_ARGUMENT,
+                    "session, tokens, and logits are required");
+    }
+    if (token_count == 0 || token_count > UINT32_MAX) {
+        return fail(error, KIPP_ERROR_RANGE,
+                    "session evaluation requires at least one token");
+    }
+    if (rows == 0 || rows > token_count) {
+        return fail(error, KIPP_ERROR_RANGE,
+                    "rows must be between 1 and the token count");
+    }
+    if (token_count > session->capacity - session->length) {
+        return fail(error, KIPP_ERROR_RANGE,
+                    "append of %zu token(s) exceeds session capacity %u",
+                    token_count, session->capacity);
+    }
+    for (size_t index = 0; index < token_count; ++index) {
+        if (tokens[index] >= KIPP_VOCAB_SIZE) {
+            return fail(error, KIPP_ERROR_RANGE, "token %zu is out of range",
+                        index);
+        }
+    }
+    kipp_eval_item item = {
+        session->backend_session, tokens, (uint32_t)token_count,
+        session->length,          logits, rows,   NULL,
+        relaxed_order,
     };
     uint32_t first_new = 0;
     if (session_is_pooled(session)) {
@@ -3749,56 +3805,15 @@ int kipp_session_eval(kipp_session *session, const uint32_t *tokens,
 int kipp_session_eval_n(kipp_session *session, const uint32_t *tokens,
                         size_t token_count, float *logits, uint32_t rows,
                         kipp_error *error) {
-    clear_error(error);
-    if (session == NULL || tokens == NULL || logits == NULL) {
-        return fail(error, KIPP_ERROR_ARGUMENT,
-                    "session, tokens, and logits are required");
-    }
-    if (token_count == 0 || token_count > UINT32_MAX) {
-        return fail(error, KIPP_ERROR_RANGE,
-                    "session evaluation requires at least one token");
-    }
-    if (rows == 0 || rows > token_count) {
-        return fail(error, KIPP_ERROR_RANGE,
-                    "rows must be between 1 and the token count");
-    }
-    if (token_count > session->capacity - session->length) {
-        return fail(error, KIPP_ERROR_RANGE,
-                    "append of %zu token(s) exceeds session capacity %u",
-                    token_count, session->capacity);
-    }
-    for (size_t index = 0; index < token_count; ++index) {
-        if (tokens[index] >= KIPP_VOCAB_SIZE) {
-            return fail(error, KIPP_ERROR_RANGE, "token %zu is out of range",
-                        index);
-        }
-    }
-    kipp_eval_item item = {
-        session->backend_session, tokens, (uint32_t)token_count,
-        session->length,          logits, rows,   NULL,
-    };
-    uint32_t first_new = 0;
-    if (session_is_pooled(session)) {
-        if (pooled_map_blocks(session,
-                              session->length + (uint32_t)token_count,
-                              &first_new, error) != 0) {
-            return -1;
-        }
-        item.block_table = session->block_ids;
-    }
-    if (session->model->backend_ops->eval(session->model->backend_model,
-                                          &item, 1, error) != 0) {
-        if (session_is_pooled(session)) {
-            pooled_unmap_from(session, first_new);
-        }
-        return -1;
-    }
-    if (session_is_pooled(session)) {
-        memcpy(session->timeline + session->length, tokens,
-               token_count * sizeof(*tokens));
-    }
-    session->length += (uint32_t)token_count;
-    return 0;
+    return session_eval_rows(session, tokens, token_count, logits, rows,
+                             false, error);
+}
+
+int kipp_session_eval_scored(kipp_session *session, const uint32_t *tokens,
+                             size_t token_count, float *logits, uint32_t rows,
+                             kipp_error *error) {
+    return session_eval_rows(session, tokens, token_count, logits, rows,
+                             true, error);
 }
 
 int kipp_eval_batch(kipp_model *model, kipp_batch_item *items,
@@ -3855,6 +3870,7 @@ int kipp_eval_batch(kipp_model *model, kipp_batch_item *items,
             item->logits,
             1,
             NULL,
+            false,
         };
     }
     /* Map pooled blocks for every item before the single backend call; on

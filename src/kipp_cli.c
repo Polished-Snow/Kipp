@@ -328,10 +328,14 @@ static int run_perplexity(kipp_model *model, const kipp_model_info *info,
             if (chunk_length > KIPP_CLI_PPL_CHUNK) {
                 chunk_length = KIPP_CLI_PPL_CHUNK;
             }
-            if (kipp_session_eval_n(session,
-                                    stream + window_start + chunk_start,
-                                    chunk_length, logits,
-                                    (uint32_t)chunk_length, &error) != 0) {
+            /* Scored evaluation: rows held to backend tolerance, which
+             * lets Metal keep its matrix kernels instead of the bitwise
+             * decode-order vector path speculation requires. */
+            if (kipp_session_eval_scored(session,
+                                         stream + window_start + chunk_start,
+                                         chunk_length, logits,
+                                         (uint32_t)chunk_length,
+                                         &error) != 0) {
                 fprintf(stderr, "kipp: ppl: eval: %s\n", error.message);
                 goto done;
             }
