@@ -36,12 +36,11 @@ make test-sanitize   # ASan + UBSan
 
 Model gates run the built test binary directly against the pinned vectors
 (do **not** use `make test-model`'s vectors->convert chain for a quick gate —
-make test-ppl                         # CLI perplexity smoke over the pinned tokens
 it rewrites the multi-GB GGUF). With a converted `qwen3-4b-base` BF16 GGUF at
 `$M` and vectors at `$V`:
 
 ```bash
-build/kipp_test        --model      $M $V   # CPU logits == pinned reference (bitwise)
+build/kipp_test        --model      $M $V   # CPU vs pinned FP32 vectors (argmax exact, NMSE <= 5e-5)
 build/kipp_test        --paged-cpu  $M $V   # paged KV == contiguous, scrambled block table (bitwise)
 build/kipp_test_metal  --paged-metal $M $V  # same, Metal backend
 build/kipp_test_metal  --phase3-metal $M $V # Metal vs CPU oracle (argmax exact, NMSE <= 1e-4)

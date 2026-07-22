@@ -270,9 +270,12 @@ private, which is what keeps `kipp_session_truncate` — speculative rollback
 sessions bind the model pool buffers with the pool stride, and the
 `kipp_kv_write`/`kipp_flash_gqa` kernels resolve the same per-item block
 table they always have. The `--pooled-cpu` and `--pooled-metal` gates prove
-pooled identity, shared-prefix and batched mixed evaluation bitwise-equal
-to unshared runs on the same backend (Metal additionally within the
-standard `1e-4` of the CPU oracle), clean pool-exhaustion failure,
+pooled identity and shared-prefix evaluation bitwise-equal to unshared
+runs on the same backend, batched mixed evaluation equal within the
+backend's batching contract (bitwise on CPU, whose scalar path is
+packing-independent; `1e-4` NMSE with identical arg max on Metal, where
+kernel selection legitimately differs between batched rounds and isolated
+evaluation), clean pool-exhaustion failure,
 truncation into the private tail, and eviction. Server integration,
 persistence, and cache-pressure admission remain future Phase 5 work and do
 not change the backend contract.

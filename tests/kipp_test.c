@@ -1757,14 +1757,44 @@ static int run_pooled_test(const char *model_path,
             goto cleanup;
         }
     }
-    if (memcmp(actual, reference_full, KIPP_VOCAB_SIZE * sizeof(*actual)) !=
-            0 ||
-        memcmp(actual_second, reference_mixed,
-               KIPP_VOCAB_SIZE * sizeof(*actual_second)) != 0 ||
-        memcmp(actual_third, reference_full,
-               KIPP_VOCAB_SIZE * sizeof(*actual_third)) != 0) {
-        fprintf(stderr, "POOLED-%s batched logits differ\n", label);
-        goto cleanup;
+    /*
+     * The batched case holds the backend's documented batching contract
+     * (kipp.h: batched results match isolated evaluation within the
+     * backend's tolerance). On CPU the scalar path is packing-independent,
+     * so the bound is bitwise. On Metal, kernel selection and tile packing
+     * legitimately differ between quota-sized batched rounds and isolated
+     * evaluation (matrix vs vector tails reorder reductions), so the bound
+     * is the standard 1e-4 NMSE with an identical arg max; the demand for
+     * bitwise equality here only ever held while a kernel-compile fallback
+     * silently pinned every path to the vector kernels.
+     */
+    if (backend == KIPP_BACKEND_CPU) {
+        if (memcmp(actual, reference_full,
+                   KIPP_VOCAB_SIZE * sizeof(*actual)) != 0 ||
+            memcmp(actual_second, reference_mixed,
+                   KIPP_VOCAB_SIZE * sizeof(*actual_second)) != 0 ||
+            memcmp(actual_third, reference_full,
+                   KIPP_VOCAB_SIZE * sizeof(*actual_third)) != 0) {
+            fprintf(stderr, "POOLED-%s batched logits differ\n", label);
+            goto cleanup;
+        }
+    } else {
+        const float *batch_actual[3] = {actual, actual_second, actual_third};
+        const float *batch_reference[3] = {reference_full, reference_mixed,
+                                           reference_full};
+        for (int item = 0; item < 3; ++item) {
+            double nmse = logit_nmse(batch_actual[item],
+                                     batch_reference[item], KIPP_VOCAB_SIZE);
+            if (nmse > 1.0e-4 ||
+                argmax(batch_actual[item], KIPP_VOCAB_SIZE) !=
+                    argmax(batch_reference[item], KIPP_VOCAB_SIZE)) {
+                fprintf(stderr,
+                        "POOLED-%s batched item %d nmse=%.9g or argmax "
+                        "mismatch\n",
+                        label, item, nmse);
+                goto cleanup;
+            }
+        }
     }
     kipp_session_destroy(session);
     kipp_session_destroy(second);
