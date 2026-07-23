@@ -296,6 +296,9 @@ int kipp_test_normalize_nfc(const char *text, char **normalized);
 /* Reverse a CPU session's paged block table (before any eval) so the paged
  * gate can prove reads/writes are correct under a non-identity mapping. */
 int kipp_test_scramble_session_kv(kipp_session *session);
+/* Cap the Metal decode split-K count (1 = legacy single-split path, 0 =
+ * automatic); returns -1 for non-Metal models. */
+int kipp_test_metal_ksplit_cap(kipp_model *model, uint32_t cap);
 #endif
 
 #ifdef __cplusplus

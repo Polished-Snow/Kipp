@@ -25,6 +25,10 @@
 /* Queries per threadgroup in the matrix prefill-attention kernel; must
  * match KIPP_FA_QUERIES in the shader. */
 #define KIPP_METAL_FA_QUERIES 8u
+/* Split-K decode (mirrors KIPP_KSPLIT_* in the MSL source). */
+#define KIPP_METAL_KSPLIT_MAX 8u
+#define KIPP_METAL_KSPLIT_CHUNK 1024u
+#define KIPP_METAL_KSPLIT_STRIDE (4u + KIPP_ATTENTION_HEAD_DIM)
 #define KIPP_METAL_PAIRS_PER_GROUP 4u
 #define KIPP_METAL_TOKEN_TILE 8u
 
@@ -56,6 +60,9 @@ typedef struct {
     uint32_t start_position;
     uint32_t token_count;
     uint32_t capacity;
+    /* Test hook: 0 = automatic split-K, 1 forces the legacy single-split
+     * decode path; mirrors KvParams.ksplit_cap in the MSL source. */
+    uint32_t ksplit_cap;
 } metal_kv_params;
 
 @class KippMetalModel;
@@ -105,6 +112,10 @@ typedef struct {
 @property(nonatomic, strong) id<MTLBuffer> poolKeyCache;
 @property(nonatomic, strong) id<MTLBuffer> poolValueCache;
 @property(nonatomic) uint32_t poolSlabPositions;
+/* Split-K decode scratch: one online-softmax partial per
+ * (head, split, workspace token); merged by kipp_flash_gqa_reduce. */
+@property(nonatomic, strong) id<MTLBuffer> gqaPartials;
+@property(nonatomic) uint32_t ksplitCap; /* test hook; 0 = automatic */
 @end
 
 @implementation KippMetalModel
@@ -276,6 +287,18 @@ static void metal_enc_groups(id<MTLComputeCommandEncoder> encoder,
     [encoder setComputePipelineState:pipeline];
     configure(encoder);
     [encoder dispatchThreadgroups:MTLSizeMake(groupsX, groupsY, 1)
+            threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+}
+
+static void metal_enc_groups_3d(id<MTLComputeCommandEncoder> encoder,
+                                id<MTLComputePipelineState> pipeline,
+                                NSUInteger groupsX, NSUInteger groupsY,
+                                NSUInteger groupsZ, NSUInteger threadsPerGroup,
+                                void (^configure)(
+                                    id<MTLComputeCommandEncoder>)) {
+    [encoder setComputePipelineState:pipeline];
+    configure(encoder);
+    [encoder dispatchThreadgroups:MTLSizeMake(groupsX, groupsY, groupsZ)
             threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
 }
 
@@ -508,7 +531,7 @@ static void metal_encode_kv_write(id<MTLComputeCommandEncoder> target,
                                   uint32_t startPosition,
                                   uint32_t tokenCount) {
     metal_kv_params params = {layer, startPosition, tokenCount,
-                              kvSession.slabPositions};
+                              kvSession.slabPositions, 0};
     metal_enc_threads(target, metal_pipeline(model, @"kipp_kv_write"),
                       KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
                       tokenCount, ^(id<MTLComputeCommandEncoder> encoder) {
@@ -547,7 +570,7 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
                              uint32_t startPosition, uint32_t tokenCount,
                              bool useMatrixAttention) {
     metal_kv_params params = {layer, startPosition, tokenCount,
-                              kvSession.slabPositions};
+                              kvSession.slabPositions, model.ksplitCap};
     void (^bind)(id<MTLComputeCommandEncoder>) =
         ^(id<MTLComputeCommandEncoder> encoder) {
           [encoder setBuffer:query offset:headStateOffset atIndex:0];
@@ -556,6 +579,7 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
           [encoder setBuffer:output offset:headStateOffset atIndex:3];
           [encoder setBytes:&params length:sizeof(params) atIndex:4];
           [encoder setBuffer:kvSession.blockTable offset:0 atIndex:5];
+          [encoder setBuffer:model.gqaPartials offset:0 atIndex:6];
         };
     if (useMatrixAttention) {
         metal_enc_groups(
@@ -565,9 +589,35 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
             32, bind);
         return;
     }
-    metal_enc_groups(target, metal_pipeline(model, @"kipp_flash_gqa"),
-                     model.config.attention_head_count, tokenCount,
-                     KIPP_METAL_GQA_THREADS, bind);
+    /* Mirror the kernel's position-derived split count for the dispatch
+     * width; the kernel re-derives it per token, so a shorter token in a
+     * multi-row batch simply retires its excess split threadgroups. */
+    uint32_t lastSource = startPosition + tokenCount - 1;
+    uint32_t splitsMax =
+        MIN(KIPP_METAL_KSPLIT_MAX, 1u + lastSource / KIPP_METAL_KSPLIT_CHUNK);
+    if (model.ksplitCap != 0) {
+        splitsMax = MIN(splitsMax, model.ksplitCap);
+    }
+    metal_enc_groups_3d(target, metal_pipeline(model, @"kipp_flash_gqa"),
+                        model.config.attention_head_count, splitsMax,
+                        tokenCount, KIPP_METAL_GQA_THREADS, bind);
+    if (splitsMax > 1) {
+        metal_enc_groups(target,
+                         metal_pipeline(model, @"kipp_flash_gqa_reduce"),
+                         model.config.attention_head_count, tokenCount,
+                         KIPP_METAL_GROUP_THREADS,
+                         ^(id<MTLComputeCommandEncoder> encoder) {
+                           [encoder setBuffer:output
+                                       offset:headStateOffset
+                                      atIndex:0];
+                           [encoder setBuffer:model.gqaPartials
+                                       offset:0
+                                      atIndex:1];
+                           [encoder setBytes:&params
+                                      length:sizeof(params)
+                                     atIndex:2];
+                         });
+    }
 }
 
 static void metal_encode_residual(id<MTLComputeCommandEncoder> target,
@@ -988,6 +1038,7 @@ static int metal_compile_pipelines(
           @"kipp_bf16_roundtrip" : @0, @"kipp_embed_gather" : @0,
           @"kipp_rms_norm" : @0, @"kipp_head_norm" : @0, @"kipp_rope" : @0,
           @"kipp_kv_write" : @0, @"kipp_flash_gqa" : @0,
+          @"kipp_flash_gqa_reduce" : @0,
           @"kipp_residual_add" : @0, @"kipp_swiglu" : @0,
           @"kipp_bf16_stage" : @0,
           @"kipp_matvec_bf16_decode" : @1,
@@ -1129,6 +1180,14 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
         if (model.batchLogits == nil) {
             return metal_fail(error, KIPP_ERROR_MEMORY,
                               "unable to allocate batched logits storage");
+        }
+        model.gqaPartials = metal_new_shared_buffer(
+            device, (NSUInteger)view->config.attention_head_count *
+                        KIPP_METAL_KSPLIT_MAX * KIPP_METAL_BATCH *
+                        KIPP_METAL_KSPLIT_STRIDE * sizeof(float));
+        if (model.gqaPartials == nil) {
+            return metal_fail(error, KIPP_ERROR_MEMORY,
+                              "unable to allocate split-K partial storage");
         }
         if (model.queue == nil) {
             return metal_fail(error, KIPP_ERROR_INTERNAL,
@@ -1380,6 +1439,15 @@ const char *kipp_metal_device_name(void) {
 /* Test hook: reverse a Metal session's page table (before any eval) so the
  * paged gate can prove the kernels honor the block table under a non-identity
  * mapping. Mirrors the CPU hook in kipp.c. */
+int kipp_metal_test_set_ksplit_cap(void *backendModel, uint32_t cap) {
+    if (backendModel == NULL) {
+        return -1;
+    }
+    KippMetalModel *model = (__bridge KippMetalModel *)backendModel;
+    model.ksplitCap = cap;
+    return 0;
+}
+
 int kipp_metal_test_scramble_session(void *backendSession) {
     if (backendSession == NULL) {
         return -1;
@@ -2043,7 +2111,7 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             id<MTLBuffer> blockTable =
                 metal_new_shared_buffer(device, sizeof(uint32_t));
             ((uint32_t *)blockTable.contents)[0] = 0;
-            metal_kv_params position0 = {0, 0, 1, capacity};
+            metal_kv_params position0 = {0, 0, 1, capacity, 0};
             id<MTLCommandBuffer> first = [queue commandBuffer];
             metal_dispatch_2d(first, pipelines[@"kipp_kv_write"],
                               KIPP_ATTENTION_HEAD_COUNT_KV *
@@ -2076,7 +2144,7 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                 ((float *)valueBuffer.contents)
                     [head * KIPP_ATTENTION_HEAD_DIM] = 3.0f;
             }
-            metal_kv_params position1 = {0, 1, 1, capacity};
+            metal_kv_params position1 = {0, 1, 1, capacity, 0};
             id<MTLCommandBuffer> second = [queue commandBuffer];
             metal_dispatch_2d(second, pipelines[@"kipp_kv_write"],
                               KIPP_ATTENTION_HEAD_COUNT_KV *
@@ -2113,6 +2181,9 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                              length:sizeof(position1)
                             atIndex:4];
                   [encoder setBuffer:blockTable offset:0 atIndex:5];
+                  /* Position 1 stays single-split; the partials binding is
+                   * never dereferenced, so any buffer satisfies it. */
+                  [encoder setBuffer:output offset:0 atIndex:6];
                 });
             if (metal_commit_and_wait(second, error) != 0) {
                 return -1;

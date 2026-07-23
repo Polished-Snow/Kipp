@@ -67,7 +67,30 @@ struct KvParams {
     uint start_position;
     uint token_count;
     uint capacity;
+    /* Test hook: 0 = automatic split-K, otherwise a hard cap (1 forces the
+     * legacy single-split decode path regardless of position). */
+    uint ksplit_cap;
 };
+
+/*
+ * Split-K decode: contexts past KIPP_KSPLIT_CHUNK positions split the KV
+ * scan across up to KIPP_KSPLIT_MAX threadgroups per (head, token), each
+ * writing an online-softmax partial that kipp_flash_gqa_reduce merges. The
+ * split count derives ONLY from the token's own position, so a token is
+ * partitioned - and therefore reduced - identically whether it arrives as
+ * single-token decode or inside a multi-row speculative verify; that
+ * position-independence is the token-identity contract for speculation.
+ */
+constant uint KIPP_KSPLIT_MAX = 8;
+constant uint KIPP_KSPLIT_CHUNK = 1024;
+/* floats per (head, split, token) partial: max, denominator, 2 pad,
+ * then the 128 accumulator lanes. */
+constant uint KIPP_KSPLIT_STRIDE = 4 + KIPP_HEAD_DIM;
+
+inline uint kipp_ksplit_count(uint last_source, uint cap) {
+    uint splits = min(KIPP_KSPLIT_MAX, 1u + last_source / KIPP_KSPLIT_CHUNK);
+    return cap != 0u ? min(splits, cap) : splits;
+}
 
 kernel void kipp_bf16_roundtrip(device const float *input [[buffer(0)]],
                                 device ushort *bits [[buffer(1)]],
@@ -383,7 +406,8 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
                            device float *output [[buffer(3)]],
                            constant KvParams &params [[buffer(4)]],
                            device const uint *block_table [[buffer(5)]],
-                           uint2 group_id [[threadgroup_position_in_grid]],
+                           device float *partials [[buffer(6)]],
+                           uint3 group_id [[threadgroup_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]],
                            uint group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float partial_values[KIPP_GQA_GROUPS][KIPP_HEAD_DIM];
@@ -393,21 +417,31 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
     threadgroup uint partial_count[KIPP_GQA_GROUPS];
 
     uint head = group_id.x;
-    uint token = group_id.y;
+    uint split = group_id.y;
+    uint token = group_id.z;
     uint kv_head = head / (KIPP_Q_HEADS / KIPP_KV_HEADS);
     device const float4 *query4 = (device const float4 *)(
         query + (ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM);
     float4 q = query4[lane];
     const float scale = rsqrt(float(KIPP_HEAD_DIM));
     uint last_source = params.start_position + token;
+    uint splits = kipp_ksplit_count(last_source, params.ksplit_cap);
+    if (split >= splits) {
+        return;
+    }
     ulong head_offset = ulong(kv_head) * KIPP_HEAD_DIM;
 
+    /* splits == 1 makes first/stride collapse to the legacy scan (source =
+     * group, stride 8): identical arithmetic in identical order, keeping
+     * short-context decode bit-for-bit unchanged. */
+    uint first_source = split * KIPP_GQA_GROUPS + group;
+    uint source_stride = splits * KIPP_GQA_GROUPS;
     float maximum = 0.0f;
     float denominator = 0.0f;
     float4 accumulator = 0.0f;
     uint count = 0;
-    for (uint source = group; source <= last_source;
-         source += KIPP_GQA_GROUPS) {
+    for (uint source = first_source; source <= last_source;
+         source += source_stride) {
         ulong offset =
             kipp_kv_slot(params, block_table, source) *
                 KIPP_KV_VALUES_PER_TOKEN +
@@ -458,9 +492,69 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
             value += partial_values[g][thread_id] * weight;
             total += partial_denominator[g] * weight;
         }
-        output[(ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM +
-               thread_id] = value / total;
+        if (splits == 1u) {
+            output[(ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM +
+                   thread_id] = value / total;
+        } else {
+            /* Un-normalized numerator at this split's local maximum; the
+             * reduce kernel merges the splits in fixed order. */
+            ulong base = ((ulong(token) * KIPP_Q_HEADS + head) *
+                              KIPP_KSPLIT_MAX +
+                          split) *
+                         KIPP_KSPLIT_STRIDE;
+            partials[base + 4u + thread_id] = value;
+            if (thread_id == 0u) {
+                partials[base + 0u] = global_maximum;
+                partials[base + 1u] = total;
+            }
+        }
     }
+}
+
+/*
+ * Merge kipp_flash_gqa's split-K partials for one (head, token) with the
+ * standard streaming-softmax rescale, in fixed split order. Recomputes the
+ * split count from the token's own position exactly as the split kernel
+ * does; single-split tokens were written directly and are skipped.
+ */
+kernel void kipp_flash_gqa_reduce(device float *output [[buffer(0)]],
+                                  device const float *partials [[buffer(1)]],
+                                  constant KvParams &params [[buffer(2)]],
+                                  uint2 group_id
+                                  [[threadgroup_position_in_grid]],
+                                  uint thread_id
+                                  [[thread_index_in_threadgroup]]) {
+    uint head = group_id.x;
+    uint token = group_id.y;
+    uint last_source = params.start_position + token;
+    uint splits = kipp_ksplit_count(last_source, params.ksplit_cap);
+    if (splits <= 1u || thread_id >= KIPP_HEAD_DIM) {
+        return;
+    }
+    ulong base = (ulong(token) * KIPP_Q_HEADS + head) * KIPP_KSPLIT_MAX *
+                 KIPP_KSPLIT_STRIDE;
+    float global_maximum = KIPP_FLT_LOWEST;
+    for (uint s = 0; s < splits; ++s) {
+        ulong entry = base + ulong(s) * KIPP_KSPLIT_STRIDE;
+        if (partials[entry + 1u] != 0.0f &&
+            partials[entry] > global_maximum) {
+            global_maximum = partials[entry];
+        }
+    }
+    float value = 0.0f;
+    float total = 0.0f;
+    for (uint s = 0; s < splits; ++s) {
+        ulong entry = base + ulong(s) * KIPP_KSPLIT_STRIDE;
+        float denominator = partials[entry + 1u];
+        if (denominator == 0.0f) {
+            continue;
+        }
+        float weight = exp(partials[entry] - global_maximum);
+        value += partials[entry + 4u + thread_id] * weight;
+        total += denominator * weight;
+    }
+    output[(ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM +
+           thread_id] = value / total;
 }
 
 kernel void kipp_residual_add(device float *residual [[buffer(0)]],
