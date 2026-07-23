@@ -609,6 +609,12 @@ FlashAttention lineage
 streaming online-softmax kernel: eight simdgroups per (head, token) each
 scan every eighth source position through the block table, and partial
 softmaxes merge in threadgroup memory; no score matrix is materialized.
+Past 1{,}024 cached positions the kernel additionally splits each head's
+KV scan across up to eight threadgroups, each emitting an online-softmax
+partial that a small reduction kernel merges in fixed order; the split
+count derives only from a token's own position, so plain decode and
+multi-row speculative verify partition identically and short contexts
+execute the unsplit path bit-for-bit.
 Prefill uses a tiled simdgroup-matrix flash kernel whose 32-position KV
 tiles coincide with cache blocks; its arrival also produced the
 silent-fallback episode of \Cref{sec:eval-ablation}.
@@ -951,7 +957,9 @@ parameter count.}
 decode, median of 3; \code{bench/results/ctx-*.json}). Decode degrades
 gracefully, from \CtxDecodeShort{} to \CtxDecodeLongest~tok/s between a 3-
 and a 12{,}800-token context, as the per-step KV read grows against the
-fixed weight stream. Prefill peaks near \CtxPrefillPeak~tok/s at an
+fixed weight stream; the KV-length split of \Cref{sec:impl-kernels} is
+what holds the 12{,}800-token point near two-thirds of the bandwidth
+roofline, where a single-threadgroup-per-head scan reaches about a third. Prefill peaks near \CtxPrefillPeak~tok/s at an
 800-token prompt and then declines steadily with context, the expected
 shape once attention's quadratic term grows against the linear matmul
 work; at 12{,}800 tokens prefill still sustains over a third of its peak.
