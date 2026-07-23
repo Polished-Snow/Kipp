@@ -1,0 +1,32 @@
+{
+  "title": "Kipp: Oracle-Gated, Placement-Invariant Paged Attention for Verifiable LLM Inference",
+  "upload_type": "software",
+  "description": "<p>Kipp is a hand-written C11 inference engine for the pinned Qwen3 dense model family, with a scalar CPU correctness oracle and correctness-gated Apple Metal and NVIDIA CUDA backends. Its paged key-value cache is placement-invariant: the physical location of KV blocks is arbitrary, so a sequence's logits are bitwise-identical under any permutation of its block table. Kipp turns that property into a continuous correctness contract &mdash; a scramble gate that reverses a session's block table and requires bitwise-identical output &mdash; and a mutation study shows the gate catches a class of silent KV-addressing bugs that tolerance-based reference tests miss entirely.</p><p>This deposit is the software artifact accompanying the paper of the same title; every benchmark number in the paper is generated from committed result files under <code>bench/results/</code>.</p>",
+  "creators": [
+    {
+      "name": "Khachatryan Johansson, David",
+      "affiliation": "Cortify"
+    }
+  ],
+  "license": "MIT",
+  "access_right": "open",
+  "keywords": [
+    "large language models",
+    "inference engine",
+    "paged attention",
+    "KV cache",
+    "deterministic inference",
+    "verifiable systems",
+    "metamorphic testing",
+    "Qwen3",
+    "Apple Metal",
+    "CUDA"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/Polished-Snow/Kipp",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}

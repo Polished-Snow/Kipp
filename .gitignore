@@ -36,3 +36,4 @@ paper/*.out
 paper/*.fdb_latexmk
 paper/*.fls
 .claude/worktrees/
+paper/arxiv-submission.tar.gz
