@@ -1042,25 +1042,34 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        /* Scalar online-softmax step: lane r owns query row r. */
-        if (lane < KIPP_FA_QUERIES) {
-            uint row = lane;
+        /* Online-softmax step on all 32 lanes: quad r (lanes 4r..4r+3)
+         * owns query row r, each lane owns eight score columns, and quad
+         * shuffles reduce the row maximum and exp-sum, so no lane idles
+         * and the serial exp work per lane drops from 32 columns to 8. */
+        {
+            uint row = lane / 4u;
+            uint sub = lane % 4u;
             uint query_position =
                 params.start_position + tile_first + min(row, tile_rows - 1u);
             float row_max = KIPP_FLT_LOWEST;
-            for (uint column = 0; column < KIPP_FA_KV_TILE; ++column) {
+            for (uint index = 0; index < KIPP_FA_KV_TILE / 4u; ++index) {
+                uint column = sub * (KIPP_FA_KV_TILE / 4u) + index;
                 if (tile_base + column <= query_position) {
                     row_max = max(row_max,
                                   scores[row * KIPP_FA_SCORE_STRIDE + column] *
                                       scale);
                 }
             }
+            /* row*4 is quad-aligned, so masks 1 and 2 stay in the quad. */
+            row_max = max(row_max, simd_shuffle_xor(row_max, 1u));
+            row_max = max(row_max, simd_shuffle_xor(row_max, 2u));
             float previous = maxima[row];
             float merged = max(previous, row_max);
             float correction =
                 merged == previous ? 1.0f : exp(previous - merged);
             float sum = 0.0f;
-            for (uint column = 0; column < KIPP_FA_KV_TILE; ++column) {
+            for (uint index = 0; index < KIPP_FA_KV_TILE / 4u; ++index) {
+                uint column = sub * (KIPP_FA_KV_TILE / 4u) + index;
                 float weight = 0.0f;
                 if (tile_base + column <= query_position) {
                     weight = exp(scores[row * KIPP_FA_SCORE_STRIDE + column] *
@@ -1070,9 +1079,13 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
                 probs[row * KIPP_FA_SCORE_STRIDE + column] = bfloat(weight);
                 sum += weight;
             }
-            maxima[row] = merged;
-            denominators[row] = denominators[row] * correction + sum;
-            rescale[row * 8u + row] = correction;
+            sum += simd_shuffle_xor(sum, 1u);
+            sum += simd_shuffle_xor(sum, 2u);
+            if (sub == 0u) {
+                maxima[row] = merged;
+                denominators[row] = denominators[row] * correction + sum;
+                rescale[row * 8u + row] = correction;
+            }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
