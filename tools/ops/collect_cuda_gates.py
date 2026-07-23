@@ -4,7 +4,7 @@
 The gate binaries already print machine-parseable lines (MODEL nmse=...,
 PHASE4 ... nmse=..., PASS/FAIL ...); verda_cuda_gate.sh adds
 KIPP_CUDA_GATE_* provenance markers. This collector turns one tee'd log
-into a committed, paper-bindable result file.
+into a committed, documentation-ready result file.
 
 Usage: python3 tools/ops/collect_cuda_gates.py cuda-gate-YYYYMMDD.log
 Stdlib only, matching bench/*.py conventions.

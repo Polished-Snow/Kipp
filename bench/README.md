@@ -29,16 +29,13 @@ hardware, and the exact commands.
   repository/revision read from its `*.gguf.manifest.json` — never
   hardcoded.
 
-Every result file records the engine commit, binary, and hardware — **a
-number quoted anywhere (docs, paper) must trace to a committed
-`results/*.json`**, and a hardware change must be visible in that file, not
-inferred.
+Every result file records the engine commit, binary, and hardware. A number
+quoted in project documentation must trace to a committed `results/*.json`,
+and a hardware change must be visible in that file rather than inferred.
 
-The recorded `dirty` flag ignores `bench/results/` itself and the paper
-artifacts derived from it (`paper/generated/`, `paper/data/`): a run whose
-only working-tree changes are freshly written results or stale derived
-paper data records `dirty: false`. Any modification outside those paths
-still marks the run dirty.
+The recorded `dirty` flag ignores `bench/results/` itself so a run whose only
+working-tree changes are freshly written results records `dirty: false`.
+Any modification outside that directory still marks the run dirty.
 
 ## Measurement protocol: GPU steady state
 
@@ -74,45 +71,12 @@ Committed per configuration. Naming: `<model>-<scheme>-<decode|prefill>.json`,
 `llamacpp-*.json` (external A/B), `faults.json` (mutation study), and
 `cuda-h100-gates.json` for cloud CUDA gate runs.
 
-## Reference numbers — Apple M5 Max (Qwen3-4B, Metal, greedy, median of 5)
+## Published results
 
-Measured on a MacBook Pro M5 Max (40-core GPU, 128 GB unified memory) under
-the steady-state protocol above. Numbers from earlier releases were measured
-on a base M5 (10-core GPU, 24 GB) and are roughly 4× lower across the board;
-see each result file's recorded hardware.
-
-| Weight scheme | Decode tok/s | Prefill tok/s (348 / 2,048 tokens) | Wikitext-2 PPL |
-|---|---|---|---|
-| BF16 | 60.7 | 528 / 481 | 7.731 |
-| Q8_0 (8-bit) | 97.9 | 488 / 441 | 7.733 |
-| affine4 (4-bit) | 130 | 509 / 466 | 8.171 |
-
-Peak process RSS ≈ 41 MB (weights are mmap-ed; RSS understates GPU-touched
-residency). Decode is bandwidth-bound, so quantization scales it with the
-weight-byte reduction at unmeasurable quality cost for Q8_0 (+0.02% PPL)
-and a Q4-class cost for affine4 (+5.7% PPL). Prefill runs on the
-simdgroup-matrix (MMA) kernels — matmuls and the tiled flash-attention
-kernel — so quantized prefill stays near BF16 parity; the O(n²) attention
-tail brings Q8_0 prefill from ~485 tok/s at short context down to
-177 tok/s at 12.8k tokens.
-
-Speculative decoding (Q8_0, 256-token decode, paired-baseline A/B via
-`--gate both`, median of 3):
-
-| Workload | α | Ungated | Gated | Duty |
-|---|---|---|---|---|
-| Repetitive / copy-heavy | 1.00 | 2.10× | 2.27× | 1.00 |
-| Code | 0.19 | 0.73× | 1.24× | 0.06 |
-| Grounded QA | 0.00 | 0.27× | 0.90× | 0.04 |
-| Open-ended | 0.09 | 0.62× | 0.84× | 0.10 |
-
-Prompt-lookup only pays at high acceptance; the adaptive gate suspends
-drafting when a short acceptance EMA collapses and probes periodically, which
-holds every low-acceptance workload at or near parity (0.84× floor, and
-above parity on code) while keeping the copy-heavy win. Speedups are
-smaller than earlier drafts because the sampling fast path made the plain
-decode baseline itself faster. Gated speculative output remains
-token-identical to greedy.
+[`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) is the single human-readable
+record of reference results. The JSON files in `results/` are the underlying
+machine-readable evidence; this document intentionally describes only the
+harness and measurement protocol.
 
 ## Reproduce
 
@@ -129,4 +93,6 @@ python3 bench/ppl_bench.py --output bench/results/ppl-4b.json
 
 Run the commands above on your hardware and open a PR adding the `results/`
 JSON files. Keep the model revision, quantization, context, and build flags
-identical to the reference so numbers are comparable.
+identical to the reference so numbers are comparable. See
+[`docs/REPRODUCING.md`](../docs/REPRODUCING.md) for the complete build and
+gate sequence.

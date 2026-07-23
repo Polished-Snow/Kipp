@@ -60,8 +60,8 @@ record results from a fallback build. Current reference numbers
   dequantize once per 16-token tile, so quantized prefill stays near BF16
   parity; the O(n²) attention tail brings Q8_0 prefill from ~485 tok/s at
   short context to **177 tok/s** at 12,800 tokens.
-- Context scaling (Q8_0): decode 98.4 → 26.0 tok/s from a 3- to a
-  12,800-token prompt (`ctx-*.json`).
+- Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
+  12,800-token prompt after the split-K long-context path (`ctx-*.json`).
 - Model-size sweep (BF16 decode): 0.6B **269**, 4B **60.7**, 8B **33.5**
   tok/s — bandwidth-bound decode scales inversely with streamed weight
   bytes across the family (8B Q8_0: 57.8 tok/s; 8B prefill 316/331).

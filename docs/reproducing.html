@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reproducing — Kipp</title>
+  <meta name="description" content="Build, correctness-gate, and benchmark reproduction commands.">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="index.html">Home</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="model-support.html">Models</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="reproducing.html" aria-current="page">Reproduce</a>
+        <a href="releasing.html">Releases</a>
+        <a href="research/inspiration-notes.html">Research</a>
+        <a href="contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Reproducing Kipp</h1>
+<p>This guide covers builds, correctness gates, and benchmark reproduction.
+Benchmark claims in <code>BENCHMARKS.md</code> trace to committed JSON records under
+<code>bench/results/</code>.</p>
+<h2>Requirements</h2>
+<ul>
+<li><strong>CPU:</strong> a C11 compiler (<code>clang</code> or <code>gcc</code>), <code>make</code>, and Python 3.12+</li>
+<li><strong>Apple Metal:</strong> Apple Silicon with the Xcode command-line tools</li>
+<li><strong>NVIDIA CUDA:</strong> <code>nvcc</code> from CUDA 12.x or newer</li>
+<li><strong>Tooling:</strong> <a href="https://docs.astral.sh/uv/"><code>uv</code></a> for the locked Python
+environment</li>
+<li><strong>Model artifacts:</strong> converted pinned Qwen3 checkpoints under <code>models/</code></li>
+</ul>
+<p>Model weights are downloaded by <code>tools/download_model.sh</code> and converted by
+<code>tools/convert_to_gguf.py</code>. They are intentionally not committed. The pinned
+<code>qwen3-4b-base</code> golden vectors live under <code>tests/test-vectors/</code>.</p>
+<h2>Build</h2>
+<pre><code class="language-bash">make cpu             # scalar CPU reference CLI
+make server          # CPU server
+make metal           # Apple Metal CLI
+make server-metal    # Apple Metal server
+make cuda-generic    # portable NVIDIA CUDA CLI
+make server-cuda     # portable NVIDIA CUDA server
+make cuda-spark      # NVIDIA DGX Spark (sm_121)
+</code></pre>
+<p>Backend selection is explicit. A backend initialization or compilation
+failure is fatal; Kipp never silently falls back to CPU.</p>
+<h2>Model-free gates</h2>
+<pre><code class="language-bash">make test            # native units, tooling tests, docs drift
+make test-sanitize   # ASan + UBSan
+make docs-check      # generated HTML matches canonical Markdown
+</code></pre>
+<h2>Model-backed CPU and Metal gates</h2>
+<p>For a quick local gate, run the built test binaries against an existing GGUF
+and vector directory. Avoid the <code>vectors</code> target unless you intend to
+download, convert, and regenerate the multi-gigabyte artifact.</p>
+<pre><code class="language-bash">M=models/qwen3-4b-base/kipp-qwen3-4b-base-bf16.gguf
+V=tests/test-vectors/qwen3-4b-base
+
+build/kipp_test --model &quot;$M&quot; &quot;$V&quot;
+build/kipp_test --phase2-model &quot;$M&quot; &quot;$V&quot;
+build/kipp_test --multilogit &quot;$M&quot; &quot;$V&quot;
+build/kipp_test --paged-cpu &quot;$M&quot; &quot;$V&quot;
+build/kipp_test --pooled-cpu &quot;$M&quot; &quot;$V&quot;
+
+build/kipp_test_metal --metal-operators
+build/kipp_test_metal --phase3-metal &quot;$M&quot; &quot;$V&quot;
+build/kipp_test_metal --multilogit-metal &quot;$M&quot; &quot;$V&quot;
+build/kipp_test_metal --paged-metal &quot;$M&quot; &quot;$V&quot;
+build/kipp_test_metal --pooled-metal &quot;$M&quot; &quot;$V&quot;
+build/kipp_test_metal --longctx-metal &quot;$M&quot; &quot;$V&quot;
+</code></pre>
+<p>The convenience targets <code>test-cpu-model</code> and <code>test-metal</code> run the complete
+CPU and Metal suites for <code>CHECKPOINT</code> (default <code>qwen3-4b-base</code>).
+Additional integration gates:</p>
+<pre><code class="language-bash">make test-server
+make test-chat
+make test-draft-spec
+</code></pre>
+<p>CPU reference logits require the vector-specific bound and exact argmax.
+Cached CPU decode must match recomputation within <code>1e-6</code>; Metal must preserve
+argmax and remain within <code>1e-4</code> NMSE of the CPU oracle.</p>
+<h2>CUDA gates</h2>
+<p>On an NVIDIA host:</p>
+<pre><code class="language-bash">make cuda-generic test-cuda
+</code></pre>
+<p><code>tools/ops/verda_cuda_gate.sh</code> provisions a disposable Verda instance,
+runs the registered checkpoint gates, and removes the VM and volume. It
+requires explicit cost acknowledgement. Parse a captured log with
+<code>tools/ops/collect_cuda_gates.py</code> to produce a self-describing result file.</p>
+<h2>Mutation gate</h2>
+<p>The optional fault-injection binary validates that the identity-layout
+tolerance gate and adversarial block-table gate catch different classes of
+KV addressing defects:</p>
+<pre><code class="language-bash">make build/kipp_test_fault
+KIPP_FAULT=1 build/kipp_test_fault --fault-reference &quot;$M&quot; &quot;$V&quot;
+KIPP_FAULT=1 build/kipp_test_fault --paged-cpu &quot;$M&quot; &quot;$V&quot;
+</code></pre>
+<p>Values 1–4 select read-block, read-slot, rollover, and K/V-swap faults.
+Production targets never define <code>KIPP_FAULT_INJECT</code>.</p>
+<h2>Benchmarks</h2>
+<p>All benchmark harnesses record commit, dirty state, binary, compiler,
+hardware, and model manifest metadata. Follow the sustained GPU steady-state
+protocol in <a href="https://github.com/Polished-Snow/Kipp/blob/main/bench/README.md"><code>../bench/README.md</code></a>.</p>
+<pre><code class="language-bash">python3 tools/bench.py \
+  --backend metal \
+  --model models/qwen3-4b-base/kipp-qwen3-4b-base-bf16.gguf \
+  --prompt &quot;The capital of France is&quot; \
+  --decode 64 --warmup 1 --runs 5 \
+  --output bench/results/4b-bf16-decode.json
+
+python3 bench/spec_bench.py --model &lt;gguf&gt; --decode 256 --runs 3 --gate both
+python3 bench/server_bench.py --model &lt;gguf&gt;
+python3 bench/prefix_bench.py --model &lt;gguf&gt;
+python3 bench/load_bench.py --model &lt;gguf&gt;
+python3 bench/ppl_bench.py --output bench/results/ppl-4b.json
+</code></pre>
+<p>CUDA uses the same subprocess harness with <code>--backend cuda --binary build/kipp-cuda-generic</code>. Only commit results from a clean, stable run with
+tight dispersion.</p>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
+</body>
+</html>

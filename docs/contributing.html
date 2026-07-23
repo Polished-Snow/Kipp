@@ -19,6 +19,9 @@
         <a href="roadmap.html">Roadmap</a>
         <a href="model-support.html">Models</a>
         <a href="benchmarks.html">Benchmarks</a>
+        <a href="reproducing.html">Reproduce</a>
+        <a href="releasing.html">Releases</a>
+        <a href="research/inspiration-notes.html">Research</a>
         <a href="contributing.html" aria-current="page">Contributing</a></nav>
     </div>
   </header>
@@ -48,21 +51,27 @@ it at the expense of the GPU paths.</li>
 Read them for architecture, reimplement cleanly.</li>
 </ul>
 <h2>Building and gating</h2>
-<p>Build targets: <code>make cpu</code>, <code>make metal</code>, <code>make server-metal</code> (and
-<code>make cuda-generic</code> on NVIDIA hosts). Every feature is gated against the CPU
-oracle on real hardware before it is called done:</p>
+<p>Build targets: <code>make cpu</code>, <code>make server</code>, <code>make metal</code>, <code>make server-metal</code>,
+<code>make cuda-generic</code>, <code>make server-cuda</code>, and <code>make cuda-spark</code> for DGX Spark.
+Every feature is gated against the CPU oracle on real hardware before it is
+called done:</p>
 <ul>
 <li><code>make test</code> / <code>make test-sanitize</code> — hermetic unit tests (+ ASan/UBSan).</li>
 <li>Model gates run the built <code>build/kipp_test[_metal]</code> binary directly against
 the pinned vectors in <code>tests/test-vectors/</code> — do <strong>not</strong> go through the
 <code>vectors</code>→<code>convert</code> chain for a quick gate, it rewrites the multi-GB GGUF:
 <code>--model</code> (CPU logits vs pinned), <code>--paged-cpu</code> / <code>--paged-metal</code> (paged KV
-bitwise-equal to contiguous under a scrambled block table), <code>--multilogit</code>,
-<code>--phase3-metal</code> (CPU-vs-Metal within 1e-4 NMSE, identical argmax).</li>
+bitwise-equal to contiguous under a scrambled block table), <code>--pooled-cpu</code> /
+<code>--pooled-metal</code> (shared-prefix KV), <code>--multilogit</code>,
+<code>--phase3-metal</code> (CPU-vs-Metal within <code>1e-4</code> NMSE, identical argmax), and
+<code>--longctx-metal</code> (split-K decode partitioning).</li>
 <li><code>make test-server</code> — OpenAI Completions + Chat Completions server tests.</li>
+<li><code>make test-chat</code> / <code>make test-draft-spec</code> — chat and draft-model integration
+gates against converted model artifacts.</li>
 </ul>
 <p>State plainly which backends you actually ran. CUDA is validated on ephemeral
-cloud GPUs at phase milestones, not on this machine.</p>
+cloud GPUs at phase milestones, not on this machine. The complete command
+matrix lives in <code>docs/REPRODUCING.md</code>.</p>
   </main>
   <footer class="site-footer">
     <div class="wrap footer-content">

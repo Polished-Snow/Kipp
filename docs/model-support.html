@@ -19,12 +19,15 @@
         <a href="roadmap.html">Roadmap</a>
         <a href="model-support.html" aria-current="page">Models</a>
         <a href="benchmarks.html">Benchmarks</a>
+        <a href="reproducing.html">Reproduce</a>
+        <a href="releasing.html">Releases</a>
+        <a href="research/inspiration-notes.html">Research</a>
         <a href="contributing.html">Contributing</a></nav>
     </div>
   </header>
   <main class="wrap content">
 <h1>Kipp Model Support</h1>
-<p>This document describes Kipp v0.0.2.</p>
+<p>This document describes Kipp v0.0.3 and the current unreleased changes.</p>
 <p>&quot;Supported&quot; has a narrow meaning here: a checkpoint is supported only when
 it has a pinned entry in the compiled-in registry (<code>src/kipp_checkpoints.h</code>,
 mirrored by <code>tools/checkpoints.py</code>), its conversion and test vectors were
@@ -39,8 +42,9 @@ embedding tying, and stop tokens are recorded in the registry sources.</p>
 <thead>
 <tr>
 <th>Checkpoint id</th>
-<th>Layers</th>
-<th>Hidden</th>
+<th style="text-align:right">Params</th>
+<th style="text-align:right">Layers</th>
+<th style="text-align:right">Hidden</th>
 <th>Variant</th>
 <th>Tied head</th>
 <th>Gate status</th>
@@ -49,107 +53,120 @@ embedding tying, and stop tokens are recorded in the registry sources.</p>
 <tbody>
 <tr>
 <td>qwen3-0.6b-base</td>
-<td>28</td>
-<td>1024</td>
+<td style="text-align:right">0.6B</td>
+<td style="text-align:right">28</td>
+<td style="text-align:right">1024</td>
 <td>base</td>
 <td>yes</td>
-<td><strong>validated (CPU + Metal M5 + CUDA A100)</strong></td>
+<td><strong>CPU + Metal M5 Max + CUDA H100</strong></td>
 </tr>
 <tr>
 <td>qwen3-0.6b</td>
-<td>28</td>
-<td>1024</td>
+<td style="text-align:right">0.6B</td>
+<td style="text-align:right">28</td>
+<td style="text-align:right">1024</td>
 <td>instruct</td>
 <td>yes</td>
 <td>registry only</td>
 </tr>
 <tr>
 <td>qwen3-1.7b-base</td>
-<td>28</td>
-<td>2048</td>
+<td style="text-align:right">1.7B</td>
+<td style="text-align:right">28</td>
+<td style="text-align:right">2048</td>
 <td>base</td>
 <td>yes</td>
 <td>registry only</td>
 </tr>
 <tr>
 <td>qwen3-1.7b</td>
-<td>28</td>
-<td>2048</td>
+<td style="text-align:right">1.7B</td>
+<td style="text-align:right">28</td>
+<td style="text-align:right">2048</td>
 <td>instruct</td>
 <td>yes</td>
 <td>registry only</td>
 </tr>
 <tr>
 <td>qwen3-4b-base</td>
-<td>36</td>
-<td>2560</td>
+<td style="text-align:right">4B</td>
+<td style="text-align:right">36</td>
+<td style="text-align:right">2560</td>
 <td>base</td>
 <td>yes</td>
-<td><strong>validated (CPU + Metal M5 + CUDA A100)</strong></td>
+<td><strong>CPU + Metal M5 Max + CUDA H100</strong></td>
 </tr>
 <tr>
 <td>qwen3-4b</td>
-<td>36</td>
-<td>2560</td>
+<td style="text-align:right">4B</td>
+<td style="text-align:right">36</td>
+<td style="text-align:right">2560</td>
 <td>instruct</td>
 <td>yes</td>
 <td>registry only</td>
 </tr>
 <tr>
 <td>qwen3-4b-instruct-2507</td>
-<td>36</td>
-<td>2560</td>
+<td style="text-align:right">4B</td>
+<td style="text-align:right">36</td>
+<td style="text-align:right">2560</td>
 <td>instruct-2507</td>
 <td>yes</td>
-<td><strong>validated (CPU + Metal M5 + CUDA A100)</strong></td>
+<td><strong>CPU + Metal M5 Max + CUDA H100</strong></td>
 </tr>
 <tr>
 <td>qwen3-4b-thinking-2507</td>
-<td>36</td>
-<td>2560</td>
+<td style="text-align:right">4B</td>
+<td style="text-align:right">36</td>
+<td style="text-align:right">2560</td>
 <td>thinking-2507</td>
 <td>yes</td>
 <td>registry only</td>
 </tr>
 <tr>
 <td>qwen3-8b-base</td>
-<td>36</td>
-<td>4096</td>
+<td style="text-align:right">8B</td>
+<td style="text-align:right">36</td>
+<td style="text-align:right">4096</td>
 <td>base</td>
 <td>no</td>
-<td><strong>validated (CPU + CUDA A100)</strong> — Metal blocked by buffer size (see below)</td>
+<td><strong>CPU + CUDA H100; Q8_0 on Metal</strong></td>
 </tr>
 <tr>
 <td>qwen3-8b</td>
-<td>36</td>
-<td>4096</td>
+<td style="text-align:right">8B</td>
+<td style="text-align:right">36</td>
+<td style="text-align:right">4096</td>
 <td>instruct</td>
 <td>no</td>
 <td>registry only</td>
 </tr>
 <tr>
 <td>qwen3-14b-base</td>
-<td>40</td>
-<td>5120</td>
+<td style="text-align:right">14B</td>
+<td style="text-align:right">40</td>
+<td style="text-align:right">5120</td>
 <td>base</td>
 <td>no</td>
-<td><strong>validated (CPU + CUDA A100)</strong> — Metal blocked by size</td>
+<td><strong>CPU + CUDA A100</strong>; Metal blocked by size</td>
 </tr>
 <tr>
 <td>qwen3-14b</td>
-<td>40</td>
-<td>5120</td>
+<td style="text-align:right">14B</td>
+<td style="text-align:right">40</td>
+<td style="text-align:right">5120</td>
 <td>instruct</td>
 <td>no</td>
 <td>registry only</td>
 </tr>
 <tr>
 <td>qwen3-32b</td>
-<td>64</td>
-<td>5120</td>
+<td style="text-align:right">32B</td>
+<td style="text-align:right">64</td>
+<td style="text-align:right">5120</td>
 <td>instruct</td>
 <td>no</td>
-<td><strong>validated (CPU + CUDA A100)</strong> — Metal blocked by size</td>
+<td><strong>CPU + CUDA A100</strong>; Metal blocked by size</td>
 </tr>
 </tbody>
 </table>
@@ -159,7 +176,7 @@ support claim is made.</p>
 <p><strong>Metal single-buffer limit.</strong> The Metal backend wraps the entire GGUF mmap
 in one no-copy <code>MTLBuffer</code>, so a model is Metal-runnable on a given device
 only if its artifact fits <code>MTLDevice.maxBufferLength</code>. On this project's
-Apple M5 that cap is <strong>13.32 GiB</strong> (recommended working set 17.76 GiB), so
+Apple M5 Max that cap is <strong>13.32 GiB</strong>, so
 the 8B BF16 artifact (15.26 GiB) is rejected at model creation with a clear
 error rather than a fallback. The 8B Q8_0 artifact fits and is validated on
 Metal, while its BF16 artifact remains unsupported there. 14B and 32B BF16
@@ -170,21 +187,21 @@ claim for those sizes requires a separately gated quantized artifact.</p>
 tokenizer cases (including the four instruct-era special tokens, which
 base checkpoints must BPE-split and instruct checkpoints must isolate);
 exact reference token IDs; full-vocabulary logits versus an FP32
-HF Transformers reference with identical argmax and NMSE at most <code>1e-5</code>
+HF Transformers reference with identical argmax and NMSE at most <code>5e-5</code>
 (Phase 1); cached incremental decode equal to no-cache recomputation with
 identical argmax and NMSE at most <code>1e-6</code> at every position (Phase 2); and
 Metal-versus-CPU with identical argmax and NMSE at most <code>1e-4</code> for prefill,
 every checked decode position, truncate/resume, and batched-equals-isolated
-evaluation (Phase 3, Apple M5).</p>
+evaluation (Phase 3, Apple M5-class hardware).</p>
 <h2>Validated results</h2>
-<h3>qwen3-4b-base (CPU + Metal, Apple M5)</h3>
+<h3>qwen3-4b-base (CPU + Metal, Apple M5-class hardware)</h3>
 <p>The v2 registry refactor was gated byte-identical against v0.0.1 output:
 identical top-10 logits at <code>%.9g</code> on CPU and Metal, and an identical
 8-token greedy Metal decode. Phase 1 NMSE <code>3.79e-7</code>; Phase 2 NMSE <code>0</code>;
 Phase 3 maximum NMSE <code>2.96e-8</code> (decode) / <code>1.41e-8</code> (batch suffix), all
-with exact argmax. Sampling, truncation, batched evaluation, and the
-19-test server suite pass unchanged.</p>
-<h3>qwen3-0.6b-base (CPU + Metal, Apple M5)</h3>
+with exact argmax. Sampling, truncation, batched evaluation, and the server
+integration suite pass unchanged.</p>
+<h3>qwen3-0.6b-base (CPU + Metal, Apple M5-class hardware)</h3>
 <p>The first non-4B checkpoint, exercising 16 query heads and an attention
 width (2,048) wider than the hidden width (1,024). All 13 golden tokenizer
 cases pass, including the think/tool special tokens. Phase 1 NMSE
@@ -193,13 +210,13 @@ confirming the deviation is the storage contract, not the implementation);
 Phase 2 NMSE <code>0</code> at every position; Phase 3 Metal maximum NMSE <code>5.9e-7</code>
 with exact argmax across decode, prefill, truncate/resume, and batched
 evaluation.</p>
-<h3>qwen3-8b-base (CPU, Apple M5)</h3>
+<h3>qwen3-8b-base (CPU, Apple M5-class hardware)</h3>
 <p>The first untied checkpoint, binding a separate <code>lm_head.weight</code> instead of
 aliasing the token embedding. Phase 1 NMSE <code>3.63e-7</code> with exact argmax and
 Phase 2 NMSE <code>0</code> on CPU. The Metal gate is blocked, not failed: the 15.26
 GiB artifact exceeds the M5's 13.32 GiB single-buffer cap and is rejected at
-model creation. Metal validation is deferred to the quantized artifact.</p>
-<h3>qwen3-4b-instruct-2507 (CPU + Metal, Apple M5)</h3>
+model creation. The Q8_0 artifact fits and is validated on Metal.</p>
+<h3>qwen3-4b-instruct-2507 (CPU + Metal, Apple M5-class hardware)</h3>
 <p>The first instruct checkpoint, exercising RoPE theta <code>5e6</code>, the 262,144
 context limit, and the instruct stop set. All 13 golden tokenizer cases
 pass with the think/tool strings isolated as single tokens. Phase 1 NMSE
@@ -210,10 +227,10 @@ on Metal produces a coherent reply and generation stops on <code>&lt;|im_end|&gt
 <h3>Other checkpoints</h3>
 <p>Gate transcripts land here as each checkpoint's vectors are generated and
 run. Until then the table above is the authority.</p>
-<h3>CUDA (NVIDIA A100 80GB, first validation 2026-07-17)</h3>
-<p>The Phase 4 CUDA gate ran for the first time on a Verda A100-SXM4-80GB
-(driver 580.126.09, CUDA 12.8, sm_80), built warning-clean with the
-existing <code>CUDA_GENERIC_ARCH_FLAGS</code>. All four available checkpoints pass
+<h3>CUDA (NVIDIA H100 80GB, revalidated 2026-07-22)</h3>
+<p>The current Phase 4 gate record was captured on a Verda H100 80GB HBM3
+(driver 580.126.09, CUDA 12.8), built warning-clean with the existing
+<code>CUDA_GENERIC_ARCH_FLAGS</code>. Four checkpoints pass
 <code>--phase4-cuda</code> with identical argmax and CUDA-vs-CPU full-logit NMSE well
 under the <code>1e-4</code> bound at prefill, every decode position, stateless prefill,
 and reset/reuse:</p>
@@ -228,7 +245,7 @@ and reset/reuse:</p>
 <tbody>
 <tr>
 <td>qwen3-4b-base</td>
-<td>1.78e-8</td>
+<td>2.39e-8</td>
 <td>exact</td>
 </tr>
 <tr>
@@ -246,19 +263,11 @@ and reset/reuse:</p>
 <td>4.98e-8</td>
 <td>exact</td>
 </tr>
-<tr>
-<td>qwen3-14b-base</td>
-<td>2.82e-6 (CUDA)</td>
-<td>exact</td>
-</tr>
-<tr>
-<td>qwen3-32b</td>
-<td>1.10e-7 (CUDA)</td>
-<td>exact</td>
-</tr>
 </tbody>
 </table>
-<p>14B and 32B also pass CPU Phase 1 (argmax exact) and Phase 2 (NMSE <code>0</code>). 14B
+<p>The machine-readable record is <code>bench/results/cuda-h100-gates.json</code>.
+Earlier A100 validation additionally covered 14B and 32B. Both pass CPU
+Phase 1 (argmax exact) and Phase 2 (NMSE <code>0</code>). 14B
 uses the FP32 CPU reference (Phase 1 NMSE <code>7.8e-6</code>, under the <code>5e-5</code> bound).
 32B is too large for an FP32 host reference (~256 GiB), so its reference is
 BF16-on-GPU; that reference differs from Kipp's BF16-weight/FP32-accumulate
@@ -284,7 +293,7 @@ norms stay BF16. <code>tools/convert_to_gguf.py --quant q8_0</code> writes a
 loader validates per-tensor types and byte counts. Both CPU and Metal decode
 Q8_0 (the Metal path adds token-tiled <code>kipp_matvec_q8_0</code> decode/prefill
 kernels).</p>
-<p>Validated on Apple M5:</p>
+<p>Validated on Apple M5 Max:</p>
 <table>
 <thead>
 <tr>
@@ -301,7 +310,7 @@ kernels).</p>
 <td>4.32 GiB (was 7.5)</td>
 <td>1.9e-5</td>
 <td>5.5e-10</td>
-<td>22.2 tok/s (bf16 13.8)</td>
+<td>97.9 tok/s (bf16 60.7)</td>
 </tr>
 <tr>
 <td>qwen3-8b-base q8_0</td>
@@ -312,9 +321,10 @@ kernels).</p>
 </tr>
 </tbody>
 </table>
-<p>Both pass with exact argmax. Q8_0 is near-lossless (NMSE under the 5e-5 bf16
-bound) and ~1.6× faster decode / ~2× faster prefill on the 4B. Critically,
-<strong>8B now runs on Metal</strong> — its 9.20 GiB Q8_0 artifact fits the 13.32 GiB
+<p>Both pass with exact argmax. Q8_0 is near-lossless (NMSE under the <code>5e-5</code>
+BF16 bound) and ~1.6× faster decode on the 4B while quantized prefill remains
+near BF16 parity. Critically, <strong>8B now runs on Metal</strong>: its 9.20 GiB Q8_0
+artifact fits the 13.32 GiB
 single-buffer cap that its 15.26 GiB BF16 artifact exceeded. 14B (Q8 ≈ 15
 GiB) still exceeds the cap and awaits 4-bit; 8B/14B/32B Q8_0 remain CUDA- and
 CPU-runnable.</p>
@@ -327,13 +337,13 @@ gates therefore use an explicit per-vector tolerance rather than presenting
 it as near-lossless. A checkpoint gains a quantized support claim only after
 its full-logit and backend gates pass.</p>
 <h2>Backends</h2>
-<p>The CPU oracle, the Metal backend (Apple M5), and the CUDA backend (NVIDIA
-A100) are validated backends. Metal must be selected explicitly — a Metal
-initialization or shader compilation failure is fatal rather than falling
-back. Metal compiles its pipelines per model, specializing the hidden width
-and query-head count through function constants; the mmap of each GGUF is
-wrapped in one shared no-copy buffer (hence the single-buffer cap). CUDA
-copies the required tensors to VRAM at model creation and fails explicitly
+<p>The CPU oracle, the Metal backend (Apple M5 Max), and the CUDA backend
+(currently revalidated on NVIDIA H100) are validated backends. Metal must be
+selected explicitly: initialization or shader compilation failures are fatal
+rather than falling back. Metal compiles pipelines per model, specializing
+the hidden width and query-head count through function constants; the GGUF
+mmap is wrapped in one shared no-copy buffer, hence the single-buffer cap.
+CUDA copies required tensors to VRAM at model creation and fails explicitly
 if they do not fit.</p>
 <p>CUDA is validated on the checkpoints in the table above; other registry
 entries stay &quot;registry only&quot; for CUDA until their gate runs.</p>

@@ -19,6 +19,9 @@
         <a href="roadmap.html">Roadmap</a>
         <a href="model-support.html">Models</a>
         <a href="benchmarks.html">Benchmarks</a>
+        <a href="reproducing.html">Reproduce</a>
+        <a href="releasing.html">Releases</a>
+        <a href="research/inspiration-notes.html">Research</a>
         <a href="contributing.html">Contributing</a></nav>
     </div>
   </header>
@@ -242,10 +245,8 @@ changing any computed value. The <code>--paged-cpu</code> and <code>--paged-meta
 prove this per backend by evaluating a multi-block prompt under a
 deliberately scrambled block table and asserting the final logits are
 bitwise-identical to the identity mapping; <code>--phase3-metal</code> further confirms
-paged Metal matches the paged CPU oracle within the 1e-4 tolerance. CUDA
-remains contiguous for now. The shared cross-request block pool
-(<code>src/kipp_kv_pool.c</code>) and the eval-item <code>block_table</code> contract that lets
-the core drive both backends are the next Phase 5 steps.</p>
+paged Metal matches the paged CPU oracle within the <code>1e-4</code> tolerance. CUDA
+remains contiguous for now.</p>
 <p>Sessions support truncation back to a prefix of their timeline
 (<code>kipp_session_truncate</code>), which is the primitive behind the server's
 serial prefix reuse.</p>
@@ -269,11 +270,12 @@ backend's batching contract (bitwise on CPU, whose scalar path is
 packing-independent; <code>1e-4</code> NMSE with identical arg max on Metal, where
 kernel selection legitimately differs between batched rounds and isolated
 evaluation), clean pool-exhaustion failure,
-truncation into the private tail, and eviction. Server integration,
-persistence, and cache-pressure admission remain future Phase 5 work and do
-not change the backend contract.</p>
+truncation into the private tail, and eviction. The server uses pooled
+models by default on CPU and Metal, with reservation-based admission under
+cache pressure. Persistence remains deferred and does not change the backend
+contract.</p>
 <h3>SSD streaming</h3>
-<p>SSD streaming is not part of Kipp v1.</p>
+<p>SSD streaming is not part of the current Kipp architecture.</p>
 <p>ds4 keeps model loading mmap-backed and uses backend-specific placement:
 <code>model_open()</code> maps weights, Metal uses <code>ds4_gpu_set_model_map()</code>, and CUDA
 uses <code>ds4_gpu_set_model_map_range()</code>. Its <code>ds4_ssd_*</code> path streams sparsely
@@ -288,7 +290,8 @@ KV checkpoint files are also deferred.</p>
 <h2>Backend boundary</h2>
 <p>Kipp uses one internal, model-specific backend contract. It is not a generic
 tensor API and does not expose device buffers to callers.</p>
-<p>The contract will live in <code>src/kipp_backend.h</code> and have this shape:</p>
+<p>The contract lives in <code>src/kipp_backend.h</code>. Its central evaluation item and
+operations table have this shape (omitting configuration and error details):</p>
 <pre><code class="language-c">typedef struct {
     void *session;
     const uint32_t *tokens;
@@ -331,7 +334,7 @@ must match isolated evaluation within the backend's documented tolerance.</p>
 their own static <code>kipp_backend_ops</code>. Device-specific headers, handles, and
 errors do not cross this interface.</p>
 <h2>Public engine and session model</h2>
-<p>The public C API will use opaque model and session handles:</p>
+<p>The public C API uses opaque model and session handles:</p>
 <ul>
 <li>a model owns the validated file mapping and one selected backend model;</li>
 <li>a session owns one independent token timeline and KV cache;</li>
@@ -407,8 +410,8 @@ drafts the continuation with a prompt-lookup n-gram matcher
 and accepts the longest greedy-matching prefix — rolling the KV back with
 <code>kipp_session_truncate</code> for rejected drafts. The emitted sequence is exactly
 the plain greedy sequence (a gated invariant); it just takes fewer forward
-passes (measured ~3.2x on repetitive/copy-heavy content with the adaptive
-gate, which also holds low-acceptance workloads at 0.80x or better; see
+passes (measured 2.27× on repetitive/copy-heavy content with the adaptive
+gate, which also holds low-acceptance workloads at 0.84× or better; see
 <code>bench/results/spec-gated.json</code>).</p>
 <p>The v1 server does not claim support for Anthropic Messages, tools,
 structured output, embeddings, multimodal input, authentication, TLS,
@@ -489,7 +492,7 @@ weight quantization, multi-row logits, and prompt-lookup speculative decoding
 were admitted through separate reviews and correctness gates.</p>
 <p>Still deferred:</p>
 <ul>
-<li>cross-session prefix caching and radix attention;</li>
+<li>radix-tree prefix indexing;</li>
 <li>KV persistence, offload, or quantization;</li>
 <li>SSD weight streaming;</li>
 <li>additional model families;</li>

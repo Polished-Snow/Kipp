@@ -56,14 +56,11 @@ def git_metadata(root: pathlib.Path) -> tuple[str, bool]:
         text=True,
         check=False,
     )
-    # Freshly written result files must not mark their own run dirty, and
-    # the paper artifacts derived from them (paper/generated, paper/data)
-    # inevitably lag between regeneration and commit, so both are excluded;
-    # every other change still counts.
+    # Freshly written result files must not mark their own run dirty.
+    # Every other working-tree change still counts.
     status = subprocess.run(
         ["git", "status", "--porcelain", "--", ".",
-         ":(exclude)bench/results", ":(exclude)paper/generated",
-         ":(exclude)paper/data"],
+         ":(exclude)bench/results"],
         cwd=root,
         capture_output=True,
         text=True,

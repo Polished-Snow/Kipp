@@ -250,10 +250,8 @@ changing any computed value. The `--paged-cpu` and `--paged-metal` gates
 prove this per backend by evaluating a multi-block prompt under a
 deliberately scrambled block table and asserting the final logits are
 bitwise-identical to the identity mapping; `--phase3-metal` further confirms
-paged Metal matches the paged CPU oracle within the 1e-4 tolerance. CUDA
-remains contiguous for now. The shared cross-request block pool
-(`src/kipp_kv_pool.c`) and the eval-item `block_table` contract that lets
-the core drive both backends are the next Phase 5 steps.
+paged Metal matches the paged CPU oracle within the `1e-4` tolerance. CUDA
+remains contiguous for now.
 
 Sessions support truncation back to a prefix of their timeline
 (`kipp_session_truncate`), which is the primitive behind the server's
@@ -279,13 +277,14 @@ backend's batching contract (bitwise on CPU, whose scalar path is
 packing-independent; `1e-4` NMSE with identical arg max on Metal, where
 kernel selection legitimately differs between batched rounds and isolated
 evaluation), clean pool-exhaustion failure,
-truncation into the private tail, and eviction. Server integration,
-persistence, and cache-pressure admission remain future Phase 5 work and do
-not change the backend contract.
+truncation into the private tail, and eviction. The server uses pooled
+models by default on CPU and Metal, with reservation-based admission under
+cache pressure. Persistence remains deferred and does not change the backend
+contract.
 
 ### SSD streaming
 
-SSD streaming is not part of Kipp v1.
+SSD streaming is not part of the current Kipp architecture.
 
 ds4 keeps model loading mmap-backed and uses backend-specific placement:
 `model_open()` maps weights, Metal uses `ds4_gpu_set_model_map()`, and CUDA
@@ -305,7 +304,8 @@ KV checkpoint files are also deferred.
 Kipp uses one internal, model-specific backend contract. It is not a generic
 tensor API and does not expose device buffers to callers.
 
-The contract will live in `src/kipp_backend.h` and have this shape:
+The contract lives in `src/kipp_backend.h`. Its central evaluation item and
+operations table have this shape (omitting configuration and error details):
 
 ```c
 typedef struct {
@@ -356,7 +356,7 @@ errors do not cross this interface.
 
 ## Public engine and session model
 
-The public C API will use opaque model and session handles:
+The public C API uses opaque model and session handles:
 
 - a model owns the validated file mapping and one selected backend model;
 - a session owns one independent token timeline and KV cache;
@@ -439,8 +439,8 @@ drafts the continuation with a prompt-lookup n-gram matcher
 and accepts the longest greedy-matching prefix — rolling the KV back with
 `kipp_session_truncate` for rejected drafts. The emitted sequence is exactly
 the plain greedy sequence (a gated invariant); it just takes fewer forward
-passes (measured ~3.2x on repetitive/copy-heavy content with the adaptive
-gate, which also holds low-acceptance workloads at 0.80x or better; see
+passes (measured 2.27× on repetitive/copy-heavy content with the adaptive
+gate, which also holds low-acceptance workloads at 0.84× or better; see
 `bench/results/spec-gated.json`).
 
 The v1 server does not claim support for Anthropic Messages, tools,
@@ -549,7 +549,7 @@ were admitted through separate reviews and correctness gates.
 
 Still deferred:
 
-- cross-session prefix caching and radix attention;
+- radix-tree prefix indexing;
 - KV persistence, offload, or quantization;
 - SSD weight streaming;
 - additional model families;

@@ -25,18 +25,24 @@ gates, never by loosening validation.
 
 ## Building and gating
 
-Build targets: `make cpu`, `make metal`, `make server-metal` (and
-`make cuda-generic` on NVIDIA hosts). Every feature is gated against the CPU
-oracle on real hardware before it is called done:
+Build targets: `make cpu`, `make server`, `make metal`, `make server-metal`,
+`make cuda-generic`, `make server-cuda`, and `make cuda-spark` for DGX Spark.
+Every feature is gated against the CPU oracle on real hardware before it is
+called done:
 
 - `make test` / `make test-sanitize` — hermetic unit tests (+ ASan/UBSan).
 - Model gates run the built `build/kipp_test[_metal]` binary directly against
   the pinned vectors in `tests/test-vectors/` — do **not** go through the
   `vectors`→`convert` chain for a quick gate, it rewrites the multi-GB GGUF:
   `--model` (CPU logits vs pinned), `--paged-cpu` / `--paged-metal` (paged KV
-  bitwise-equal to contiguous under a scrambled block table), `--multilogit`,
-  `--phase3-metal` (CPU-vs-Metal within 1e-4 NMSE, identical argmax).
+  bitwise-equal to contiguous under a scrambled block table), `--pooled-cpu` /
+  `--pooled-metal` (shared-prefix KV), `--multilogit`,
+  `--phase3-metal` (CPU-vs-Metal within `1e-4` NMSE, identical argmax), and
+  `--longctx-metal` (split-K decode partitioning).
 - `make test-server` — OpenAI Completions + Chat Completions server tests.
+- `make test-chat` / `make test-draft-spec` — chat and draft-model integration
+  gates against converted model artifacts.
 
 State plainly which backends you actually ran. CUDA is validated on ephemeral
-cloud GPUs at phase milestones, not on this machine.
+cloud GPUs at phase milestones, not on this machine. The complete command
+matrix lives in `docs/REPRODUCING.md`.
