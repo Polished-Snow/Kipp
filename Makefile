@@ -212,6 +212,9 @@ test-multilogit-metal: $(BUILD_DIR)/kipp_test_metal vectors
 test-paged-metal: $(BUILD_DIR)/kipp_test_metal vectors
 	$(BUILD_DIR)/kipp_test_metal --paged-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
+test-longctx-metal: $(BUILD_DIR)/kipp_test_metal vectors
+	$(BUILD_DIR)/kipp_test_metal --longctx-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
 test-pooled-metal: $(BUILD_DIR)/kipp_test_metal vectors
 	$(BUILD_DIR)/kipp_test_metal --pooled-metal $(MODEL_GGUF) $(VECTOR_DIR)
 

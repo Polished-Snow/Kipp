@@ -15,4 +15,11 @@ const char *kipp_metal_device_name(void);
 /* Test hook: reverse a Metal backend session's KV page table before eval. */
 int kipp_metal_test_scramble_session(void *backendSession);
 
+/*
+ * Test hook: cap the decode split-K count on a Metal backend model.
+ * 1 forces the legacy single-split path regardless of context length;
+ * 0 restores automatic position-derived splitting.
+ */
+int kipp_metal_test_set_ksplit_cap(void *backendModel, uint32_t cap);
+
 #endif

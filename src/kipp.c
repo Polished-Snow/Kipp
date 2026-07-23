@@ -3990,6 +3990,19 @@ int kipp_test_scramble_session_kv(kipp_session *session) {
     return -1;
 }
 
+int kipp_test_metal_ksplit_cap(kipp_model *model, uint32_t cap) {
+#ifdef KIPP_ENABLE_METAL
+    if (model != NULL && model->backend_model != NULL &&
+        model->backend_ops == kipp_metal_backend_operations()) {
+        return kipp_metal_test_set_ksplit_cap(model->backend_model, cap);
+    }
+#else
+    (void)model;
+    (void)cap;
+#endif
+    return -1;
+}
+
 void kipp_test_rms_norm(const float *input, const uint16_t *weight,
                         float *output, size_t length, float epsilon) {
     rms_norm(input, weight, output, length, epsilon);

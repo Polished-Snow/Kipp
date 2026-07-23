@@ -1962,6 +1962,122 @@ cleanup:
     return result;
 }
 
+
+#ifdef KIPP_ENABLE_METAL
+/*
+ * Split-K decode gate: the position-derived split path must reproduce the
+ * legacy single-split path. Long context (past the 1,024-position split
+ * threshold) is held to the standard Metal tolerance (1e-4 NMSE, same
+ * argmax) because the merge reorders the reduction; short context takes
+ * the single-split branch in both configurations and must stay bitwise.
+ */
+static int run_longctx_test(const char *model_path,
+                            const char *vector_directory) {
+    enum { LONGCTX_SEQ = 3200, LONGCTX_SHORT = 3 * KIPP_KV_BLOCK_TOKENS };
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *seed = NULL;
+    size_t token_bytes = 0;
+    uint32_t *sequence = NULL;
+    kipp_model *model = NULL;
+    kipp_session *session = NULL;
+    float *logits_auto = NULL;
+    float *logits_capped = NULL;
+    kipp_error error = {0};
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&seed, &token_bytes) != 0 ||
+        token_bytes < sizeof(*seed) || token_bytes % sizeof(*seed)) {
+        fprintf(stderr, "unable to read longctx token vector\n");
+        goto cleanup;
+    }
+    size_t seed_count = token_bytes / sizeof(*seed);
+    sequence = malloc((size_t)LONGCTX_SEQ * sizeof(*sequence));
+    logits_auto = malloc(KIPP_VOCAB_SIZE * sizeof(*logits_auto));
+    logits_capped = malloc(KIPP_VOCAB_SIZE * sizeof(*logits_capped));
+    if (sequence == NULL || logits_auto == NULL || logits_capped == NULL) {
+        fprintf(stderr, "longctx allocation failed\n");
+        goto cleanup;
+    }
+    for (uint32_t index = 0; index < LONGCTX_SEQ; ++index) {
+        sequence[index] = seed[index % seed_count];
+    }
+    if (kipp_model_open_backend(model_path, KIPP_BACKEND_METAL, &model,
+                                &error) != 0) {
+        fprintf(stderr, "longctx metal open failed: %s\n", error.message);
+        goto cleanup;
+    }
+
+    /*
+     * Long context: automatic splits vs the capped legacy path. Prefill all
+     * but the last token (matrix-attention path, split-independent), then
+     * decode the final token alone so the vector flash-GQA kernel - the
+     * split-K subject - answers with a >3k source scan.
+     */
+    for (int capped = 0; capped < 2; ++capped) {
+        float *logits = capped ? logits_capped : logits_auto;
+        if (kipp_test_metal_ksplit_cap(model, capped ? 1u : 0u) != 0 ||
+            kipp_session_create(model, LONGCTX_SEQ, &session, &error) != 0 ||
+            kipp_session_eval(session, sequence, LONGCTX_SEQ - 1, logits,
+                              KIPP_VOCAB_SIZE, &error) != 0 ||
+            kipp_session_eval(session, sequence + LONGCTX_SEQ - 1, 1, logits,
+                              KIPP_VOCAB_SIZE, &error) != 0) {
+            fprintf(stderr, "longctx eval failed: %s\n", error.message);
+            goto cleanup;
+        }
+        kipp_session_destroy(session);
+        session = NULL;
+    }
+    double nmse = logit_nmse(logits_auto, logits_capped, KIPP_VOCAB_SIZE);
+    int argmax_auto = argmax(logits_auto, KIPP_VOCAB_SIZE);
+    int argmax_capped = argmax(logits_capped, KIPP_VOCAB_SIZE);
+    fprintf(stderr,
+            "LONGCTX-METAL split vs capped nmse=%.9g argmax=%d/%d\n", nmse,
+            argmax_auto, argmax_capped);
+    if (nmse > 1.0e-4 || argmax_auto != argmax_capped) {
+        goto cleanup;
+    }
+
+    /* Short context stays on the single-split branch either way and must
+     * therefore be bitwise identical. */
+    for (int capped = 0; capped < 2; ++capped) {
+        float *logits = capped ? logits_capped : logits_auto;
+        if (kipp_test_metal_ksplit_cap(model, capped ? 1u : 0u) != 0 ||
+            kipp_session_create(model, LONGCTX_SHORT, &session, &error) != 0 ||
+            kipp_session_eval(session, sequence, LONGCTX_SHORT - 1, logits,
+                              KIPP_VOCAB_SIZE, &error) != 0 ||
+            kipp_session_eval(session, sequence + LONGCTX_SHORT - 1, 1,
+                              logits, KIPP_VOCAB_SIZE, &error) != 0) {
+            fprintf(stderr, "longctx short eval failed: %s\n", error.message);
+            goto cleanup;
+        }
+        kipp_session_destroy(session);
+        session = NULL;
+    }
+    if (memcmp(logits_auto, logits_capped,
+               KIPP_VOCAB_SIZE * sizeof(*logits_auto)) != 0) {
+        fprintf(stderr, "LONGCTX-METAL short-context logits differ\n");
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (model != NULL) {
+        (void)kipp_test_metal_ksplit_cap(model, 0u);
+    }
+    kipp_session_destroy(session);
+    if (model != NULL) {
+        (void)kipp_model_close(model, NULL);
+    }
+    free(logits_capped);
+    free(logits_auto);
+    free(sequence);
+    free(seed);
+    free(tokens_path);
+    return result;
+}
+#endif
+
 #ifdef KIPP_ENABLE_METAL
 /* Metal kipp_session_eval_n rows must match a CPU single-position eval at
  * each position within the Metal-vs-CPU tolerance (1e-4 NMSE, same argmax). */
@@ -3103,6 +3219,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL paged_metal\n");
         } else {
             fprintf(stderr, "PASS paged_metal\n");
+        }
+#endif
+#ifdef KIPP_ENABLE_METAL
+    } else if (argc == 4 && strcmp(argv[1], "--longctx-metal") == 0) {
+        ++tests_run;
+        if (run_longctx_test(argv[2], argv[3]) != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL longctx_metal\n");
+        } else {
+            fprintf(stderr, "PASS longctx_metal\n");
         }
 #endif
 #ifdef KIPP_ENABLE_METAL

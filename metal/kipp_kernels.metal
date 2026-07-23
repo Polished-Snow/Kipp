@@ -67,7 +67,30 @@ struct KvParams {
     uint start_position;
     uint token_count;
     uint capacity;
+    /* Test hook: 0 = automatic split-K, otherwise a hard cap (1 forces the
+     * legacy single-split decode path regardless of position). */
+    uint ksplit_cap;
 };
+
+/*
+ * Split-K decode: contexts past KIPP_KSPLIT_CHUNK positions split the KV
+ * scan across up to KIPP_KSPLIT_MAX threadgroups per (head, token), each
+ * writing an online-softmax partial that kipp_flash_gqa_reduce merges. The
+ * split count derives ONLY from the token's own position, so a token is
+ * partitioned - and therefore reduced - identically whether it arrives as
+ * single-token decode or inside a multi-row speculative verify; that
+ * position-independence is the token-identity contract for speculation.
+ */
+constant uint KIPP_KSPLIT_MAX = 8;
+constant uint KIPP_KSPLIT_CHUNK = 1024;
+/* floats per (head, split, token) partial: max, denominator, 2 pad,
+ * then the 128 accumulator lanes. */
+constant uint KIPP_KSPLIT_STRIDE = 4 + KIPP_HEAD_DIM;
+
+inline uint kipp_ksplit_count(uint last_source, uint cap) {
+    uint splits = min(KIPP_KSPLIT_MAX, 1u + last_source / KIPP_KSPLIT_CHUNK);
+    return cap != 0u ? min(splits, cap) : splits;
+}
 
 kernel void kipp_bf16_roundtrip(device const float *input [[buffer(0)]],
                                 device ushort *bits [[buffer(1)]],
@@ -383,7 +406,8 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
                            device float *output [[buffer(3)]],
                            constant KvParams &params [[buffer(4)]],
                            device const uint *block_table [[buffer(5)]],
-                           uint2 group_id [[threadgroup_position_in_grid]],
+                           device float *partials [[buffer(6)]],
+                           uint3 group_id [[threadgroup_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]],
                            uint group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float partial_values[KIPP_GQA_GROUPS][KIPP_HEAD_DIM];
@@ -393,21 +417,31 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
     threadgroup uint partial_count[KIPP_GQA_GROUPS];
 
     uint head = group_id.x;
-    uint token = group_id.y;
+    uint split = group_id.y;
+    uint token = group_id.z;
     uint kv_head = head / (KIPP_Q_HEADS / KIPP_KV_HEADS);
     device const float4 *query4 = (device const float4 *)(
         query + (ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM);
     float4 q = query4[lane];
     const float scale = rsqrt(float(KIPP_HEAD_DIM));
     uint last_source = params.start_position + token;
+    uint splits = kipp_ksplit_count(last_source, params.ksplit_cap);
+    if (split >= splits) {
+        return;
+    }
     ulong head_offset = ulong(kv_head) * KIPP_HEAD_DIM;
 
+    /* splits == 1 makes first/stride collapse to the legacy scan (source =
+     * group, stride 8): identical arithmetic in identical order, keeping
+     * short-context decode bit-for-bit unchanged. */
+    uint first_source = split * KIPP_GQA_GROUPS + group;
+    uint source_stride = splits * KIPP_GQA_GROUPS;
     float maximum = 0.0f;
     float denominator = 0.0f;
     float4 accumulator = 0.0f;
     uint count = 0;
-    for (uint source = group; source <= last_source;
-         source += KIPP_GQA_GROUPS) {
+    for (uint source = first_source; source <= last_source;
+         source += source_stride) {
         ulong offset =
             kipp_kv_slot(params, block_table, source) *
                 KIPP_KV_VALUES_PER_TOKEN +
@@ -458,9 +492,69 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
             value += partial_values[g][thread_id] * weight;
             total += partial_denominator[g] * weight;
         }
-        output[(ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM +
-               thread_id] = value / total;
+        if (splits == 1u) {
+            output[(ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM +
+                   thread_id] = value / total;
+        } else {
+            /* Un-normalized numerator at this split's local maximum; the
+             * reduce kernel merges the splits in fixed order. */
+            ulong base = ((ulong(token) * KIPP_Q_HEADS + head) *
+                              KIPP_KSPLIT_MAX +
+                          split) *
+                         KIPP_KSPLIT_STRIDE;
+            partials[base + 4u + thread_id] = value;
+            if (thread_id == 0u) {
+                partials[base + 0u] = global_maximum;
+                partials[base + 1u] = total;
+            }
+        }
     }
+}
+
+/*
+ * Merge kipp_flash_gqa's split-K partials for one (head, token) with the
+ * standard streaming-softmax rescale, in fixed split order. Recomputes the
+ * split count from the token's own position exactly as the split kernel
+ * does; single-split tokens were written directly and are skipped.
+ */
+kernel void kipp_flash_gqa_reduce(device float *output [[buffer(0)]],
+                                  device const float *partials [[buffer(1)]],
+                                  constant KvParams &params [[buffer(2)]],
+                                  uint2 group_id
+                                  [[threadgroup_position_in_grid]],
+                                  uint thread_id
+                                  [[thread_index_in_threadgroup]]) {
+    uint head = group_id.x;
+    uint token = group_id.y;
+    uint last_source = params.start_position + token;
+    uint splits = kipp_ksplit_count(last_source, params.ksplit_cap);
+    if (splits <= 1u || thread_id >= KIPP_HEAD_DIM) {
+        return;
+    }
+    ulong base = (ulong(token) * KIPP_Q_HEADS + head) * KIPP_KSPLIT_MAX *
+                 KIPP_KSPLIT_STRIDE;
+    float global_maximum = KIPP_FLT_LOWEST;
+    for (uint s = 0; s < splits; ++s) {
+        ulong entry = base + ulong(s) * KIPP_KSPLIT_STRIDE;
+        if (partials[entry + 1u] != 0.0f &&
+            partials[entry] > global_maximum) {
+            global_maximum = partials[entry];
+        }
+    }
+    float value = 0.0f;
+    float total = 0.0f;
+    for (uint s = 0; s < splits; ++s) {
+        ulong entry = base + ulong(s) * KIPP_KSPLIT_STRIDE;
+        float denominator = partials[entry + 1u];
+        if (denominator == 0.0f) {
+            continue;
+        }
+        float weight = exp(partials[entry] - global_maximum);
+        value += partials[entry + 4u + thread_id] * weight;
+        total += denominator * weight;
+    }
+    output[(ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM +
+           thread_id] = value / total;
 }
 
 kernel void kipp_residual_add(device float *residual [[buffer(0)]],
@@ -948,25 +1042,34 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        /* Scalar online-softmax step: lane r owns query row r. */
-        if (lane < KIPP_FA_QUERIES) {
-            uint row = lane;
+        /* Online-softmax step on all 32 lanes: quad r (lanes 4r..4r+3)
+         * owns query row r, each lane owns eight score columns, and quad
+         * shuffles reduce the row maximum and exp-sum, so no lane idles
+         * and the serial exp work per lane drops from 32 columns to 8. */
+        {
+            uint row = lane / 4u;
+            uint sub = lane % 4u;
             uint query_position =
                 params.start_position + tile_first + min(row, tile_rows - 1u);
             float row_max = KIPP_FLT_LOWEST;
-            for (uint column = 0; column < KIPP_FA_KV_TILE; ++column) {
+            for (uint index = 0; index < KIPP_FA_KV_TILE / 4u; ++index) {
+                uint column = sub * (KIPP_FA_KV_TILE / 4u) + index;
                 if (tile_base + column <= query_position) {
                     row_max = max(row_max,
                                   scores[row * KIPP_FA_SCORE_STRIDE + column] *
                                       scale);
                 }
             }
+            /* row*4 is quad-aligned, so masks 1 and 2 stay in the quad. */
+            row_max = max(row_max, simd_shuffle_xor(row_max, 1u));
+            row_max = max(row_max, simd_shuffle_xor(row_max, 2u));
             float previous = maxima[row];
             float merged = max(previous, row_max);
             float correction =
                 merged == previous ? 1.0f : exp(previous - merged);
             float sum = 0.0f;
-            for (uint column = 0; column < KIPP_FA_KV_TILE; ++column) {
+            for (uint index = 0; index < KIPP_FA_KV_TILE / 4u; ++index) {
+                uint column = sub * (KIPP_FA_KV_TILE / 4u) + index;
                 float weight = 0.0f;
                 if (tile_base + column <= query_position) {
                     weight = exp(scores[row * KIPP_FA_SCORE_STRIDE + column] *
@@ -976,9 +1079,13 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
                 probs[row * KIPP_FA_SCORE_STRIDE + column] = bfloat(weight);
                 sum += weight;
             }
-            maxima[row] = merged;
-            denominators[row] = denominators[row] * correction + sum;
-            rescale[row * 8u + row] = correction;
+            sum += simd_shuffle_xor(sum, 1u);
+            sum += simd_shuffle_xor(sum, 2u);
+            if (sub == 0u) {
+                maxima[row] = merged;
+                denominators[row] = denominators[row] * correction + sum;
+                rescale[row * 8u + row] = correction;
+            }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
