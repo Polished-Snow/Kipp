@@ -2,7 +2,7 @@
 	tools-env model convert vectors chat-vectors test-model test-ppl test-phase2 \
 	test-paged-cpu test-pooled-cpu test-multilogit metal test-metal-ops \
 	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
-	test-chat test-server \
+	test-chat test-draft-spec test-server \
 	cuda-spark cuda-generic \
 	test-cuda-ops test-cuda docs docs-check paper-data paper-check clean
 
@@ -11,9 +11,11 @@ TOOLS_DIR := tools
 # Any id from the supported-checkpoint registry (src/kipp_checkpoints.h).
 CHECKPOINT ?= qwen3-4b-base
 CHAT_CHECKPOINT ?= qwen3-4b-instruct-2507
+DRAFT_CHECKPOINT ?= qwen3-0.6b-base
 MODEL_DIR := models/$(CHECKPOINT)
 MODEL_SOURCE := $(MODEL_DIR)/source
 MODEL_GGUF := $(MODEL_DIR)/kipp-$(CHECKPOINT)-bf16.gguf
+DRAFT_MODEL_GGUF := models/$(DRAFT_CHECKPOINT)/kipp-$(DRAFT_CHECKPOINT)-bf16.gguf
 VECTOR_DIR := tests/test-vectors/$(CHECKPOINT)
 CHAT_SOURCE := models/$(CHAT_CHECKPOINT)/source
 CHAT_VECTOR := tests/test-vectors/$(CHAT_CHECKPOINT)/chat-cases.json
@@ -227,6 +229,24 @@ test-chat: $(BUILD_DIR)/kipp-metal
 	printf 'Say hi\nexit\n' | $(BUILD_DIR)/kipp-metal --backend metal \
 		--model $(CHAT_MODEL_GGUF) --chat --decode 8 --temperature 0 \
 		| grep -q .
+
+# Draft-model speculation must emit exactly the target's greedy sequence.
+# Compare the generated-text line (the diagnostic top-N logit table trails
+# internal state and legitimately differs after a speculative round).
+test-draft-spec: $(BUILD_DIR)/kipp-metal
+	@P="Machine learning models are trained on large datasets to"; \
+	$(BUILD_DIR)/kipp-metal --backend metal --model $(MODEL_GGUF) \
+		--prompt "$$P" --decode 48 --temperature 0 2>/dev/null \
+		| head -1 > $(BUILD_DIR)/draft-plain.txt; \
+	$(BUILD_DIR)/kipp-metal --backend metal --model $(MODEL_GGUF) \
+		--draft-model $(DRAFT_MODEL_GGUF) --prompt "$$P" --decode 48 \
+		--temperature 0 2>/dev/null \
+		| head -1 > $(BUILD_DIR)/draft-spec.txt; \
+	if diff -q $(BUILD_DIR)/draft-plain.txt $(BUILD_DIR)/draft-spec.txt \
+		>/dev/null; then echo "PASS test-draft-spec"; \
+	else echo "FAIL test-draft-spec: draft-spec output differs from greedy"; \
+		diff $(BUILD_DIR)/draft-plain.txt $(BUILD_DIR)/draft-spec.txt; \
+		exit 1; fi
 
 test-server: $(BUILD_DIR)/kipp-server-metal
 	KIPP_SERVER_BINARY=$(BUILD_DIR)/kipp-server-metal \

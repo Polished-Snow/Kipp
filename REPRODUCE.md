@@ -47,6 +47,7 @@ build/kipp_test_metal  --phase3-metal $M $V # Metal vs CPU oracle (argmax exact,
 build/kipp_test_metal  --metal-operators    # per-kernel operator tests
 make test-server                            # OpenAI Completions + Chat Completions
 make test-chat                              # --chat REPL smoke on the instruct GGUF
+make test-draft-spec                        # draft-model spec == target greedy (byte-identical)
 ```
 
 Convenience targets that wire the same gates to the default checkpoint:
@@ -100,6 +101,11 @@ python3 bench/spec_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0
   --decode 256 --runs 3 --gate off --output bench/results/spec.json
 python3 bench/spec_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0.gguf \
   --decode 256 --runs 3 --gate on --output bench/results/spec-gated.json
+
+# Draft-model speculation (0.6B drafts for the 4B target; byte-identical output):
+python3 bench/spec_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-bf16.gguf \
+  --draft-model models/qwen3-0.6b-base/kipp-qwen3-0.6b-base-bf16.gguf \
+  --decode 256 --runs 3 --output bench/results/spec-draft.json
 
 # Serving: batch scaling, cross-request prefix reuse, open-loop load:
 python3 bench/server_bench.py --model models/qwen3-4b-base/kipp-qwen3-4b-base-q8_0.gguf \

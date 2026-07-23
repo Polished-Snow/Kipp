@@ -3,6 +3,29 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## Unreleased
+
+### Draft-model speculative decoding (2026-07-23)
+- **`--draft-model M.gguf`** on the CLI: a small pinned-family checkpoint
+  (e.g. Qwen3-0.6B) drafts up to eight tokens autoregressively and the
+  target (`--model`) verifies the block in one multi-row forward, accepting
+  the longest prefix that matches its greedy arg max. The whole family
+  shares one tokenizer and vocabulary, so no token remapping is needed, and
+  the two sessions are kept in lockstep on committed tokens. The emitted
+  sequence is byte-identical to the target's plain greedy decode — gated by
+  `make test-draft-spec` and verified across backends and prompts. Benchable
+  via `bench/spec_bench.py --draft-model`.
+
+### Long-context decode and prefill softmax (2026-07-23)
+- **Split-K long-context decode**: the Metal flash-GQA decode kernel splits
+  each head's KV scan across up to eight threadgroups past 1,024 cached
+  positions; 12,800-token Q8_0 decode improves ~1.7× (26 → 44.7 tok/s, from
+  ~36% to ~67% of the bandwidth roofline). The split count derives from a
+  token's own position, so decode and speculative verify partition
+  identically and shorter contexts stay bit-identical (`--longctx-metal`).
+- **All-lane prefill softmax**: the tiled prefill kernel's online-softmax
+  step now uses all 32 simdgroup lanes via quad shuffles.
+
 ## v0.0.3 — 2026-07-22
 
 ### Metal matrix kernels restored; harness tripwire (2026-07-22)
