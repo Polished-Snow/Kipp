@@ -38,10 +38,13 @@ WORKLOADS = {
 }
 
 
-def run(binary, backend, model, prompt, decode, spec, gate="on"):
+def run(binary, backend, model, prompt, decode, spec, gate="on",
+        draft_model=None):
     cmd = [binary, "--backend", backend, "--model", model, "--prompt", prompt,
            "--decode", str(decode), "--temperature", "0"]
-    if spec:
+    if spec and draft_model is not None:
+        cmd += ["--draft-model", draft_model]  # draft-model spec has no gate
+    elif spec:
         cmd += ["--spec", "--spec-gate", gate]
     out = subprocess.run(cmd, capture_output=True, text=True).stderr
     m = METRIC.search(out)
@@ -77,9 +80,17 @@ def main():
     ap.add_argument("--output", default="bench/results/spec.json")
     ap.add_argument("--output-gated", default="bench/results/spec-gated.json",
                     help="gated-half output when --gate both")
+    ap.add_argument("--draft-model", default=None,
+                    help="draft-model speculation: a small GGUF drafts for "
+                         "--model (target). Replaces prompt-lookup; the gate "
+                         "does not apply, so a single 'draft' mode is measured "
+                         "into --output.")
     args = ap.parse_args()
 
-    modes = ["off", "on"] if args.gate == "both" else [args.gate]
+    if args.draft_model is not None:
+        modes = ["draft"]
+    else:
+        modes = ["off", "on"] if args.gate == "both" else [args.gate]
     results = {mode: {} for mode in modes}
     for name, prompt in WORKLOADS.items():
         base_s = []
@@ -95,7 +106,7 @@ def main():
             # slow drift in machine state cannot skew the A/B.
             for mode in modes:
                 sp = run(args.binary, args.backend, args.model, prompt,
-                         args.decode, True, mode)
+                         args.decode, True, mode, args.draft_model)
                 spec_s[mode].append(sp["decode_seconds"] / sp["decode_tokens"])
                 accepts[mode].append(sp)
         base_tps = 1.0 / statistics.median(base_s)
@@ -125,18 +136,21 @@ def main():
                   f"duty={draft_duty:.2f}")
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    outputs = {"off": args.output, "on": args.output}
-    if args.gate == "both":
+    outputs = {"off": args.output, "on": args.output, "draft": args.output}
+    if args.gate == "both" and args.draft_model is None:
         outputs = {"off": args.output, "on": args.output_gated}
     for mode in modes:
+        config = {"decode": args.decode, "runs": args.runs,
+                  "warmup_runs": 1, "gate": mode,
+                  "paired_baseline": args.gate == "both"}
+        if args.draft_model is not None:
+            config["draft_model"] = _provenance.model_metadata(args.draft_model)
         report = {
             "engine": _provenance.engine_metadata(args.binary, args.backend,
                                                   root),
             "hardware": _provenance.hardware_metadata(args.backend),
             "model": _provenance.model_metadata(args.model),
-            "configuration": {"decode": args.decode, "runs": args.runs,
-                              "warmup_runs": 1, "gate": mode,
-                              "paired_baseline": args.gate == "both"},
+            "configuration": config,
             "workloads": results[mode],
         }
         path = pathlib.Path(outputs[mode])

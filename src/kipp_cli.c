@@ -166,6 +166,147 @@ done:
     return status;
 }
 
+/*
+ * Greedy draft-model speculative decode. A small draft model proposes up to
+ * KIPP_CLI_MAX_DRAFT tokens autoregressively; the target verifies the whole
+ * block in one multi-row forward and accepts the longest prefix whose tokens
+ * equal the target's greedy argmax, taking the target's own argmax as the
+ * correction at the first mismatch. The emitted sequence is therefore exactly
+ * the target's plain greedy sequence — only the number of target forwards
+ * drops. Both models are pinned Qwen3-family checkpoints with the identical
+ * tokenizer and vocabulary, so no token remapping is needed.
+ *
+ * The two sessions are kept in lockstep on committed tokens. Each round the
+ * draft feeds next_tok then its own k proposals (k+1 draft evals in all), so
+ * the draft session's KV covers the whole block even when every draft is
+ * accepted; both sessions are then truncated back to the accepted prefix.
+ */
+static int run_draft_spec_decode(kipp_model *target,
+                                 kipp_session *target_session,
+                                 kipp_session *draft_session, float *logits,
+                                 const uint32_t *prompt, size_t prompt_len,
+                                 size_t decode_count, size_t *out_decoded,
+                                 uint64_t *out_drafted, uint64_t *out_accepted,
+                                 uint64_t *out_draft_steps,
+                                 uint64_t *out_plain_steps, kipp_error *error) {
+    size_t capacity = prompt_len + decode_count + KIPP_CLI_MAX_DRAFT + 1;
+    uint32_t *hist = malloc(capacity * sizeof(*hist));
+    float *rows = malloc((size_t)(KIPP_CLI_MAX_DRAFT + 1) * KIPP_VOCAB_SIZE *
+                         sizeof(*rows));
+    float *draft_logits = malloc(KIPP_VOCAB_SIZE * sizeof(*draft_logits));
+    uint32_t drafts[KIPP_CLI_MAX_DRAFT];
+    uint32_t feed[KIPP_CLI_MAX_DRAFT + 1];
+    if (hist == NULL || rows == NULL || draft_logits == NULL) {
+        free(hist);
+        free(rows);
+        free(draft_logits);
+        fprintf(stderr, "kipp: unable to allocate draft-spec buffers\n");
+        (void)error;
+        return -1;
+    }
+    memcpy(hist, prompt, prompt_len * sizeof(*hist));
+    size_t hlen = prompt_len;
+    uint32_t next_tok = argmax_logits(logits);
+    int status = -1;
+
+    while (*out_decoded < decode_count) {
+        if (kipp_model_is_stop_token(target, next_tok)) {
+            break;
+        }
+        if (emit_token(target, next_tok, out_decoded, error) != 0) {
+            goto done;
+        }
+        hist[hlen++] = next_tok;
+        if (*out_decoded >= decode_count) {
+            break;
+        }
+        size_t k = decode_count - *out_decoded;
+        if (k > KIPP_CLI_MAX_DRAFT) {
+            k = KIPP_CLI_MAX_DRAFT;
+        }
+        if (k == 0) {
+            /* Budget exhausted mid-block: one plain step, both sessions kept
+             * in sync so the next round's invariant still holds. */
+            *out_plain_steps += 1;
+            if (kipp_session_eval(target_session, &next_tok, 1, logits,
+                                  KIPP_VOCAB_SIZE, error) != 0 ||
+                kipp_session_eval(draft_session, &next_tok, 1, draft_logits,
+                                  KIPP_VOCAB_SIZE, error) != 0) {
+                goto done;
+            }
+            next_tok = argmax_logits(logits);
+            continue;
+        }
+        /* Draft k tokens greedily on the small model; the trailing eval keeps
+         * the draft KV covering the whole block for the all-accepted case. */
+        uint32_t token = next_tok;
+        for (size_t i = 0; i <= k; ++i) {
+            if (kipp_session_eval(draft_session, &token, 1, draft_logits,
+                                  KIPP_VOCAB_SIZE, error) != 0) {
+                goto done;
+            }
+            if (i < k) {
+                drafts[i] = argmax_logits(draft_logits);
+                token = drafts[i];
+            }
+        }
+        feed[0] = next_tok;
+        memcpy(feed + 1, drafts, k * sizeof(*drafts));
+        if (kipp_session_eval_n(target_session, feed, k + 1, rows,
+                                (uint32_t)(k + 1), error) != 0) {
+            goto done;
+        }
+        *out_drafted += k;
+        *out_draft_steps += 1;
+        size_t accepted = 0;
+        int finished = 0;
+        for (size_t i = 0; i < k; ++i) {
+            uint32_t correct = argmax_logits(rows + i * KIPP_VOCAB_SIZE);
+            if (correct != drafts[i]) {
+                break;
+            }
+            if (kipp_model_is_stop_token(target, drafts[i])) {
+                finished = 1;
+                ++accepted;
+                break;
+            }
+            if (emit_token(target, drafts[i], out_decoded, error) != 0) {
+                goto done;
+            }
+            hist[hlen++] = drafts[i];
+            ++accepted;
+            *out_accepted += 1;
+            if (*out_decoded >= decode_count) {
+                finished = 1;
+                break;
+            }
+        }
+        /* Roll both sessions back to next_tok + the accepted drafts. The draft
+         * session fed next_tok + all k proposals, so it holds a superset of
+         * the committed prefix and the same truncation length applies. */
+        kipp_session_info info;
+        if (kipp_session_get_info(target_session, &info) != 0) {
+            goto done;
+        }
+        uint32_t keep = info.length - (uint32_t)(k - accepted);
+        if (kipp_session_truncate(target_session, keep, error) != 0 ||
+            kipp_session_truncate(draft_session, keep, error) != 0) {
+            goto done;
+        }
+        if (finished) {
+            break;
+        }
+        next_tok = argmax_logits(rows + accepted * KIPP_VOCAB_SIZE);
+    }
+    status = 0;
+
+done:
+    free(hist);
+    free(rows);
+    free(draft_logits);
+    return status;
+}
+
 /* Default per-turn generation budget and session capacity for --chat. */
 #define KIPP_CLI_CHAT_DECODE 512u
 #define KIPP_CLI_CHAT_CTX 8192u
@@ -448,6 +589,8 @@ static void usage(const char *program) {
             "  [--spec]                    greedy self-speculative decoding\n"
             "  [--spec-gate on|off]        adaptive speculation gate "
             "(default on)\n"
+            "  [--draft-model M.gguf]      greedy draft-model speculation "
+            "(target = --model)\n"
             "  [--chat]                    interactive chat (instruct "
             "checkpoints)\n"
             "  [--system TEXT]             chat system prompt\n"
@@ -666,6 +809,7 @@ int main(int argc, char **argv) {
     float min_p = 0.0f;
     int spec = 0;
     int spec_gate = 1;
+    const char *draft_model_path = NULL;
     int chat = 0;
     int enable_thinking = 1;
     const char *system_prompt = NULL;
@@ -677,6 +821,8 @@ int main(int argc, char **argv) {
     kipp_backend_kind backend = KIPP_BACKEND_CPU;
     kipp_model *model = NULL;
     kipp_session *session = NULL;
+    kipp_model *draft_model = NULL;
+    kipp_session *draft_session = NULL;
     kipp_tokens tokens = {0};
     kipp_error error = {0};
     float *logits = NULL;
@@ -720,6 +866,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[index], "--spec") == 0) {
             spec = 1;
             continue;
+        } else if (strcmp(argv[index], "--draft-model") == 0 &&
+                   index + 1 < argc) {
+            draft_model_path = argv[++index];
         } else if (strcmp(argv[index], "--spec-gate") == 0 &&
                    index + 1 < argc) {
             const char *mode = argv[++index];
@@ -782,6 +931,11 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             goto cleanup;
         }
+    }
+    /* A draft model turns on speculation and shares its capacity, output,
+     * and greedy-only rules with self-speculation. */
+    if (draft_model_path != NULL) {
+        spec = 1;
     }
     if (model_path == NULL ||
         (prompt == NULL && ppl_path == NULL && !chat)) {
@@ -859,21 +1013,49 @@ int main(int argc, char **argv) {
         fprintf(stderr, "kipp: prompt produced no tokens\n");
         goto cleanup;
     }
+    /* A draft model must share the target's tokenizer and vocabulary; the
+     * pinned Qwen3 family guarantees this, but validate rather than assume. */
+    kipp_model_info draft_info;
+    if (draft_model_path != NULL) {
+        if (kipp_model_open_backend(draft_model_path, backend, &draft_model,
+                                    &error) != 0) {
+            fprintf(stderr, "kipp: draft model: %s: %s\n",
+                    kipp_error_code_name(error.code), error.message);
+            goto cleanup;
+        }
+        if (kipp_model_get_info(draft_model, &draft_info) != 0 ||
+            draft_info.vocab_size != info.vocab_size) {
+            fprintf(stderr,
+                    "kipp: draft model vocabulary does not match the target\n");
+            goto cleanup;
+        }
+    }
     /* Speculation transiently appends up to KIPP_CLI_MAX_DRAFT draft tokens
      * beyond the logical length before rolling them back, so the KV cache
-     * needs that much headroom (clamped to the context length). */
+     * needs that much headroom (clamped to the context length; the draft
+     * shares the same committed timeline so both are sized alike). */
+    uint32_t context_limit = info.context_length;
+    if (draft_model_path != NULL && draft_info.context_length < context_limit) {
+        context_limit = draft_info.context_length;
+    }
     size_t session_capacity = tokens.count + decode_count;
     if (spec) {
         session_capacity += KIPP_CLI_MAX_DRAFT + 1;
-        if (session_capacity > info.context_length) {
-            session_capacity = info.context_length;
+        if (session_capacity > context_limit) {
+            session_capacity = context_limit;
         }
     }
-    if (tokens.count > info.context_length ||
-        decode_count > info.context_length - tokens.count ||
+    if (tokens.count > context_limit ||
+        decode_count > context_limit - tokens.count ||
         kipp_session_create(model, (uint32_t)session_capacity, &session,
                             &error) != 0) {
         fprintf(stderr, "kipp: session: %s\n", error.message);
+        goto cleanup;
+    }
+    if (draft_model_path != NULL &&
+        kipp_session_create(draft_model, (uint32_t)session_capacity,
+                            &draft_session, &error) != 0) {
+        fprintf(stderr, "kipp: draft session: %s\n", error.message);
         goto cleanup;
     }
     logits = malloc(KIPP_VOCAB_SIZE * sizeof(*logits));
@@ -895,6 +1077,23 @@ int main(int argc, char **argv) {
     (void)clock_gettime(CLOCK_MONOTONIC, &finished);
     prefill_seconds = elapsed_seconds(started, finished);
 
+    /* Prime the draft session with the same prompt so it drafts from the
+     * target's context; its logits are discarded (the target's govern). */
+    if (draft_model_path != NULL) {
+        float *draft_prime = malloc(KIPP_VOCAB_SIZE * sizeof(*draft_prime));
+        if (draft_prime == NULL) {
+            fprintf(stderr, "kipp: unable to allocate draft prime buffer\n");
+            goto cleanup;
+        }
+        int primed = kipp_session_eval(draft_session, tokens.data, tokens.count,
+                                       draft_prime, KIPP_VOCAB_SIZE, &error);
+        free(draft_prime);
+        if (primed != 0) {
+            fprintf(stderr, "kipp: draft prime: %s\n", error.message);
+            goto cleanup;
+        }
+    }
+
     size_t decoded_count = 0;
     uint64_t spec_drafted = 0;
     uint64_t spec_accepted = 0;
@@ -908,10 +1107,19 @@ int main(int argc, char **argv) {
         }
         fputs("generated\t", stdout);
         (void)clock_gettime(CLOCK_MONOTONIC, &started);
-        if (run_spec_decode(model, session, logits, tokens.data, tokens.count,
-                            decode_count, spec_gate, &decoded_count,
-                            &spec_drafted, &spec_accepted, &spec_draft_steps,
-                            &spec_plain_steps, &error) != 0) {
+        int rc = draft_model_path != NULL
+                     ? run_draft_spec_decode(model, session, draft_session,
+                                             logits, tokens.data, tokens.count,
+                                             decode_count, &decoded_count,
+                                             &spec_drafted, &spec_accepted,
+                                             &spec_draft_steps,
+                                             &spec_plain_steps, &error)
+                     : run_spec_decode(model, session, logits, tokens.data,
+                                       tokens.count, decode_count, spec_gate,
+                                       &decoded_count, &spec_drafted,
+                                       &spec_accepted, &spec_draft_steps,
+                                       &spec_plain_steps, &error);
+        if (rc != 0) {
             fprintf(stderr, "kipp: spec decode: %s\n", error.message);
             goto cleanup;
         }
@@ -1010,6 +1218,11 @@ cleanup:
     free(logits);
     kipp_tokens_free(&tokens);
     kipp_session_destroy(session);
+    kipp_session_destroy(draft_session);
+    if (draft_model != NULL && kipp_model_close(draft_model, &error) != 0) {
+        fprintf(stderr, "kipp: draft close: %s\n", error.message);
+        exit_code = 1;
+    }
     if (kipp_model_close(model, &error) != 0) {
         fprintf(stderr, "kipp: close: %s\n", error.message);
         exit_code = 1;
