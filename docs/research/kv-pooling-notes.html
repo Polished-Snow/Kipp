@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Batching and KV research — Kipp</title>
+  <meta name="description" content="Design decisions behind batching, paged KV, and prefix reuse.">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="../index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="../index.html">Home</a>
+        <a href="../architecture.html">Architecture</a>
+        <a href="../roadmap.html">Roadmap</a>
+        <a href="../model-support.html">Models</a>
+        <a href="../benchmarks.html">Benchmarks</a>
+        <a href="../reproducing.html">Reproduce</a>
+        <a href="../releasing.html">Releases</a>
+        <a href="../research/inspiration-notes.html">Research</a>
+        <a href="../contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Batching and KV Pooling Design Notes</h1>
+<p>These notes record the design decisions behind Kipp's continuous batching,
+paged KV addressing, and cross-request prefix reuse. Reference repositories
+informed the boundaries; no implementation was vendored.</p>
+<h2>Delivered design</h2>
+<ul>
+<li><code>kipp_eval_batch</code> evaluates multiple sessions per backend call. Metal packs
+unfinished items into shared rounds so weights are reused across sequences.</li>
+<li>The server uses a <code>poll()</code> event loop with FIFO admission, chunked prefill,
+batched decode, idle-connection reaping, and disconnect cancellation.</li>
+<li>CPU and Metal sessions address KV through 32-position block tables.</li>
+<li><code>kipp_model_open_pooled</code> gives CPU and Metal sessions block tables into one
+model-owned slab.</li>
+<li>Finished sessions publish complete blocks to a content-addressed pool;
+<code>kipp_session_match_prefix</code> adopts the longest verified prefix in a new
+session.</li>
+<li>Shared blocks are complete and immutable. Partial append blocks remain
+private, so truncation and speculative rollback cannot mutate shared state.</li>
+<li>Admission reserves worst-case blocks before starting work. Pool pressure
+delays a request in the FIFO instead of corrupting an active sequence.</li>
+</ul>
+<p>The <code>--paged-cpu</code>, <code>--paged-metal</code>, <code>--pooled-cpu</code>, and <code>--pooled-metal</code>
+gates cover placement invariance, shared-prefix equivalence, mixed batched
+evaluation, exhaustion, collision verification, truncation, and eviction.
+Server integration tests cover cancellation and pressure at the API boundary.</p>
+<h2>Reference design: nano-vllm</h2>
+<p>The small block manager in <code>GeeeekExplorer/nano-vllm</code> provided a useful
+comparison:</p>
+<ul>
+<li>Fixed-size blocks carry an identifier, reference count, chained content
+hash, and token IDs.</li>
+<li>Hash hits are verified against exact token IDs before reuse.</li>
+<li>Full released blocks remain indexed for revival and are reclaimed through
+an LRU free list under pressure.</li>
+<li>Partial blocks remain private.</li>
+<li>Prefill separates query length from key length so cached tokens can be
+skipped.</li>
+</ul>
+<p>Kipp follows those safety properties while keeping ownership inside each
+backend model and preserving the existing public session API.</p>
+<h2>Scheduler contract</h2>
+<ul>
+<li>Waiting and running queues keep admission separate from execution.</li>
+<li>Capacity is reserved before a request starts.</li>
+<li>Cache exhaustion delays admission rather than failing an active request.</li>
+<li>Batching must preserve each backend's isolated-evaluation tolerance.</li>
+<li>Future preemption policies must preserve deterministic FIFO semantics.</li>
+</ul>
+<h2>Metal attention</h2>
+<p>ggml's Metal attention implementation confirmed the online-softmax reduction
+shape used by Kipp: parallel ranges maintain running maxima, sums, and
+rescaled accumulators before reduction.</p>
+<p>Kipp now uses tiled matrix prefill attention and split-K long-context decode.
+Further KV work remains deliberately separate: radix-tree indexing,
+persistence, offload, and KV quantization each require their own correctness
+gate and measured justification.</p>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
+</body>
+</html>

@@ -54,31 +54,22 @@ must never silently diverge from it.
   vector kernels — MMA reduction order flips near-tie argmaxes). Paired
   A/B (`spec_bench.py --gate both`, drift-immune shared baseline): gated
   2.27× on repetitive text, 1.24× on code (above parity), floor 0.84×.
+- **Draft-model speculation**: `--draft-model` uses a smaller registered
+  checkpoint to propose up to eight tokens; target verification preserves
+  the target model's plain greedy sequence (`make test-draft-spec`).
+- **Long-context Metal decode**: split-K GQA partitions the KV scan across
+  up to eight threadgroups past 1,024 cached positions. The
+  `--longctx-metal` gate checks partition invariance.
 - **Mutation study**: `build/kipp_test_fault` (KIPP_FAULT=1..4) +
   `--fault-reference`; results in `bench/results/faults.json` — tolerance
   and scramble gates are complementary; the rollover fault has NMSE exactly
   0 vs reference and only the scramble gate catches it.
 
-## Paper (`paper/`)
-
-Revised 2026-07-21 to acmart [sigconf,nonacm] (12 pages, `tectonic
-main.tex`): Proposition 1 (placement invariance), scramble-gate + gate-
-lattice figures, mutation-study matrix (§7.3, the centerpiece), a
-KV-relocation survey table (11 systems), and a 13-subsection evaluation:
-gates, mutation, quant speed+quality (PPL), model-size sweep, context,
-batch, serving-under-load, prefix sharing (175×), paired speculation A/B,
-matched llama.cpp head-to-head (decode ~1.7× Kipp, prefill ~4.5× llama at
-2,048 tokens incl. Q4_0), memory, and the silent-fallback case study
-(replacing the obsolete flash-prefill ablation). Every
-number is generated into `paper/generated/results-macros.tex` +
-`paper/data/*.dat` by `tools/paper_data.py` from committed
-`bench/results/*.json`; `make paper-check` (in `test-tools`) enforces it.
-Measure only via the GPU steady-state protocol in `bench/README.md`.
-
 ## Working rules
 
 - Gate on real hardware before claiming a backend works; state which ones you
-  ran. Build/gate commands in `AGENT.md` + `REPRODUCE.md`.
+  ran. Build/gate commands live in `AGENT.md` and `docs/REPRODUCING.md`.
+- Measure only via the GPU steady-state protocol in `bench/README.md`.
 - **Hardware**: this machine is an Apple **M5 Max (40-core GPU, 128 GB)**
   since 2026-07-20; earlier committed numbers were from a base M5 and are
   ~4× lower. Never mix them; result files self-describe hardware.

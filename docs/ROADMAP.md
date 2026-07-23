@@ -1,11 +1,11 @@
 # Kipp Roadmap
 
 This sequence is binding unless `ARCHITECTURE.md` is explicitly revised.
-Correctness gates every phase; dates and speculative performance claims are
-intentionally absent.
+Correctness gates every phase. Status notes summarize delivered work and
+link measured claims back to the benchmark records.
 
-**Status (v0.0.3, in preparation):** Since v0.0.2, Kipp delivered the
-items that release deferred and hardened the serving path. **Cross-request
+**Status (v0.0.3):** Kipp delivered the items that v0.0.2 deferred and
+hardened the serving path. **Cross-request
 KV prefix sharing is now the CPU/Metal serving default**: pooled sessions
 share one model-owned slab through a content-addressed 32-token block pool
 (publish-at-finish, memcmp-verified), gated by `--pooled-cpu` /
@@ -25,6 +25,12 @@ H100 (four checkpoints, worst NMSE 5.9e-7). Speculation now measures a
 paired-baseline A/B with an adaptive-gate floor of 0.84× and above-parity
 code decoding.
 
+**Current unreleased work:** draft-model speculative decoding uses a smaller
+registered checkpoint to propose tokens while preserving the target model's
+greedy sequence. Metal long-context decode now uses split-K attention past
+1,024 cached positions, and the prefill softmax distributes work across all
+simdgroup lanes.
+
 **Status (v0.0.2):** This release expands Kipp from the single pinned
 checkpoint of v0.0.1 to the **Qwen3 dense family** (0.6B–32B, base +
 instruct) behind a strict compiled-in checkpoint registry, with the BF16
@@ -40,8 +46,8 @@ both the CPU oracle and the Metal backend — a per-session 32-position block
 table gated bitwise-equal to the contiguous layout (`--paged-cpu`,
 `--paged-metal`). Everything is gated on Apple M5 (CPU + Metal); the whole
 family plus quantization is additionally validated on NVIDIA A100 via
-ephemeral cloud runs. Still deferred at that point (since delivered — see the v0.0.3 status
-above): the cross-request KV block pool, Metal flash-attention prefill.
+ephemeral cloud runs. At that point, cross-request KV pooling and Metal
+flash-attention prefill were still deferred; both are now delivered.
 Quantized KV remains deferred.
 
 **v2 expansion (approved 2026-07-16):** scope grew from one pinned
@@ -51,16 +57,17 @@ tying, and stop tokens became per-checkpoint runtime configuration with the
 4B refactor gated byte-identical.
 
 Delivered since: validated checkpoints spanning Qwen3 dense 0.6B through
-32B on CPU plus a GPU backend (Metal on M5, CUDA on a Verda A100);
+32B on CPU plus a GPU backend (Metal on M5-class hardware, CUDA on Verda
+A100/H100 instances);
 `/v1/chat/completions` with a native ChatML renderer; the full sampling
 surface (top-k, min-p, penalties, logit_bias); a `/metrics` endpoint; and
-**weight quantization** — Q8_0 (near-lossless, ~1.6x decode, brings 8B
-under the M5 Metal buffer cap) and affine 4-bit gs32 (~2x decode, 2.6x
-smaller, coherent output), both gated on CPU + Metal. Production KV block pooling with
-cross-request prefix caching is delivered (the serving default on
-CPU/Metal). Remaining: a token-budget scheduler and quantized KV — each
-behind its own CPU-vs-GPU gate. Prompt-lookup speculative decoding and
-generated-token logprobs are already delivered.
+**weight quantization** — Q8_0 (near-lossless, ~1.6× decode, brings 8B
+under the M5 Metal buffer cap) and affine 4-bit gs32 (~2× decode, 2.6×
+smaller, coherent output), both gated on CPU + Metal. Production KV block
+pooling with cross-request prefix caching is delivered and is the serving
+default on CPU/Metal. Remaining: a token-budget scheduler and quantized KV — each
+behind its own CPU-vs-GPU gate. Prompt-lookup and draft-model speculative
+decoding plus generated-token logprobs are already delivered.
 
 ## Phase 0 — Specify the model
 
@@ -74,7 +81,7 @@ generated-token logprobs are already delivered.
 - Implement mmap-backed loading, native tokenization, scalar operators, and
   the readable full-prompt forward pass.
 - Pass deterministic full-logit vectors with exact argmax and NMSE at most
-  `1e-5`.
+  `5e-5`.
 
 ## Phase 2 — Add the KV cache
 
@@ -95,8 +102,8 @@ generated-token logprobs are already delivered.
 
 - Deliver batched multi-sequence evaluation and a small FIFO scheduler.
 - Require batched requests to reproduce isolated execution.
-- Keep cross-session KV sharing separate until backend pools, cache-pressure
-  admission, cancellation, and eviction are integrated.
+- Deliver cross-session KV sharing only after backend pools, cache-pressure
+  admission, cancellation, and eviction are integrated and gated.
 
 ## Phase 6 — Serve
 
@@ -109,8 +116,9 @@ generated-token logprobs are already delivered.
 Delivered through explicit reviews:
 
 - Q8_0 and affine 4-bit weight quantization
-- prompt-lookup speculative decoding and multi-row logits
+- prompt-lookup and draft-model speculative decoding, plus multi-row logits
 - pinned Qwen3 dense checkpoint registry and native chat rendering
+- cross-request KV prefix sharing on CPU and Metal
 
 Still deferred:
 

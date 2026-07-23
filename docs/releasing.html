@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Releasing — Kipp</title>
+  <meta name="description" content="Release checklist, hardware gates, and versioning workflow.">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-content">
+      <a class="brand" href="index.html">
+        <span class="brand-mark"></span>
+        Kipp
+      </a>
+      <nav aria-label="Primary"><a href="index.html">Home</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="model-support.html">Models</a>
+        <a href="benchmarks.html">Benchmarks</a>
+        <a href="reproducing.html">Reproduce</a>
+        <a href="releasing.html" aria-current="page">Releases</a>
+        <a href="research/inspiration-notes.html">Research</a>
+        <a href="contributing.html">Contributing</a></nav>
+    </div>
+  </header>
+  <main class="wrap content">
+<h1>Releasing Kipp</h1>
+<p>The release pattern established by v0.0.1–v0.0.3 is a release
+branch, a single <code>Release vX.Y.Z</code> commit, a GitHub PR merged into <code>main</code>
+with a merge commit, and an annotated tag on that merge. Everything below
+must be green before the branch is cut.</p>
+<h2>Pre-release checklist</h2>
+<ol>
+<li><strong>Gates, recorded.</strong> On the release candidate commit, on real hardware:
+<ul>
+<li><code>make test</code> (hermetic units, docs drift, and tooling tests) and
+<code>make test-sanitize</code> (ASan/UBSan).</li>
+<li>CPU model gates via the built binary: <code>--model</code>, <code>--phase2-model</code>,
+<code>--multilogit</code>, <code>--paged-cpu</code>, <code>--pooled-cpu</code>, <code>--fault-reference</code>.</li>
+<li>Metal gates: <code>--metal-operators</code>, <code>--phase3-metal</code>, <code>--paged-metal</code>,
+<code>--multilogit-metal</code>, <code>--pooled-metal</code>, <code>--longctx-metal</code>.</li>
+<li>CUDA gates on an ephemeral cloud GPU:
+<code>KIPP_VERDA_CONFIRM_COST=yes KIPP_VERDA_SSH_KEY_ID=... \  tools/ops/verda_cuda_gate.sh 2&gt;&amp;1 | tee cuda-gate-$(date +%Y%m%d).log</code>
+then <code>python3 tools/ops/collect_cuda_gates.py &lt;log&gt;</code> and commit the
+resulting <code>bench/results/cuda-*-gates.json</code>.</li>
+<li>State plainly which backends were exercised on which hardware.</li>
+</ul>
+</li>
+<li><strong>Server suite</strong>: <code>make test-server</code> (40+ tests) against a freshly built
+server binary.</li>
+<li><strong>Benchmarks current</strong>: any result file whose code path changed this
+release is re-measured under the steady-state protocol
+(<code>bench/README.md</code>) and committed with <code>dirty: false</code>.</li>
+<li><strong>CHANGELOG</strong>: retitle <code>## Unreleased</code> to <code>## vX.Y.Z (YYYY-MM-DD)</code>.</li>
+<li><strong>Version bump</strong>: update <code>KIPP_VERSION</code> in <code>src/kipp.h</code>.</li>
+<li><strong>Docs</strong>: ROADMAP status block describes the release; drift check
+<code>grep -rn &quot;not yet wired&quot; docs src *.md</code> returns only intended lines;
+<code>make docs &amp;&amp; make docs-check</code> green.</li>
+</ol>
+<h2>Release mechanics</h2>
+<pre><code class="language-bash">git checkout -b release/vX.Y.Z          # from the validated branch tip
+# apply items 4-5 above in one commit:
+git commit -m &quot;Release vX.Y.Z: &lt;one-line summary&gt;&quot;
+git push -u origin release/vX.Y.Z
+gh pr create --base main --title &quot;Release vX.Y.Z&quot; --body &quot;&lt;summary + gate results&gt;&quot;
+gh pr merge --merge                      # merge commit, matching PRs #1/#2
+git checkout main &amp;&amp; git pull
+git tag -a vX.Y.Z -m &quot;Kipp vX.Y.Z: &lt;summary&gt;&quot;
+git push origin vX.Y.Z
+</code></pre>
+<h2>Post-merge</h2>
+<ul>
+<li>CI on <code>main</code> runs <code>make test</code>; verify the native, tooling, and docs-drift
+gates pass on the merge commit.</li>
+<li>Do not regenerate or prune <code>bench/results/</code> in the release commit.</li>
+<li>Verify the tag points at the merge commit and the GitHub release page
+(if drafted) links the CHANGELOG section.</li>
+</ul>
+  </main>
+  <footer class="site-footer">
+    <div class="wrap footer-content">
+      <span>Kipp contributors · MIT License</span>
+      <a href="https://github.com/Polished-Snow/Kipp">GitHub</a>
+    </div>
+  </footer>
+</body>
+</html>

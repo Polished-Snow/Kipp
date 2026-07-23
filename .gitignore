@@ -26,14 +26,7 @@ __pycache__/
 # Editor and operating-system files
 .DS_Store
 *.swp
-
-# LaTeX build artifacts (keep main.pdf for reading)
-paper/*.aux
-paper/*.bbl
-paper/*.blg
-paper/*.log
-paper/*.out
-paper/*.fdb_latexmk
-paper/*.fls
 .claude/worktrees/
-paper/arxiv-submission.tar.gz
+
+# Publication sources and generated artifacts are maintained separately.
+/paper/

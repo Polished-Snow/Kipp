@@ -61,6 +61,18 @@ PAGES = (
         "Reproducible benchmark policy and measured results.",
     ),
     Page(
+        DOCS / "REPRODUCING.md",
+        DOCS / "reproducing.html",
+        "Reproducing — Kipp",
+        "Build, correctness-gate, and benchmark reproduction commands.",
+    ),
+    Page(
+        DOCS / "RELEASING.md",
+        DOCS / "releasing.html",
+        "Releasing — Kipp",
+        "Release checklist, hardware gates, and versioning workflow.",
+    ),
+    Page(
         ROOT / "AGENT.md",
         DOCS / "contributing.html",
         "Contributing — Kipp",
@@ -73,10 +85,10 @@ PAGES = (
         "Reference repositories and provenance rules.",
     ),
     Page(
-        DOCS / "research" / "phase5-notes.md",
-        DOCS / "research" / "phase5-notes.html",
+        DOCS / "research" / "kv-pooling-notes.md",
+        DOCS / "research" / "kv-pooling-notes.html",
         "Batching and KV research — Kipp",
-        "Delivered batching groundwork and future KV block design notes.",
+        "Design decisions behind batching, paged KV, and prefix reuse.",
     ),
 )
 
@@ -135,11 +147,15 @@ def navigation(page: Page) -> str:
         ("roadmap.html", "Roadmap"),
         ("model-support.html", "Models"),
         ("benchmarks.html", "Benchmarks"),
+        ("reproducing.html", "Reproduce"),
+        ("releasing.html", "Releases"),
+        ("research/inspiration-notes.html", "Research"),
         ("contributing.html", "Contributing"),
     )
     items = []
     for href, label in links:
-        current = ' aria-current="page"' if page.output.name == href else ""
+        target = (DOCS / href).resolve()
+        current = ' aria-current="page"' if page.output.resolve() == target else ""
         items.append(f'<a href="{prefix}{href}"{current}>{label}</a>')
     return "\n        ".join(items)
 

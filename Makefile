@@ -1,10 +1,11 @@
 .PHONY: all cpu server server-metal server-cuda test test-tools test-sanitize \
-	tools-env model convert vectors chat-vectors test-model test-ppl test-phase2 \
+	tools-env model convert vectors chat-vectors test-model test-cpu-model \
+	test-ppl test-phase2 \
 	test-paged-cpu test-pooled-cpu test-multilogit metal test-metal-ops \
 	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
-	test-chat test-draft-spec test-server \
+	test-longctx-metal test-chat test-draft-spec test-server \
 	cuda-spark cuda-generic \
-	test-cuda-ops test-cuda docs docs-check paper-data paper-check clean
+	test-cuda-ops test-cuda docs docs-check clean
 
 BUILD_DIR := build
 TOOLS_DIR := tools
@@ -151,13 +152,6 @@ docs-check: tools-env
 test-tools: docs-check
 	uv run --project $(TOOLS_DIR) --python 3.12 \
 		python -m unittest tests/test_tooling.py
-	python3 tools/paper_data.py --check
-
-paper-data:
-	python3 tools/paper_data.py
-
-paper-check:
-	python3 tools/paper_data.py --check
 
 model: tools-env
 	tools/download_model.sh --checkpoint $(CHECKPOINT)
@@ -191,6 +185,8 @@ test-ppl: $(BUILD_DIR)/kipp vectors
 		grep -E 'KIPP_PPL .* ppl=[0-9]+\.[0-9]+' >/dev/null && \
 		echo "PASS test-ppl"
 
+test-cpu-model: test-model test-phase2 test-pooled-cpu
+
 test-phase2: test-paged-cpu test-multilogit
 	$(BUILD_DIR)/kipp_test --phase2-model $(MODEL_GGUF) $(VECTOR_DIR)
 
@@ -220,7 +216,8 @@ test-longctx-metal: $(BUILD_DIR)/kipp_test_metal vectors
 test-pooled-metal: $(BUILD_DIR)/kipp_test_metal vectors
 	$(BUILD_DIR)/kipp_test_metal --pooled-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
-test-metal: test-metal-ops test-multilogit-metal test-paged-metal
+test-metal: test-metal-ops test-multilogit-metal test-paged-metal \
+		test-pooled-metal test-longctx-metal
 	$(BUILD_DIR)/kipp_test_metal --phase3-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
 # Chat REPL smoke test against an already-converted instruct GGUF; does not

@@ -3,7 +3,7 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
-## Unreleased
+## v0.0.3 — 2026-07-23
 
 ### Draft-model speculative decoding (2026-07-23)
 - **`--draft-model M.gguf`** on the CLI: a small pinned-family checkpoint
@@ -25,8 +25,6 @@ BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
   identically and shorter contexts stay bit-identical (`--longctx-metal`).
 - **All-lane prefill softmax**: the tiled prefill kernel's online-softmax
   step now uses all 32 simdgroup lanes via quad shuffles.
-
-## v0.0.3 — 2026-07-22
 
 ### Metal matrix kernels restored; harness tripwire (2026-07-22)
 - **Fixed a reserved-MSL-keyword bug** (`fragment` used as a loop variable
@@ -92,10 +90,10 @@ BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
   for current CLI releases; new `tools/ops/collect_cuda_gates.py` turns a
   gate log into `bench/results/cuda-h100-gates.json`. All four default
   checkpoints pass `--model` and `--phase4-cuda` on an ephemeral NVIDIA
-  H100 80GB (worst observed NMSE 5.9e-7); the paper's CUDA correctness row
-  is now bound to that committed file.
+  H100 80GB (worst observed NMSE 5.9e-7), with the complete gate record
+  bound to that committed file.
 
-### Paper revision: measurement, quality, and provenance (2026-07-21)
+### Measurement, quality, and provenance (2026-07-21)
 - **CLI `--ppl` perplexity mode**: wikitext-2 perplexity over LE-uint32
   token files (non-overlapping windows, 32-token multi-row chunks,
   double-precision log-sum-exp). CPU and Metal agree to ~1e-4 relative;
@@ -106,22 +104,13 @@ BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
   (baseline, ungated, gated adjacent within each run).
 - **`bench/_provenance.py`**: every bench script now records the same
   engine/hardware/model block, with model identity read from the GGUF
-  manifest; the dirty flag excludes results and derived paper data.
-- **`tools/paper_data.py`** + `make paper-data` / `make paper-check`:
-  bench/results JSONs are the single source for the paper's macros and
-  pgfplots data; `paper-check` (wired into `test-tools`) fails on missing,
-  uncommitted, modified, or incoherent inputs and on generated-file drift.
+  manifest; the dirty flag excludes freshly written benchmark results.
 - **GPU steady-state measurement protocol** documented in `bench/README.md`
-  and `REPRODUCE.md`; all committed numbers re-measured under it on the
+  and `docs/REPRODUCING.md`; all committed numbers re-measured under it on the
   M5 Max, including new evals: perplexity per scheme, a 0.6B/4B/8B
   model-size sweep, context scaling to 12,800 tokens, open-loop serving
   load, and a matched llama.cpp head-to-head (pinned commit, 2,048-token
   prefill, Q4_0 point).
-- **Paper** rebuilt on `acmart` with every number macro-bound to committed
-  results; new survey, LoC, and pooled-gate tables; quality-vs-speed,
-  model-size, and serving-load figures. (The 2026-07-21 ablation that
-  called the tiled flash-prefill kernel slower than split-K was an
-  artifact of the silent kernel-compile fallback fixed below.)
 
 ### Cross-request KV prefix sharing (CPU + Metal)
 - **Pooled models** (`kipp_model_open_pooled`, CPU and Metal backends): all
