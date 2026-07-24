@@ -506,6 +506,10 @@ static int cuda_model_create(const kipp_model_view *view, void **backend_model,
         return cuda_fail(error, KIPP_ERROR_UNSUPPORTED,
                          "the CUDA backend supports BF16 weights only");
     }
+    if (view->config.kv_quant != KIPP_KV_QUANT_BF16) {
+        return cuda_fail(error, KIPP_ERROR_UNSUPPORTED,
+                         "the CUDA backend supports BF16 KV only");
+    }
 
     int device = 0;
     cudaError_t status = cudaGetDevice(&device);

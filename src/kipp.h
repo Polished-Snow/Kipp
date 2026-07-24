@@ -39,6 +39,19 @@ typedef enum {
     KIPP_BACKEND_CUDA = 2
 } kipp_backend_kind;
 
+/*
+ * Storage precision for the session KV cache. This is independent of the
+ * weight quantization scheme: weights and KV are quantized on separate axes.
+ * KIPP_KV_QUANT_BF16 (0) is the default 2-bytes-per-value store; Q8_0 stores
+ * each 32-value block as {fp16 scale; int8 qs[32]} (8.5 bpw, ~1.9x smaller),
+ * reusing the weight-quant block convention. CPU and Metal only; CUDA rejects
+ * any non-BF16 KV scheme.
+ */
+typedef enum {
+    KIPP_KV_QUANT_BF16 = 0,
+    KIPP_KV_QUANT_Q8_0 = 1
+} kipp_kv_quant_scheme;
+
 typedef enum {
     KIPP_OK = 0,
     KIPP_ERROR_ARGUMENT,
@@ -107,6 +120,24 @@ int kipp_model_open_backend(const char *path, kipp_backend_kind backend,
 int kipp_model_open_pooled(const char *path, kipp_backend_kind backend,
                            uint32_t kv_pool_blocks, kipp_model **out_model,
                            kipp_error *error);
+
+/*
+ * Full open configuration. backend selects CPU/Metal/CUDA. kv_pool_blocks
+ * nonzero enables the shared cross-session KV pool (as kipp_model_open_pooled;
+ * 0 keeps per-session slabs). kv_quant selects the KV cache storage precision
+ * (default BF16). The three fields compose: a pooled model may quantize KV.
+ * CUDA rejects kv_pool_blocks != 0 or kv_quant != BF16 with
+ * KIPP_ERROR_UNSUPPORTED. The other open functions are thin wrappers that
+ * leave kv_quant BF16.
+ */
+typedef struct {
+    kipp_backend_kind backend;
+    uint32_t kv_pool_blocks;
+    kipp_kv_quant_scheme kv_quant;
+} kipp_model_open_config;
+
+int kipp_model_open_ex(const char *path, const kipp_model_open_config *config,
+                       kipp_model **out_model, kipp_error *error);
 int kipp_model_close(kipp_model *model, kipp_error *error);
 int kipp_model_get_info(const kipp_model *model, kipp_model_info *out_info);
 /* Nonzero when generation should stop after sampling this token. */
