@@ -157,6 +157,18 @@ static id<MTLBuffer> metal_new_shared_buffer(id<MTLDevice> device,
                                options:MTLResourceStorageModeShared];
 }
 
+/* KV cache bytes for one physical position (all KV heads). bf16 stores two
+ * bytes per value; Q8_0 packs each 32-value block as {bf16 scale; int8[32]}
+ * = KIPP_Q8_0_BLOCK_BYTES, matching the CPU reference. */
+static uint64_t metal_kv_bytes_per_position(kipp_kv_quant_scheme scheme) {
+    uint64_t values = (uint64_t)KIPP_ATTENTION_HEAD_COUNT_KV *
+                      KIPP_ATTENTION_HEAD_DIM;
+    if (scheme == KIPP_KV_QUANT_Q8_0) {
+        return values / KIPP_QUANT_BLOCK * KIPP_Q8_0_BLOCK_BYTES;
+    }
+    return values * sizeof(uint16_t);
+}
+
 static KippMetalSession *
 metal_session_new(KippMetalModel *model, uint32_t capacity,
                   bool forcePrivateSlab, kipp_error *error) {
@@ -194,8 +206,7 @@ metal_session_new(KippMetalModel *model, uint32_t capacity,
     } else {
         uint64_t slabBytes =
             (uint64_t)config.block_count * slabPositions *
-            KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM *
-            sizeof(uint16_t);
+            metal_kv_bytes_per_position(config.kv_quant);
         if (slabBytes > NSUIntegerMax) {
             metal_fail(error, KIPP_ERROR_MEMORY,
                        "Metal session size overflows");
@@ -532,8 +543,17 @@ static void metal_encode_kv_write(id<MTLComputeCommandEncoder> target,
                                   uint32_t tokenCount) {
     metal_kv_params params = {layer, startPosition, tokenCount,
                               kvSession.slabPositions, 0};
-    metal_enc_threads(target, metal_pipeline(model, @"kipp_kv_write"),
-                      KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
+    BOOL q8 = model.config.kv_quant == KIPP_KV_QUANT_Q8_0;
+    /* bf16 writes one thread per (value, token); Q8_0 one thread per
+     * (32-value block, token). */
+    NSUInteger writeWidth =
+        q8 ? KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM /
+                 KIPP_QUANT_BLOCK
+           : KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM;
+    metal_enc_threads(target,
+                      metal_pipeline(model, q8 ? @"kipp_kv_write_q8_0"
+                                               : @"kipp_kv_write"),
+                      writeWidth,
                       tokenCount, ^(id<MTLComputeCommandEncoder> encoder) {
                         [encoder setBuffer:key
                                     offset:stateOffset
@@ -571,6 +591,12 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
                              bool useMatrixAttention) {
     metal_kv_params params = {layer, startPosition, tokenCount,
                               kvSession.slabPositions, model.ksplitCap};
+    BOOL q8 = model.config.kv_quant == KIPP_KV_QUANT_Q8_0;
+    /* Q8_0 blocks cannot be simdgroup_load'ed, so quantized prefill routes
+     * through the streaming kernel; the MMA prefill kernel stays BF16-only. */
+    if (q8) {
+        useMatrixAttention = false;
+    }
     void (^bind)(id<MTLComputeCommandEncoder>) =
         ^(id<MTLComputeCommandEncoder> encoder) {
           [encoder setBuffer:query offset:headStateOffset atIndex:0];
@@ -598,7 +624,9 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
     if (model.ksplitCap != 0) {
         splitsMax = MIN(splitsMax, model.ksplitCap);
     }
-    metal_enc_groups_3d(target, metal_pipeline(model, @"kipp_flash_gqa"),
+    metal_enc_groups_3d(target,
+                        metal_pipeline(model, q8 ? @"kipp_flash_gqa_q8_0"
+                                                 : @"kipp_flash_gqa"),
                         model.config.attention_head_count, splitsMax,
                         tokenCount, KIPP_METAL_GQA_THREADS, bind);
     if (splitsMax > 1) {
@@ -1038,6 +1066,7 @@ static int metal_compile_pipelines(
           @"kipp_bf16_roundtrip" : @0, @"kipp_embed_gather" : @0,
           @"kipp_rms_norm" : @0, @"kipp_head_norm" : @0, @"kipp_rope" : @0,
           @"kipp_kv_write" : @0, @"kipp_flash_gqa" : @0,
+          @"kipp_kv_write_q8_0" : @0, @"kipp_flash_gqa_q8_0" : @0,
           @"kipp_flash_gqa_reduce" : @0,
           @"kipp_residual_add" : @0, @"kipp_swiglu" : @0,
           @"kipp_bf16_stage" : @0,
@@ -1199,8 +1228,7 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
                 (uint64_t)view->config.kv_pool_blocks * 32u;
             uint64_t poolBytes =
                 (uint64_t)view->config.block_count * poolPositions *
-                KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM *
-                sizeof(uint16_t);
+                metal_kv_bytes_per_position(view->config.kv_quant);
             if (poolPositions > UINT32_MAX || poolBytes > NSUIntegerMax) {
                 return metal_fail(error, KIPP_ERROR_MEMORY,
                                   "Metal KV pool size overflows");
