@@ -179,7 +179,7 @@ The CPU reference dequantizes per block inside a type-dispatched matvec;
 Metal selects kernels by the weight tensor's type: token-tiled
 `kipp_matvec_q8_0`/`kipp_matvec_affine4` vector kernels for decode, and
 simdgroup-matrix `kipp_matmul_q8_0`/`kipp_matmul_affine4` kernels for
-prefill (each 32-weight block dequantized once per 16-token tile, keeping
+prefill (each 32-weight block dequantized once per 32-token tile, keeping
 quantized prefill at near-parity with BF16). Quantized artifacts
 gate as ordinary artifacts: argmax must match the BF16 reference exactly,
 with a format-appropriate full-logit NMSE bound (Q8_0 near-lossless; 4-bit
@@ -211,6 +211,34 @@ Backends own reusable activation and scratch storage. Allocation occurs when a
 backend model or session is created, not inside the layer loop. Intermediate
 activations use FP32 for the CPU reference path. GPU storage and accumulation
 precision may differ only when tests establish the documented tolerance.
+
+The Metal backend keeps **one activation workspace per model**, not per
+session, sized for the tokens it encodes in a single forward pass. Evaluation on
+a model is already serial -- the shared logits and split-K partial buffers are
+model-global -- so per-session copies would only multiply cost: at 4B the
+activation set runs about 165 KB per token, so a wide round would otherwise
+charge every live session tens of megabytes.
+
+Three separate limits govern round shape, and conflating them is a mistake the
+code previously made:
+
+- **logit rows** bound the shared logits buffer, at one vocabulary row per
+  batched item, and also cap multi-row (`rows > 1`) evaluation. A plain prefill
+  round emits logits for its final token only, so this does not grow with the
+  round.
+- **prefill tokens** bound the activation workspace. Wider rounds are what fill
+  the GPU: the K and V projections have only 1,024 rows, so a narrow round
+  leaves most of a large GPU idle. The value is derived at model open from the
+  device's recommended working set and never falls below the floor, so a
+  smaller machine degrades to the old behavior instead of failing.
+- **partial tokens** bound the split-K scratch that only the *streaming*
+  attention kernel indexes per token. Rounds taking the matrix kernel do not
+  need it wide, and keeping it narrow measurably protects decode, which reads
+  that buffer every step.
+
+Round width is numerically neutral: for a fixed absolute token index no
+per-output-element accumulation order changes, so only kernel *selection* can
+differ, and only for a final round below the matrix-kernel threshold.
 
 Only final FP32 logits cross from a GPU backend to host memory during normal
 evaluation.
