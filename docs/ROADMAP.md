@@ -4,6 +4,32 @@ This sequence is binding unless `ARCHITECTURE.md` is explicitly revised.
 Correctness gates every phase. Status notes summarize delivered work and
 link measured claims back to the benchmark records.
 
+**Status (v0.0.4):** This release is about Metal prefill, which was the one
+axis where Kipp measurably lost to llama.cpp. Prefill is now **~2.5× faster on
+every weight scheme** at a 2,048-token prompt (BF16 504→1308, Q8_0 453→1142,
+affine4 482→1140 tok/s, same-session A/B on an M5 Max) with **decode unchanged**,
+narrowing the llama.cpp prefill gap from 4.5× to ~1.7× while decode stays ~1.6×
+ahead. The cause was occupancy rather than bandwidth: weight traffic follows the
+in-kernel token tile, not the round size, so a 32-token round left the 1,024-row
+K and V projections dispatching 16 threadgroups onto a 40-core device. Rounds are
+now device-derived and wide, the matmul token tile is per kernel (wider for BF16,
+unchanged for the quantized kernels, where widening it costs 88%), and one
+overloaded constant became three so that widening the round no longer drags the
+split-K partial buffer with it — which alone was worth 11% of decode. Activation
+scratch moved from every session to one per model.
+
+Correctness work landed alongside it, and was the prerequisite: the pinned test
+vectors are three tokens long while a round only takes the simdgroup-matrix path
+at eight or more, so the primary numeric gates had **never executed the matrix
+kernels at all**. The new `--prefill-metal` gate covers a ragged multi-round
+prefill against both the vector path and the CPU oracle and prints a full-logit
+fingerprint; `kipp_flash_gqa_prefill` gained its first operator test;
+`KIPP_METAL_REQUIRE_MMA` and a shader-geometry probe turn two classes of silent
+degradation into load failures; and an unsigned-wrap out-of-bounds write in all
+three matmul kernels was fixed. An opt-in **Q8_0 KV cache** (`--kv-quant q8_0`)
+also ships, ~1.9× smaller than BF16 and gated for tolerance and placement
+invariance — a memory feature, not a speed one.
+
 **Status (v0.0.3):** Kipp delivered the items that v0.0.2 deferred and
 hardened the serving path. **Cross-request
 KV prefix sharing is now the CPU/Metal serving default**: pooled sessions
@@ -24,12 +50,6 @@ and the whole registry surface was revalidated on an ephemeral NVIDIA
 H100 (four checkpoints, worst NMSE 5.9e-7). Speculation now measures a
 paired-baseline A/B with an adaptive-gate floor of 0.84× and above-parity
 code decoding.
-
-**Current unreleased work:** draft-model speculative decoding uses a smaller
-registered checkpoint to propose tokens while preserving the target model's
-greedy sequence. Metal long-context decode now uses split-K attention past
-1,024 cached positions, and the prefill softmax distributes work across all
-simdgroup lanes.
 
 **Status (v0.0.2):** This release expands Kipp from the single pinned
 checkpoint of v0.0.1 to the **Qwen3 dense family** (0.6B–32B, base +
@@ -68,7 +88,8 @@ pooling with cross-request prefix caching is delivered and is the serving
 default on CPU/Metal. An opt-in **Q8_0 KV cache** (`--kv-quant q8_0`) is
 delivered on CPU + Metal, ~1.9× smaller than BF16 and gated for tolerance
 and placement invariance. Remaining: a token-budget scheduler and 4-bit KV,
-each behind its own CPU-vs-GPU gate. Prompt-lookup and draft-model speculative
+each behind its own CPU-vs-GPU gate, plus a threadgroup-staged K-blocked
+matmul, which is what the remaining prefill gap to llama.cpp now needs. Prompt-lookup and draft-model speculative
 decoding plus generated-token logprobs are already delivered.
 
 ## Phase 0 — Specify the model

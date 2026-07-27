@@ -3,7 +3,7 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
-## Unreleased
+## v0.0.4 — 2026-07-27
 
 ### Metal prefill: ~2.5× faster, and the gate hole that hid the kernels (2026-07-26)
 - **Metal prefill throughput ~2.5× faster on every weight scheme.**
