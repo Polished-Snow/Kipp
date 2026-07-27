@@ -4,7 +4,8 @@
 	test-paged-cpu test-pooled-cpu test-qkv-cpu test-multilogit metal \
 	test-metal-ops test-qkv-metal \
 	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
-	test-longctx-metal test-chat test-draft-spec test-server \
+	test-longctx-metal test-prefill-metal test-chat test-draft-spec \
+	test-server \
 	cuda-spark cuda-generic \
 	test-cuda-ops test-cuda docs docs-check clean
 
@@ -223,8 +224,17 @@ test-pooled-metal: $(BUILD_DIR)/kipp_test_metal vectors
 test-qkv-metal: $(BUILD_DIR)/kipp_test_metal vectors
 	$(BUILD_DIR)/kipp_test_metal --qkv-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
+# Batched-prefill gate: exercises the simdgroup-matrix kernels over a ragged
+# multi-round sequence, which the 3-token pinned vectors never reach.
+# KIPP_METAL_REQUIRE_MMA turns a silent drop to the vector path into a load
+# failure, so a green run cannot mean "the kernels never ran".
+test-prefill-metal: $(BUILD_DIR)/kipp_test_metal vectors
+	KIPP_METAL_REQUIRE_MMA=1 $(BUILD_DIR)/kipp_test_metal --prefill-metal \
+		$(MODEL_GGUF) $(VECTOR_DIR)
+
 test-metal: test-metal-ops test-multilogit-metal test-paged-metal \
-		test-pooled-metal test-longctx-metal test-qkv-metal
+		test-pooled-metal test-longctx-metal test-qkv-metal \
+		test-prefill-metal
 	$(BUILD_DIR)/kipp_test_metal --phase3-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
 # Chat REPL smoke test against an already-converted instruct GGUF; does not

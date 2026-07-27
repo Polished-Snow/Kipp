@@ -2084,6 +2084,179 @@ cleanup:
 
 
 #ifdef KIPP_ENABLE_METAL
+/* FNV-1a over the raw logit bytes. Printed by the prefill gate so a change
+ * that is meant to be bit-exact can be checked with a one-line diff between
+ * commits, without paying for a CPU-oracle run. */
+static uint64_t logit_fingerprint(const float *values, size_t count) {
+    const unsigned char *bytes = (const unsigned char *)values;
+    size_t total = count * sizeof(*values);
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t index = 0; index < total; ++index) {
+        hash ^= bytes[index];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+/*
+ * Batched-prefill gate for the simdgroup-matrix kernels.
+ *
+ * The pinned vectors are three tokens long, but a round only takes the matrix
+ * path at KIPP_METAL_TOKEN_TILE tokens or more, so --model and --phase3-metal
+ * never reach kipp_matmul_* or kipp_flash_gqa_prefill at all. --pooled-metal
+ * does, incidentally, at 96 tokens -- but 96 is an exact multiple of the round
+ * size, so nothing anywhere exercises a ragged final round, and raising the
+ * round size would silently collapse even that coverage to a single round.
+ *
+ * Two comparisons, both on a length that is deliberately not a multiple of the
+ * round size or the matmul token tile:
+ *
+ *   (a) matrix vs forced-vector on Metal. The vector path is what the short
+ *       gates anchor to the CPU oracle, so this isolates the matrix kernels
+ *       at full length without a scalar reference pass. Kernel selection
+ *       differs, so this is a tolerance check, not a bitwise one.
+ *   (b) matrix vs the CPU oracle at a shorter length the scalar path can
+ *       afford, which anchors the result to ground truth rather than to
+ *       another GPU path.
+ */
+static int run_prefill_test(const char *model_path,
+                            const char *vector_directory) {
+    /* 650 = 20 rounds of 32 plus a 10-token tail today, and 512 + 138 once the
+     * round grows; ragged against both the round size and the 16/32-token
+     * matmul tile either way. 200 keeps the oracle leg affordable while
+     * staying ragged (200 = 6*32 + 8). */
+    enum { PREFILL_SEQ = 650, PREFILL_ORACLE_SEQ = 200 };
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *seed = NULL;
+    size_t token_bytes = 0;
+    uint32_t *sequence = NULL;
+    kipp_model *model = NULL;
+    kipp_model *oracle_model = NULL;
+    kipp_session *session = NULL;
+    float *matrix_logits = NULL;
+    float *vector_logits = NULL;
+    float *oracle_logits = NULL;
+    float *oracle_matrix = NULL;
+    kipp_error error = {0};
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&seed, &token_bytes) != 0 ||
+        token_bytes < sizeof(*seed) || token_bytes % sizeof(*seed)) {
+        fprintf(stderr, "unable to read prefill token vector\n");
+        goto cleanup;
+    }
+    size_t seed_count = token_bytes / sizeof(*seed);
+    sequence = malloc((size_t)PREFILL_SEQ * sizeof(*sequence));
+    matrix_logits = malloc(KIPP_VOCAB_SIZE * sizeof(*matrix_logits));
+    vector_logits = malloc(KIPP_VOCAB_SIZE * sizeof(*vector_logits));
+    oracle_logits = malloc(KIPP_VOCAB_SIZE * sizeof(*oracle_logits));
+    oracle_matrix = malloc(KIPP_VOCAB_SIZE * sizeof(*oracle_matrix));
+    if (sequence == NULL || matrix_logits == NULL || vector_logits == NULL ||
+        oracle_logits == NULL || oracle_matrix == NULL) {
+        fprintf(stderr, "prefill allocation failed\n");
+        goto cleanup;
+    }
+    for (uint32_t index = 0; index < PREFILL_SEQ; ++index) {
+        sequence[index] = seed[index % seed_count];
+    }
+    if (kipp_model_open_backend(model_path, KIPP_BACKEND_METAL, &model,
+                                &error) != 0) {
+        fprintf(stderr, "prefill metal open failed: %s\n", error.message);
+        goto cleanup;
+    }
+
+    /* (a) Matrix path at full length. */
+    if (kipp_session_create(model, PREFILL_SEQ, &session, &error) != 0 ||
+        kipp_session_eval(session, sequence, PREFILL_SEQ, matrix_logits,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "prefill matrix eval failed: %s\n", error.message);
+        goto cleanup;
+    }
+    kipp_session_destroy(session);
+    session = NULL;
+
+    if (kipp_test_metal_force_vector(model, 1) != 0) {
+        fprintf(stderr, "prefill force-vector hook unavailable\n");
+        goto cleanup;
+    }
+    if (kipp_session_create(model, PREFILL_SEQ, &session, &error) != 0 ||
+        kipp_session_eval(session, sequence, PREFILL_SEQ, vector_logits,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "prefill vector eval failed: %s\n", error.message);
+        goto cleanup;
+    }
+    kipp_session_destroy(session);
+    session = NULL;
+    (void)kipp_test_metal_force_vector(model, 0);
+
+    double matrix_nmse =
+        logit_nmse(matrix_logits, vector_logits, KIPP_VOCAB_SIZE);
+    int matrix_argmax = argmax(matrix_logits, KIPP_VOCAB_SIZE);
+    int vector_argmax = argmax(vector_logits, KIPP_VOCAB_SIZE);
+    fprintf(stderr,
+            "PREFILL-METAL matrix vs vector tokens=%d nmse=%.9g "
+            "matrix_argmax=%d vector_argmax=%d fingerprint=%016llx\n",
+            PREFILL_SEQ, matrix_nmse, matrix_argmax, vector_argmax,
+            (unsigned long long)logit_fingerprint(matrix_logits,
+                                                  KIPP_VOCAB_SIZE));
+    if (matrix_nmse > 1.0e-4 || matrix_argmax != vector_argmax) {
+        fprintf(stderr,
+                "PREFILL-METAL matrix kernels diverge from the vector path\n");
+        goto cleanup;
+    }
+
+    /* (b) Shorter matrix run anchored to the scalar oracle. */
+    if (kipp_session_create(model, PREFILL_ORACLE_SEQ, &session, &error) != 0 ||
+        kipp_session_eval(session, sequence, PREFILL_ORACLE_SEQ, oracle_matrix,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "prefill oracle-length eval failed: %s\n",
+                error.message);
+        goto cleanup;
+    }
+    kipp_session_destroy(session);
+    session = NULL;
+    if (kipp_model_open_backend(model_path, KIPP_BACKEND_CPU, &oracle_model,
+                                &error) != 0 ||
+        kipp_session_create(oracle_model, PREFILL_ORACLE_SEQ, &session,
+                            &error) != 0 ||
+        kipp_session_eval(session, sequence, PREFILL_ORACLE_SEQ, oracle_logits,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "prefill oracle eval failed: %s\n", error.message);
+        goto cleanup;
+    }
+    double oracle_nmse =
+        logit_nmse(oracle_matrix, oracle_logits, KIPP_VOCAB_SIZE);
+    int oracle_argmax = argmax(oracle_logits, KIPP_VOCAB_SIZE);
+    int metal_argmax = argmax(oracle_matrix, KIPP_VOCAB_SIZE);
+    fprintf(stderr,
+            "PREFILL-METAL vs CPU oracle tokens=%d nmse=%.9g cpu_argmax=%d "
+            "metal_argmax=%d\n",
+            PREFILL_ORACLE_SEQ, oracle_nmse, oracle_argmax, metal_argmax);
+    if (oracle_nmse > 1.0e-4 || oracle_argmax != metal_argmax) {
+        fprintf(stderr, "PREFILL-METAL diverges from the CPU oracle\n");
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    kipp_session_destroy(session);
+    if (model != NULL) {
+        (void)kipp_model_close(model, NULL);
+    }
+    if (oracle_model != NULL) {
+        (void)kipp_model_close(oracle_model, NULL);
+    }
+    free(oracle_matrix);
+    free(oracle_logits);
+    free(vector_logits);
+    free(matrix_logits);
+    free(sequence);
+    free(seed);
+    free(tokens_path);
+    return result;
+}
+
 /*
  * Split-K decode gate: the position-derived split path must reproduce the
  * legacy single-split path. Long context (past the 1,024-position split
@@ -3367,6 +3540,14 @@ int main(int argc, char **argv) {
             fprintf(stderr, "FAIL longctx_metal\n");
         } else {
             fprintf(stderr, "PASS longctx_metal\n");
+        }
+    } else if (argc == 4 && strcmp(argv[1], "--prefill-metal") == 0) {
+        ++tests_run;
+        if (run_prefill_test(argv[2], argv[3]) != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL prefill_metal\n");
+        } else {
+            fprintf(stderr, "PASS prefill_metal\n");
         }
 #endif
 #ifdef KIPP_ENABLE_METAL

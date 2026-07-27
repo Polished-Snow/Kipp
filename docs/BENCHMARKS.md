@@ -50,16 +50,22 @@ record results from a fallback build. Current reference numbers
 (Qwen3-4B, Metal, greedy; every value traces to a committed
 `bench/results/*.json`):
 
-- Decode tok/s (64 tokens, median of 5): BF16 **60.7**, Q8_0 **97.9**,
-  affine4 **130**.
+- Decode tok/s (64 tokens, median of 5): BF16 **59.8**, Q8_0 **94.3**,
+  affine4 **127.9**. These are 1–4% below the figures recorded before the
+  prefill work (60.7 / 97.9 / 130) purely as session drift: the controlled
+  back-to-back A/B in "Prefill round shape" measures decode unchanged on all
+  three schemes, and the whole campaign was re-run in one session so the
+  numbers stay comparable with each other.
 - Wikitext-2 perplexity (full test set, 2,048-token windows): BF16
   **7.731**, Q8_0 **7.733** (+0.02%), affine4 **8.171** (+5.7%) — Q8_0 is
   effectively lossless; affine4 is Q4-class.
-- Prefill tok/s (348-token / 2,048-token prompt): BF16 **528 / 481**,
-  Q8_0 **488 / 441**, affine4 **509 / 466**. The simdgroup-matrix kernels
-  dequantize once per 16-token tile, so quantized prefill stays near BF16
-  parity; the O(n²) attention tail brings Q8_0 prefill from ~485 tok/s at
-  short context to **177 tok/s** at 12,800 tokens.
+- Prefill tok/s (348-token / 2,048-token prompt): BF16 **1034 / 1308**,
+  Q8_0 **1048 / 1101**, affine4 **1060 / 1087** — roughly 2.1–2.7× the
+  528 / 481, 488 / 441 and 509 / 466 recorded before the prefill work. The
+  simdgroup-matrix kernels dequantize each 32-weight block once per token
+  tile, so quantized prefill stays near BF16 parity. See "Prefill round
+  shape" for the traffic model, the per-scheme A/B, and the changes that were
+  measured and rejected.
 - Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
   12,800-token prompt after the split-K long-context path (`ctx-*.json`).
 - Model-size sweep (BF16 decode): 0.6B **269**, 4B **60.7**, 8B **33.5**
@@ -97,6 +103,119 @@ record results from a fallback build. Current reference numbers
   identical). A faster decode dequant and an MMA quantized-prefill path are
   follow-ups.
 
+### Prefill round shape (2026-07-26)
+
+Metal prefill was the one axis where Kipp lost to llama.cpp: 504 tok/s against
+2,174 at a matched 2,048-token prompt, measured back to back on the same host,
+weights, and session. Two independent limits caused it, and the arithmetic
+matters because the intuitive reading is wrong.
+
+Projection weight traffic is set by the **in-kernel token tile**, not by the
+round size:
+
+```
+weight bytes per prefill = ceil(total_tokens / matmul_token_tile) x projection_bytes
+```
+
+The dispatch grid is `(row groups, token groups)` and each threadgroup streams
+its own weight rows over the full shared dimension, so threadgroups that would
+share weight rows are never co-resident. Widening the round therefore moves *no*
+weight bytes; only the tile does. What the round width fixes is **occupancy**:
+the K and V projections have 1,024 rows, so at a 32-token round they dispatched
+16 threadgroups onto a 40-core GPU, and the engine sustained only ~255 GB/s,
+roughly half of what the device can hold.
+
+Both levers were measured separately, one session, idle machine, five runs each
+(Qwen3-4B BF16, 2,048-token prompt, M5 Max):
+
+| matmul tile | round | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| 16 | 32 (previous) | 504.4 (MAD 0.45) | 55.75 |
+| 32 | 32 | **356.6** (MAD 4.58) | 54.16 |
+| 16 | 512 | 1222.3 (MAD 8.22) | 56.44 |
+| 32 | 512 | **1310.0** (MAD 0.60) | 56.10 |
+
+Three results worth keeping:
+
+- The round is the dominant lever (**+142%** with zero byte reduction); the tile
+  adds **+7%** on top. Weight bandwidth was therefore *not* the binding
+  constraint, and the widely-assumed fix had the smaller effect.
+- Raising the tile **first** is a 29% regression, because at a 32-token round a
+  32-token tile halves the grid. Ordering is not cosmetic here.
+- Naively widening the round also costs **11% of decode**, because one constant
+  sized the split-K partial buffer as well. Separating the limits (see
+  `docs/ARCHITECTURE.md`, "Activations and logits") recovers that and lands 40%
+  higher prefill than the naive change.
+
+The round size itself was swept rather than guessed (same session, 2,048-token
+prompt): 256 -> 1191.4, 512 -> 1273.8, 1024 -> 1340.3, 2048 -> 1292.0 tok/s.
+Prefill peaks near 1024, but decode falls from 56.25 to 54.78 there and to 53.57
+at 2048, so **512 is the shipped default**: it takes the bulk of the prefill win
+while leaving decode -- the larger competitive margin -- untouched.
+
+A third limit turned up only when the quantized schemes were measured, and it
+nearly shipped a large regression. The quantized matmul kernels already stage
+dequantized weights in ~16.9 KiB of threadgroup memory, so widening *their*
+token tile costs far more in occupancy than it saves in weight traffic. Isolated
+on Q8_0 at a 2,048-token prompt:
+
+| Q8_0 | 16-token tile | 32-token tile |
+|---|---|---|
+| 32-token round | 455.1 | 74.9 |
+| 512-token round | **1139.4** | 135.1 |
+
+The wider round is worth 2.5x for Q8_0 as well, but the wider tile is **-88%**
+for it while being **+7%** for BF16. Tile width is therefore a property of each
+kernel rather than of the projection layer, and the two quantized kernels keep
+the narrower tile. Correctness alone would never have caught this: all three
+schemes passed every gate at either tile.
+
+Back-to-back A/B of the shipped configuration against the previous one, all
+three weight schemes, same session, after a sustained warm-up (Qwen3-4B,
+2,048-token prompt, five runs each):
+
+| scheme | previous | shipped | ratio | decode before -> after |
+|---|---|---|---|---|
+| BF16 | 504.1 (MAD 0.11) | **1308.2** (MAD 0.64) | **2.60x** | 55.99 -> 56.47 |
+| Q8_0 | 453.6 (MAD 1.00) | **1141.7** (MAD 1.14) | **2.52x** | 85.79 -> 85.68 |
+| affine4 gs32 | 482.1 (MAD 0.18) | **1139.5** (MAD 0.31) | **2.36x** | 110.04 -> 110.21 |
+
+Decode is unchanged for every scheme. An earlier run of the same comparison
+measured BF16 prefill at 407 tok/s with a median absolute deviation of 10.5 and
+affine4 decode 20% low; those readings were thermally polluted and are not used.
+The rule this reinforces is in `bench/README.md`: only a back-to-back
+same-session A/B is meaningful here, because the narrow-round configuration
+spent proportionally more time in per-round fixed cost and therefore tracked GPU
+clock state more closely than the new one does.
+
+Every step is bit-exact: the full-logit fingerprint printed by
+`--prefill-metal` is unchanged through the refactor, the wider round, and the
+larger tile, verified by pinning the round back to 32 to separate the refactor
+from the speedup.
+
+Two further changes were implemented, measured, and **reverted** rather than
+shipped, because the repository's standard is that a change earns its place:
+
+- **Four query tiles per attention threadgroup**, so the simdgroups sharing a KV
+  head walk the same K/V tiles together and three of four reads hit cache. Flat
+  at 2,048 tokens (+0.3%) and **-7.3% at 12,800** (532.3 vs 574.0). One layer's
+  KV at these lengths is a few megabytes and was already cache-resident, so the
+  sharing bought nothing while the larger threadgroup allocation (8.3 -> 25.3
+  KiB) cut resident threadgroups per core.
+- **A 64-token matmul tile**, which would halve weight traffic again: **133.8
+  tok/s, a 90% regression**, from register spilling once the accumulator set
+  reaches 32 fragments.
+
+Remaining prefill cost is therefore neither weight traffic nor attention
+locality. llama.cpp's 2,174 tok/s is ~15.8 TFLOP/s against the 14.9 TFLOP this
+prompt requires, i.e. compute-bound; closing the rest needs a
+threadgroup-staged, K-blocked matmul rather than more of the levers above.
+
+*Provenance note: the figures in this section were measured on a working tree
+that also carried the change under test, so they are not yet backed by committed
+`bench/results/*.json` records. The full campaign is re-run on the clean tree at
+release, per the policy at the top of this file.*
+
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 
 Measured on 2026-07-13 with Kipp v0.0.1's batched Metal path: one serial compute
@@ -133,9 +252,11 @@ Results (median, with median absolute deviation):
 Short-prompt prefill is dominated by fixed per-evaluation cost; the
 265-token configuration reflects the batched matrix-kernel prefill path.
 Decode remains memory-bandwidth-bound: at ~13.8 tokens/s the engine streams
-roughly 115 GB/s of BF16 weights through the M5. Long-context prefill is
-now limited by per-layer KV re-reads in attention rather than by the
-projection matmuls.
+roughly 115 GB/s of BF16 weights through the M5. Prefill at this revision was
+limited by per-layer KV re-reads in attention rather than by the projection
+matmuls. **That attribution is specific to the 32-token round this section
+measured and no longer describes the engine** -- see "Prefill round shape"
+below for the current model and the measurement that corrected it.
 
 Batched decoding through the server (48 sampled tokens per sequence,
 temperature 0.8, single measurements). Multi-choice requests (`n`) and

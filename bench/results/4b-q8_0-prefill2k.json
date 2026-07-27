@@ -3,22 +3,23 @@
     "batch_size": 1,
     "concurrency": 1,
     "decode_tokens": 8,
+    "kv_quant": "bf16",
     "measured_runs": 5,
     "prompt": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
     "sampling": "greedy",
     "warmup_runs": 1
   },
   "decode_tokens_per_second": {
-    "maximum": 73.40122947059363,
-    "median": 73.2701378394468,
-    "median_absolute_deviation": 0.030185445415852996,
-    "minimum": 73.22520411525647
+    "maximum": 86.22640899341445,
+    "median": 85.46186798277944,
+    "median_absolute_deviation": 0.3998258558030727,
+    "minimum": 84.79786309385004
   },
   "engine": {
     "backend": "metal",
     "binary": "build/kipp-metal",
     "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
-    "commit": "8a04db95b27141350469c6091bf24e0004a9c6be",
+    "commit": "f5e9e1039338463d19b6b1eb81cd4a194b0c4b05",
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "dirty": false
   },
@@ -38,52 +39,52 @@
     "sha256": "e81b9066347d9e3ab1c22058ac7de5792a6a78f41ce408d187421b620de0bc96"
   },
   "peak_resident_bytes": {
-    "maximum": 40943616.0,
-    "median": 40910848.0,
-    "median_absolute_deviation": 32768.0,
-    "minimum": 40861696.0
+    "maximum": 41467904.0,
+    "median": 41353216.0,
+    "median_absolute_deviation": 49152.0,
+    "minimum": 41304064.0
   },
   "prefill_tokens_per_second": {
-    "maximum": 441.70078093474496,
-    "median": 441.0253494824413,
-    "median_absolute_deviation": 0.6754314523036555,
-    "minimum": 439.96941696962904
+    "maximum": 1118.4735457522854,
+    "median": 1100.8621987142274,
+    "median_absolute_deviation": 15.394764946920986,
+    "minimum": 1073.6312904806964
   },
   "runs": [
     {
-      "decode_seconds": 0.109185,
-      "decode_tokens_per_second": 73.2701378394468,
-      "peak_resident_bytes": 40943616,
-      "prefill_seconds": 4.643724,
-      "prefill_tokens_per_second": 441.0253494824413
+      "decode_seconds": 0.092779,
+      "decode_tokens_per_second": 86.22640899341445,
+      "peak_resident_bytes": 41418752,
+      "prefill_seconds": 1.831067,
+      "prefill_tokens_per_second": 1118.4735457522854
     },
     {
-      "decode_seconds": 0.109143,
-      "decode_tokens_per_second": 73.2983333791448,
-      "peak_resident_bytes": 40861696,
-      "prefill_seconds": 4.636623,
-      "prefill_tokens_per_second": 441.70078093474496
+      "decode_seconds": 0.094049,
+      "decode_tokens_per_second": 85.06204212697637,
+      "peak_resident_bytes": 41467904,
+      "prefill_seconds": 1.834703,
+      "prefill_tokens_per_second": 1116.2569636611483
     },
     {
-      "decode_seconds": 0.10899,
-      "decode_tokens_per_second": 73.40122947059363,
-      "peak_resident_bytes": 40878080,
-      "prefill_seconds": 4.640754,
-      "prefill_tokens_per_second": 441.3075978601753
+      "decode_seconds": 0.093609,
+      "decode_tokens_per_second": 85.46186798277944,
+      "peak_resident_bytes": 41304064,
+      "prefill_seconds": 1.86036,
+      "prefill_tokens_per_second": 1100.8621987142274
     },
     {
-      "decode_seconds": 0.10923,
-      "decode_tokens_per_second": 73.23995239403095,
-      "peak_resident_bytes": 40910848,
-      "prefill_seconds": 4.654869,
-      "prefill_tokens_per_second": 439.96941696962904
+      "decode_seconds": 0.093274,
+      "decode_tokens_per_second": 85.76881017218089,
+      "peak_resident_bytes": 41353216,
+      "prefill_seconds": 1.883019,
+      "prefill_tokens_per_second": 1087.6151541752897
     },
     {
-      "decode_seconds": 0.109252,
-      "decode_tokens_per_second": 73.22520411525647,
-      "peak_resident_bytes": 40910848,
-      "prefill_seconds": 4.651195,
-      "prefill_tokens_per_second": 440.31695080511565
+      "decode_seconds": 0.094342,
+      "decode_tokens_per_second": 84.79786309385004,
+      "peak_resident_bytes": 41353216,
+      "prefill_seconds": 1.907545,
+      "prefill_tokens_per_second": 1073.6312904806964
     }
   ]
 }

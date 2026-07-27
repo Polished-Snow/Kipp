@@ -5,6 +5,74 @@ BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
 ## Unreleased
 
+### Metal prefill: ~2.5× faster, and the gate hole that hid the kernels (2026-07-26)
+- **Metal prefill throughput ~2.5× faster on every weight scheme.**
+  Back-to-back same-session A/B, Qwen3-4B at a 2,048-token prompt (M5 Max, five
+  runs each): BF16 504.1 → **1308.2 tok/s (2.60×)**, Q8_0 453.6 → **1141.7
+  (2.52×)**, affine4 482.1 → **1139.5 (2.36×)**. **Decode is unchanged** for all
+  three (55.99 → 56.47, 85.79 → 85.68, 110.04 → 110.21). This narrows the
+  llama.cpp prefill gap from ~4.5× to ~1.7× while decode stays ~1.6× ahead.
+  Every step is bit-exact: the full-logit fingerprint is unchanged for all three
+  schemes through the whole change set.
+- **The matmul token tile is per-kernel, not global.** The quantized kernels
+  already stage dequantized weights in ~16.9 KiB of threadgroup memory, so
+  widening their tile costs more occupancy than it saves traffic: on Q8_0 it is
+  **−88%** (1139 → 135 tok/s) where BF16 gains 7%. The quantized kernels keep
+  the 16-token tile. Correctness could not have caught this — every gate passed
+  at either tile — which is why the change was benchmarked per scheme rather
+  than extrapolated from BF16.
+- **Three changes were measured and reverted rather than shipped:** four query
+  tiles per attention threadgroup (flat at 2,048 tokens, −7.3% at 12,800 — the
+  KV tiles were already cache-resident and the larger threadgroup allocation cut
+  occupancy), a 64-token matmul tile (−90%, register spilling), and a
+  1,024-token round (faster prefill but −2.6% decode). The round size was swept
+  rather than assumed.
+- **Split one overloaded constant into three.** `KIPP_METAL_BATCH` simultaneously
+  bounded the shared logits buffer (per item), the activation workspace (per
+  token), the split-K partial buffer, and the per-item host arrays. It is now
+  `KIPP_METAL_LOGIT_ROWS` (rows, still 32), a device-derived prefill token count,
+  and a separate partial-token width. This is a throughput change, not only a
+  memory one: widening everything together costs 11% of decode, because decode
+  reads the split-K partials every step.
+- **One activation workspace per model instead of per session.** Sizing a wide
+  round per session would charge every live server session ~85 MB at 4B.
+- **Wider prefill rounds** (device-derived, floor at the previous value) fill the
+  GPU: the 1,024-row K and V projections previously dispatched 16 threadgroups
+  onto a 40-core device. This is the dominant lever, worth +142% alone.
+- **32-token matmul tile** (was 16), halving projection weight traffic for a
+  further +7%. Note the ordering: applied *before* the wider round it is a 29%
+  regression, because it halves the dispatch grid.
+- **New `--prefill-metal` gate.** Every pinned test vector is three tokens long,
+  but a round only takes the simdgroup-matrix path at eight tokens or more, so
+  `--model` and `--phase3-metal` never executed `kipp_matmul_*` or
+  `kipp_flash_gqa_prefill` at all. Only `--pooled-metal` reached them,
+  incidentally, at a length that is an exact multiple of the round size — so no
+  gate covered a ragged final round, and widening the round would have collapsed
+  even that coverage to a single round. The new gate checks a ragged 650-token
+  multi-round prefill against both the vector path and the CPU oracle, and prints
+  a full-logit fingerprint so a change meant to be bit-exact can be verified with
+  a one-line diff.
+- **Fixed an out-of-bounds write.** All three matmul kernels and the prefill
+  attention kernel computed `min(tile, token_count - token_base)`, which wraps in
+  unsigned arithmetic when the grid is taller than the token count, yielding a
+  full phantom tile that reads *and writes* past the buffers. The quantized
+  operator test hardcoded its token-group count and would have written 32 rows
+  past a 19-row output buffer as soon as the tile changed.
+- **Two new tripwires for silent degradation**, the failure mode that once cost
+  two days to a reserved-keyword typo: `KIPP_METAL_REQUIRE_MMA=1` turns a
+  fallback to the vector path into a load failure rather than a warning, and a
+  geometry probe reads the shader's own tile constants back at model open and
+  fails on drift from the host mirror. Both are negative-tested.
+- **First operator test for `kipp_flash_gqa_prefill`**, which had none: compared
+  against the streaming kernel over a ragged token count under a reversed page
+  table. The two cannot agree bitwise — the streaming kernel keeps the query in
+  FP32 while the matrix kernel stages a BF16 query tile for `simdgroup_load` — so
+  the bound sits just above that ~2e-6 floor.
+- Corrected `docs/BENCHMARKS.md`: its claim that prefill was limited by per-layer
+  KV re-reads rather than projection matmuls was measured on a 32-token round and
+  does not describe the current engine. Attention *is* the dominant remaining
+  term, but for a different reason; the corrected traffic model is recorded.
+
 ### Quantized KV cache (2026-07-24)
 - **Opt-in Q8_0 KV cache** (`--kv-quant q8_0` on the CLI and server;
   `kipp_model_open_ex`): each 32-value block of the key/value cache is stored

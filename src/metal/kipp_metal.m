@@ -16,14 +16,34 @@
 #define KIPP_METAL_ORACLE_CAPACITY 256u
 #define KIPP_METAL_RMS_EPSILON 1.0e-6f
 #define KIPP_METAL_ROPE_THETA 1000000.0f
-/* Tokens encoded per command buffer; bounds the persistent activation
- * buffers and the host-visible token-ID staging buffer. */
-#define KIPP_METAL_BATCH 32u
+/*
+ * Logit rows in the model's shared logits buffer. Two distinct roles, both
+ * per-item rather than per-token: one row per item in a batched round, and the
+ * token cap for multi-row (rows > 1) evaluation. Must stay at or above
+ * KIPP_EVAL_BATCH_LIMIT (src/kipp.h) and is mirrored by KIPP_CLI_PPL_CHUNK.
+ */
+#define KIPP_METAL_LOGIT_ROWS 32u
+/*
+ * Tokens encoded per forward pass, which bounds the model's activation
+ * workspace. This is deliberately separate from KIPP_METAL_LOGIT_ROWS: a plain
+ * prefill round emits logits for its final token only, so widening the round
+ * costs activation scratch but not vocabulary-sized logit storage. Wider rounds
+ * are what fill the GPU -- at 32 tokens the K and V projections dispatch only
+ * 16 threadgroups, well under half of a 40-core device.
+ */
+#define KIPP_METAL_PREFILL_TOKENS 512u
+#define KIPP_METAL_PREFILL_TOKENS_MIN 32u
+/* Ceiling on the activation workspace; also clamped against the device's
+ * recommended working set so a small machine falls back toward the minimum. */
+#define KIPP_METAL_WORKSPACE_BUDGET_BYTES (192u * 1024u * 1024u)
 #define KIPP_METAL_NORM_THREADS 256u
 #define KIPP_METAL_GROUP_THREADS 128u
 #define KIPP_METAL_GQA_THREADS 256u
 /* Queries per threadgroup in the matrix prefill-attention kernel; must
- * match KIPP_FA_QUERIES in the shader. */
+ * match KIPP_FA_QUERIES in the shader. One simdgroup per threadgroup: giving
+ * the tile more simdgroups so they share cached K/V was measured and lost
+ * (flat at 2,048 tokens, -7% at 12,800) -- the larger threadgroup allocation
+ * costs more in resident threadgroups than the sharing recovers. */
 #define KIPP_METAL_FA_QUERIES 8u
 /* Split-K decode (mirrors KIPP_KSPLIT_* in the MSL source). */
 #define KIPP_METAL_KSPLIT_MAX 8u
@@ -31,6 +51,20 @@
 #define KIPP_METAL_KSPLIT_STRIDE (4u + KIPP_ATTENTION_HEAD_DIM)
 #define KIPP_METAL_PAIRS_PER_GROUP 4u
 #define KIPP_METAL_TOKEN_TILE 8u
+/* Output-tile geometry of the simdgroup-matrix projection kernels; mirrors
+ * KIPP_MM_TOKEN_TILE and KIPP_MM_ROWS_PER_SIMDGROUP * KIPP_MM_SIMDGROUPS in
+ * metal/kipp_kernels.metal. metal_verify_mm_geometry() reads the shader's own
+ * values back at model open, so a one-sided edit fails loudly instead of
+ * mis-shaping every projection grid. */
+#define KIPP_METAL_MM_TOKEN_TILE 32u
+/* The quantized matmul kernels use a narrower token tile. They already stage
+ * dequantized weights in ~16.9 KiB of threadgroup memory, so the wider tile's
+ * extra accumulator registers cost far more than its halved weight traffic
+ * wins: measured at a 2,048-token prompt, widening the tile takes Q8_0 prefill
+ * from 1139 to 135 tok/s while gaining 7% for BF16. Tile width belongs to the
+ * kernel, not to the projection layer. */
+#define KIPP_METAL_MM_QUANT_TOKEN_TILE 16u
+#define KIPP_METAL_MM_ROWS_PER_GROUP 128u
 
 typedef struct {
     uint32_t rows;
@@ -67,6 +101,32 @@ typedef struct {
 
 @class KippMetalModel;
 
+/*
+ * Per-round activation scratch. One of these belongs to the model, not to each
+ * session: evaluation on a model is already serial (batchLogits and gqaPartials
+ * are model-global and the server is a single-threaded poll loop), and sizing it
+ * for a wide prefill round would otherwise multiply that cost by every live
+ * session -- at 4B the set runs about 165 KB per token, so a 512-token round is
+ * ~85 MB that 32 sessions must not each pay.
+ */
+@interface KippMetalWorkspace : NSObject
+@property(nonatomic) uint32_t tokenCapacity;
+@property(nonatomic, strong) id<MTLBuffer> tokens;
+@property(nonatomic, strong) id<MTLBuffer> x;
+@property(nonatomic, strong) id<MTLBuffer> normalized;
+@property(nonatomic, strong) id<MTLBuffer> query;
+@property(nonatomic, strong) id<MTLBuffer> key;
+@property(nonatomic, strong) id<MTLBuffer> value;
+@property(nonatomic, strong) id<MTLBuffer> attention;
+@property(nonatomic, strong) id<MTLBuffer> projection;
+@property(nonatomic, strong) id<MTLBuffer> gate;
+@property(nonatomic, strong) id<MTLBuffer> up;
+@property(nonatomic, strong) id<MTLBuffer> staging;
+@end
+
+@implementation KippMetalWorkspace
+@end
+
 @interface KippMetalSession : NSObject
 @property(nonatomic, weak) KippMetalModel *model;
 @property(nonatomic) uint32_t capacity;
@@ -80,17 +140,6 @@ typedef struct {
 @property(nonatomic, strong) id<MTLBuffer> keyCache;
 @property(nonatomic, strong) id<MTLBuffer> valueCache;
 @property(nonatomic, strong) id<MTLBuffer> blockTable; /* logical->physical */
-@property(nonatomic, strong) id<MTLBuffer> tokens;
-@property(nonatomic, strong) id<MTLBuffer> x;
-@property(nonatomic, strong) id<MTLBuffer> normalized;
-@property(nonatomic, strong) id<MTLBuffer> query;
-@property(nonatomic, strong) id<MTLBuffer> key;
-@property(nonatomic, strong) id<MTLBuffer> value;
-@property(nonatomic, strong) id<MTLBuffer> attention;
-@property(nonatomic, strong) id<MTLBuffer> projection;
-@property(nonatomic, strong) id<MTLBuffer> gate;
-@property(nonatomic, strong) id<MTLBuffer> up;
-@property(nonatomic, strong) id<MTLBuffer> staging;
 @end
 
 @implementation KippMetalSession
@@ -116,6 +165,17 @@ typedef struct {
  * (head, split, workspace token); merged by kipp_flash_gqa_reduce. */
 @property(nonatomic, strong) id<MTLBuffer> gqaPartials;
 @property(nonatomic) uint32_t ksplitCap; /* test hook; 0 = automatic */
+/* Test hook: pin every round to the vector/streaming kernels. */
+@property(nonatomic) BOOL forceVectorTest;
+/* Model-owned activation scratch, sized for prefillTokens rows. */
+@property(nonatomic, strong) KippMetalWorkspace *workspace;
+/* Tokens encoded per forward pass. Derived from the device's memory budget at
+ * model open, never below KIPP_METAL_PREFILL_TOKENS_MIN. */
+@property(nonatomic) uint32_t prefillTokens;
+/* Token rows in gqaPartials. Only the streaming attention kernel indexes that
+ * buffer per token, so rounds that take the matrix kernel do not need it wide;
+ * keeping it narrow keeps the decode path's working set small. */
+@property(nonatomic) uint32_t partialTokens;
 @end
 
 @implementation KippMetalModel
@@ -169,6 +229,18 @@ static uint64_t metal_kv_bytes_per_position(kipp_kv_quant_scheme scheme) {
     return values * sizeof(uint16_t);
 }
 
+/* The staging buffer re-encodes the widest activation as BF16. */
+static NSUInteger metal_staging_width(kipp_model_config config) {
+    NSUInteger width = config.feed_forward_length;
+    if (config.attention_width > width) {
+        width = config.attention_width;
+    }
+    if (config.embedding_length > width) {
+        width = config.embedding_length;
+    }
+    return width;
+}
+
 static KippMetalSession *
 metal_session_new(KippMetalModel *model, uint32_t capacity,
                   bool forcePrivateSlab, kipp_error *error) {
@@ -184,15 +256,6 @@ metal_session_new(KippMetalModel *model, uint32_t capacity,
      * block table addresses cleanly; the reported logical size is unchanged. */
     uint32_t blockCapacity = (capacity + 31u) / 32u;
     uint32_t slabPositions = blockCapacity * 32u;
-    /* The staging buffer re-encodes the widest activation as BF16. */
-    NSUInteger stagingWidth = config.feed_forward_length;
-    if (config.attention_width > stagingWidth) {
-        stagingWidth = config.attention_width;
-    }
-    if (config.embedding_length > stagingWidth) {
-        stagingWidth = config.embedding_length;
-    }
-
     KippMetalSession *session = [[KippMetalSession alloc] init];
     session.model = model;
     session.capacity = capacity;
@@ -226,51 +289,72 @@ metal_session_new(KippMetalModel *model, uint32_t capacity,
             table[block] = block; /* identity mapping */
         }
     }
-    session.tokens = metal_new_shared_buffer(
-        model.device, KIPP_METAL_BATCH * sizeof(uint32_t));
-    session.x = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * config.embedding_length * sizeof(float));
-    session.normalized = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * config.embedding_length * sizeof(float));
-    session.query = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * config.attention_width * sizeof(float));
-    session.key = metal_new_shared_buffer(
-        model.device, KIPP_METAL_BATCH * KIPP_ATTENTION_HEAD_COUNT_KV *
-                          KIPP_ATTENTION_HEAD_DIM * sizeof(float));
-    session.value = metal_new_shared_buffer(
-        model.device, KIPP_METAL_BATCH * KIPP_ATTENTION_HEAD_COUNT_KV *
-                          KIPP_ATTENTION_HEAD_DIM * sizeof(float));
-    session.attention = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * config.attention_width * sizeof(float));
-    session.projection = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * config.embedding_length * sizeof(float));
-    session.gate = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * config.feed_forward_length * sizeof(float));
-    session.up = metal_new_shared_buffer(
-        model.device,
-        KIPP_METAL_BATCH * config.feed_forward_length * sizeof(float));
-    session.staging = metal_new_shared_buffer(
-        model.device, KIPP_METAL_BATCH * stagingWidth * sizeof(uint16_t));
-
     if (session.keyCache == nil || session.valueCache == nil ||
-        session.blockTable == nil ||
-        session.tokens == nil || session.x == nil ||
-        session.normalized == nil || session.query == nil ||
-        session.key == nil || session.value == nil ||
-        session.attention == nil || session.projection == nil ||
-        session.gate == nil || session.up == nil ||
-        session.staging == nil) {
+        session.blockTable == nil) {
         metal_fail(error, KIPP_ERROR_MEMORY,
                    "unable to allocate persistent Metal session buffers");
         return nil;
     }
     return session;
+}
+
+/* Per-token byte cost of one activation set, used both to size the workspace
+ * and to fit it inside the device's memory budget. */
+static uint64_t metal_workspace_bytes_per_token(kipp_model_config config) {
+    uint64_t floats = 3ull * config.embedding_length +
+                      2ull * config.attention_width +
+                      2ull * (uint64_t)KIPP_ATTENTION_HEAD_COUNT_KV *
+                          KIPP_ATTENTION_HEAD_DIM +
+                      2ull * config.feed_forward_length;
+    return floats * sizeof(float) +
+           (uint64_t)metal_staging_width(config) * sizeof(uint16_t) +
+           sizeof(uint32_t);
+}
+
+static KippMetalWorkspace *metal_workspace_new(KippMetalModel *model,
+                                               uint32_t tokenCapacity,
+                                               kipp_error *error) {
+    const kipp_model_config config = model.config;
+    NSUInteger stagingWidth = metal_staging_width(config);
+    KippMetalWorkspace *workspace = [[KippMetalWorkspace alloc] init];
+    workspace.tokenCapacity = tokenCapacity;
+    workspace.tokens = metal_new_shared_buffer(
+        model.device, tokenCapacity * sizeof(uint32_t));
+    workspace.x = metal_new_shared_buffer(
+        model.device, tokenCapacity * config.embedding_length * sizeof(float));
+    workspace.normalized = metal_new_shared_buffer(
+        model.device, tokenCapacity * config.embedding_length * sizeof(float));
+    workspace.query = metal_new_shared_buffer(
+        model.device, tokenCapacity * config.attention_width * sizeof(float));
+    workspace.key = metal_new_shared_buffer(
+        model.device, tokenCapacity * KIPP_ATTENTION_HEAD_COUNT_KV *
+                          KIPP_ATTENTION_HEAD_DIM * sizeof(float));
+    workspace.value = metal_new_shared_buffer(
+        model.device, tokenCapacity * KIPP_ATTENTION_HEAD_COUNT_KV *
+                          KIPP_ATTENTION_HEAD_DIM * sizeof(float));
+    workspace.attention = metal_new_shared_buffer(
+        model.device, tokenCapacity * config.attention_width * sizeof(float));
+    workspace.projection = metal_new_shared_buffer(
+        model.device, tokenCapacity * config.embedding_length * sizeof(float));
+    workspace.gate = metal_new_shared_buffer(
+        model.device,
+        tokenCapacity * config.feed_forward_length * sizeof(float));
+    workspace.up = metal_new_shared_buffer(
+        model.device,
+        tokenCapacity * config.feed_forward_length * sizeof(float));
+    workspace.staging = metal_new_shared_buffer(
+        model.device, tokenCapacity * stagingWidth * sizeof(uint16_t));
+    if (workspace.tokens == nil || workspace.x == nil ||
+        workspace.normalized == nil || workspace.query == nil ||
+        workspace.key == nil || workspace.value == nil ||
+        workspace.attention == nil || workspace.projection == nil ||
+        workspace.gate == nil || workspace.up == nil ||
+        workspace.staging == nil) {
+        metal_fail(error, KIPP_ERROR_MEMORY,
+                   "unable to allocate the Metal activation workspace");
+        return nil;
+    }
+    return workspace;
 }
 
 /*
@@ -346,6 +430,18 @@ static void metal_dispatch_groups(id<MTLCommandBuffer> commandBuffer,
     [encoder endEncoding];
 }
 
+static void metal_enc_groups_3d_command(
+    id<MTLCommandBuffer> commandBuffer,
+    id<MTLComputePipelineState> pipeline, NSUInteger groupsX,
+    NSUInteger groupsY, NSUInteger groupsZ, NSUInteger threadsPerGroup,
+    void (^configure)(id<MTLComputeCommandEncoder>)) {
+    id<MTLComputeCommandEncoder> encoder =
+        [commandBuffer computeCommandEncoder];
+    metal_enc_groups_3d(encoder, pipeline, groupsX, groupsY, groupsZ,
+                        threadsPerGroup, configure);
+    [encoder endEncoding];
+}
+
 static NSUInteger metal_pair_groups(NSUInteger pairCount) {
     return (pairCount + KIPP_METAL_PAIRS_PER_GROUP - 1) /
            KIPP_METAL_PAIRS_PER_GROUP;
@@ -369,7 +465,7 @@ static int metal_commit_and_wait(id<MTLCommandBuffer> commandBuffer,
 
 static void metal_encode_embed(id<MTLComputeCommandEncoder> target,
                                KippMetalModel *model,
-                               KippMetalSession *session,
+                               KippMetalWorkspace *workspace,
                                uint32_t tokenCount) {
     const kipp_tensor_view *embedding =
         &model.view->weights.token_embedding;
@@ -379,8 +475,8 @@ static void metal_encode_embed(id<MTLComputeCommandEncoder> target,
                         [encoder setBuffer:model.weights
                                     offset:metal_weight_offset(model, embedding)
                                    atIndex:0];
-                        [encoder setBuffer:session.tokens offset:0 atIndex:1];
-                        [encoder setBuffer:session.x offset:0 atIndex:2];
+                        [encoder setBuffer:workspace.tokens offset:0 atIndex:1];
+                        [encoder setBuffer:workspace.x offset:0 atIndex:2];
                       });
 }
 
@@ -439,15 +535,15 @@ static void metal_encode_matvec(id<MTLComputeCommandEncoder> target,
         });
 }
 
-/* Stage FP32 activations as BF16 in the session's staging buffer. */
+/* Stage FP32 activations as BF16 in the workspace staging buffer. */
 static void metal_encode_stage(id<MTLComputeCommandEncoder> target,
                                KippMetalModel *model,
-                               KippMetalSession *session,
+                               KippMetalWorkspace *workspace,
                                id<MTLBuffer> input, uint32_t count) {
     metal_enc_threads(target, metal_pipeline(model, @"kipp_bf16_stage"),
                       count, 1, ^(id<MTLComputeCommandEncoder> encoder) {
                         [encoder setBuffer:input offset:0 atIndex:0];
-                        [encoder setBuffer:session.staging
+                        [encoder setBuffer:workspace.staging
                                     offset:0
                                    atIndex:1];
                         [encoder setBytes:&count
@@ -463,7 +559,7 @@ static void metal_encode_stage(id<MTLComputeCommandEncoder> target,
  */
 static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
                                     KippMetalModel *model,
-                                    KippMetalSession *session,
+                                    KippMetalWorkspace *workspace,
                                     const kipp_tensor_view *weight,
                                     id<MTLBuffer> input, id<MTLBuffer> output,
                                     uint32_t rows, uint32_t columns,
@@ -474,17 +570,21 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
         return;
     }
     NSString *name = @"kipp_matmul_bf16";
-    id<MTLBuffer> activations = session.staging;
+    id<MTLBuffer> activations = workspace.staging;
+    NSUInteger tokenTile = KIPP_METAL_MM_TOKEN_TILE;
     if (weight->type == KIPP_TENSOR_Q8_0) {
         name = @"kipp_matmul_q8_0";
         activations = input;
+        tokenTile = KIPP_METAL_MM_QUANT_TOKEN_TILE;
     } else if (weight->type == KIPP_TENSOR_AFFINE4_GS32) {
         name = @"kipp_matmul_affine4";
         activations = input;
+        tokenTile = KIPP_METAL_MM_QUANT_TOKEN_TILE;
     }
     metal_matvec_params params = {rows, columns, tokenCount};
-    NSUInteger rowGroups = (rows + 127u) / 128u;
-    NSUInteger tokenGroups = (tokenCount + 15u) / 16u;
+    NSUInteger rowGroups =
+        (rows + KIPP_METAL_MM_ROWS_PER_GROUP - 1u) / KIPP_METAL_MM_ROWS_PER_GROUP;
+    NSUInteger tokenGroups = (tokenCount + tokenTile - 1u) / tokenTile;
     metal_enc_groups(
         target, metal_pipeline(model, name), rowGroups, tokenGroups,
         KIPP_METAL_GROUP_THREADS, ^(id<MTLComputeCommandEncoder> encoder) {
@@ -650,13 +750,13 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
 
 static void metal_encode_residual(id<MTLComputeCommandEncoder> target,
                                   KippMetalModel *model,
-                                  KippMetalSession *session,
+                                  KippMetalWorkspace *workspace,
                                   uint32_t tokenCount) {
     uint32_t count = model.config.embedding_length * tokenCount;
     metal_enc_threads(target, metal_pipeline(model, @"kipp_residual_add"),
                    count, 1, ^(id<MTLComputeCommandEncoder> encoder) {
-                     [encoder setBuffer:session.x offset:0 atIndex:0];
-                     [encoder setBuffer:session.projection
+                     [encoder setBuffer:workspace.x offset:0 atIndex:0];
+                     [encoder setBuffer:workspace.projection
                                  offset:0
                                 atIndex:1];
                      [encoder setBytes:&count length:sizeof(count) atIndex:2];
@@ -665,13 +765,13 @@ static void metal_encode_residual(id<MTLComputeCommandEncoder> target,
 
 static void metal_encode_swiglu(id<MTLComputeCommandEncoder> target,
                                 KippMetalModel *model,
-                                KippMetalSession *session,
+                                KippMetalWorkspace *workspace,
                                 uint32_t tokenCount) {
     uint32_t count = model.config.feed_forward_length * tokenCount;
     metal_enc_threads(target, metal_pipeline(model, @"kipp_swiglu"),
                    count, 1, ^(id<MTLComputeCommandEncoder> encoder) {
-                     [encoder setBuffer:session.gate offset:0 atIndex:0];
-                     [encoder setBuffer:session.up offset:0 atIndex:1];
+                     [encoder setBuffer:workspace.gate offset:0 atIndex:0];
+                     [encoder setBuffer:workspace.up offset:0 atIndex:1];
                      [encoder setBytes:&count length:sizeof(count) atIndex:2];
                    });
 }
@@ -687,7 +787,7 @@ static void metal_encode_swiglu(id<MTLComputeCommandEncoder> target,
  */
 static void metal_encode_lm_head(id<MTLComputeCommandEncoder> target,
                                  KippMetalModel *model,
-                                 KippMetalSession *workspace,
+                                 KippMetalWorkspace *workspace,
                                  NSUInteger logitsOffset, uint32_t rows,
                                  bool forceVector) {
     const kipp_tensor_view *lmHead = &model.view->weights.lm_head;
@@ -702,8 +802,10 @@ static void metal_encode_lm_head(id<MTLComputeCommandEncoder> target,
     metal_encode_stage(target, model, workspace, workspace.normalized,
                        columns * rows);
     metal_matvec_params params = {KIPP_VOCAB_SIZE, columns, rows};
-    NSUInteger rowGroups = (KIPP_VOCAB_SIZE + 127u) / 128u;
-    NSUInteger tokenGroups = ((NSUInteger)rows + 15u) / 16u;
+    NSUInteger rowGroups = (KIPP_VOCAB_SIZE + KIPP_METAL_MM_ROWS_PER_GROUP -
+                            1u) / KIPP_METAL_MM_ROWS_PER_GROUP;
+    NSUInteger tokenGroups = ((NSUInteger)rows + KIPP_METAL_MM_TOKEN_TILE -
+                              1u) / KIPP_METAL_MM_TOKEN_TILE;
     metal_enc_groups(
         target, metal_pipeline(model, @"kipp_matmul_bf16"), rowGroups,
         tokenGroups, KIPP_METAL_GROUP_THREADS,
@@ -739,7 +841,7 @@ typedef struct {
  * fills the workspace token buffer first. One blocking wait per round.
  */
 static int metal_encode_round(KippMetalModel *model,
-                              KippMetalSession *workspace,
+                              KippMetalWorkspace *workspace,
                               const metal_round_part *parts,
                               uint32_t partCount, uint32_t totalTokens,
                               bool forceVector, kipp_error *error) {
@@ -762,6 +864,12 @@ static int metal_encode_round(KippMetalModel *model,
      * matvec, which is what keeps speculative output token-identical to
      * plain greedy decoding — the matrix kernels' different summation order
      * would flip near-tie argmaxes. */
+    if (totalTokens > workspace.tokenCapacity) {
+        return metal_fail(error, KIPP_ERROR_INTERNAL,
+                          "round of %u tokens exceeds the %u-token activation "
+                          "workspace",
+                          totalTokens, workspace.tokenCapacity);
+    }
     bool useMatrix = model.matrixKernelAvailable &&
                      totalTokens >= KIPP_METAL_TOKEN_TILE && !forceVector;
     /* Only the BF16 matrix kernel consumes staged BF16 activations; the
@@ -913,11 +1021,27 @@ typedef struct {
  * unfinished item into the shared workspace, so projections read the
  * weights once per round for all sequences.
  */
+/*
+ * Tokens to encode in one round. A round that forces the vector kernels also
+ * takes the streaming attention kernel, which indexes gqaPartials per token, so
+ * it is capped at the narrow partial-buffer width; matrix rounds get the full
+ * workspace. Multi-row evaluation is separately bounded by the logit-row cap.
+ */
+static uint32_t metal_round_token_limit(KippMetalModel *model, uint32_t rows,
+                                       const kipp_eval_item *item) {
+    bool streams = (rows > 1 && !item->relaxed_order) || model.forceVectorTest;
+    uint32_t limit = streams ? model.partialTokens : model.prefillTokens;
+    if (limit > model.workspace.tokenCapacity) {
+        limit = model.workspace.tokenCapacity;
+    }
+    return limit < 1u ? 1u : limit;
+}
+
 static int metal_eval_multi(KippMetalModel *model, kipp_eval_item *items,
                             size_t itemCount, kipp_error *error) {
-    KippMetalSession *workspace = model.oracleSession;
-    metal_batch_cursor cursors[KIPP_METAL_BATCH];
-    uint32_t initialLengths[KIPP_METAL_BATCH];
+    KippMetalWorkspace *workspace = model.workspace;
+    metal_batch_cursor cursors[KIPP_METAL_LOGIT_ROWS];
+    uint32_t initialLengths[KIPP_METAL_LOGIT_ROWS];
     for (size_t index = 0; index < itemCount; ++index) {
         kipp_eval_item *item = &items[index];
         if (item->session == NULL) {
@@ -971,8 +1095,18 @@ static int metal_eval_multi(KippMetalModel *model, kipp_eval_item *items,
         if (active == 0) {
             break;
         }
-        uint32_t quota = KIPP_METAL_BATCH / active;
-        metal_round_part parts[KIPP_METAL_BATCH];
+        /* A streaming round indexes gqaPartials per token, so it is bounded
+         * by that buffer's width rather than by the workspace. */
+        uint32_t roundLimit = model.forceVectorTest ? model.partialTokens
+                                                   : model.prefillTokens;
+        if (roundLimit > model.workspace.tokenCapacity) {
+            roundLimit = model.workspace.tokenCapacity;
+        }
+        uint32_t quota = roundLimit / active;
+        if (quota == 0) {
+            quota = 1;
+        }
+        metal_round_part parts[KIPP_METAL_LOGIT_ROWS];
         uint32_t partCount = 0;
         uint32_t slot = 0;
         for (size_t index = 0; index < itemCount; ++index) {
@@ -1007,7 +1141,7 @@ static int metal_eval_multi(KippMetalModel *model, kipp_eval_item *items,
             ++partCount;
         }
         if (metal_encode_round(model, workspace, parts, partCount, slot,
-                               false, error) != 0) {
+                               model.forceVectorTest, error) != 0) {
             for (size_t index = 0; index < itemCount; ++index) {
                 if (!cursors[index].session.pooled) {
                     cursors[index].session.length = initialLengths[index];
@@ -1021,6 +1155,54 @@ static int metal_eval_multi(KippMetalModel *model, kipp_eval_item *items,
             cursors[index].session.length +=
                 cursors[index].item->token_count;
         }
+    }
+    return 0;
+}
+
+/*
+ * Read the projection kernels' own tile geometry back out of the compiled
+ * library and compare it against the host mirrors. The host derives every
+ * matmul dispatch grid from KIPP_METAL_MM_*, so a one-sided edit to
+ * metal/kipp_kernels.metal would silently mis-shape the grid: too short and
+ * trailing tokens are never computed, too tall and the extra threadgroups are
+ * wasted (the kernels guard the unsigned wrap that used to make them write out
+ * of bounds). Neither shows up as a compile error, so check it at model open.
+ */
+static int metal_verify_mm_geometry(
+    id<MTLDevice> device,
+    NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines,
+    kipp_error *error) {
+    id<MTLComputePipelineState> pipeline = pipelines[@"kipp_mm_geometry"];
+    if (pipeline == nil) {
+        return 0;
+    }
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLBuffer> values = metal_new_shared_buffer(device, 4 * sizeof(uint32_t));
+    if (queue == nil || values == nil) {
+        return metal_fail(error, KIPP_ERROR_MEMORY,
+                          "unable to allocate the matmul geometry probe");
+    }
+    id<MTLCommandBuffer> command = [queue commandBuffer];
+    metal_dispatch(command, pipeline, 1,
+                   ^(id<MTLComputeCommandEncoder> encoder) {
+                     [encoder setBuffer:values offset:0 atIndex:0];
+                   });
+    if (metal_commit_and_wait(command, error) != 0) {
+        return -1;
+    }
+    const uint32_t *shader = (const uint32_t *)values.contents;
+    uint32_t hostRows = KIPP_METAL_MM_ROWS_PER_GROUP;
+    if (shader[0] != KIPP_METAL_MM_TOKEN_TILE ||
+        shader[1] * shader[2] != hostRows ||
+        shader[3] != KIPP_METAL_MM_QUANT_TOKEN_TILE) {
+        return metal_fail(
+            error, KIPP_ERROR_UNSUPPORTED,
+            "matmul tile geometry drifted: shader reports %u/%u tokens "
+            "(bf16/quantized) and %u rows per threadgroup, host expects "
+            "%u/%u and %u",
+            shader[0], shader[3], shader[1] * shader[2],
+            KIPP_METAL_MM_TOKEN_TILE, KIPP_METAL_MM_QUANT_TOKEN_TILE,
+            hostRows);
     }
     return 0;
 }
@@ -1056,6 +1238,20 @@ static int metal_compile_pipelines(
                           "Metal runtime shader compilation failed: %s",
                           libraryError.localizedDescription.UTF8String);
     }
+    /* A silent drop to the vector path once cost two days of benchmarking to a
+     * reserved-keyword typo that every correctness gate still passed. Gates and
+     * benchmarks set KIPP_METAL_REQUIRE_MMA=1 so that degradation is a load
+     * failure rather than a warning on stderr. */
+    if (!matrixKernel) {
+        const char *require = getenv("KIPP_METAL_REQUIRE_MMA");
+        if (require != NULL && require[0] == '1') {
+            return metal_fail(
+                error, KIPP_ERROR_UNSUPPORTED,
+                "KIPP_METAL_REQUIRE_MMA is set but the simdgroup-matrix "
+                "kernels did not compile: %s",
+                libraryError.localizedDescription.UTF8String);
+        }
+    }
     /* The matvec kernel is specialized twice through function constant 0:
      * a one-token variant for decode and a KIPP_METAL_TOKEN_TILE variant
      * that reuses each weight read across prefill tokens. Constants 1 and 2
@@ -1082,6 +1278,7 @@ static int metal_compile_pipelines(
         tiles[@"kipp_matmul_q8_0"] = @0;
         tiles[@"kipp_matmul_affine4"] = @0;
         tiles[@"kipp_flash_gqa_prefill"] = @0;
+        tiles[@"kipp_mm_geometry"] = @0;
     }
     NSMutableDictionary *pipelines =
         [NSMutableDictionary dictionaryWithCapacity:tiles.count];
@@ -1141,6 +1338,9 @@ static int metal_compile_pipelines(
                 (unsigned long)pipeline.maxTotalThreadsPerThreadgroup);
         }
         pipelines[name] = pipeline;
+    }
+    if (metal_verify_mm_geometry(device, pipelines, error) != 0) {
+        return -1;
     }
     *outLibrary = library;
     *outPipelines = pipelines;
@@ -1204,15 +1404,52 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
         model.config = view->config;
         model.matrixKernelAvailable = matrixKernel;
         model.batchLogits = metal_new_shared_buffer(
-            device, (NSUInteger)KIPP_METAL_BATCH * KIPP_VOCAB_SIZE *
+            device, (NSUInteger)KIPP_METAL_LOGIT_ROWS * KIPP_VOCAB_SIZE *
                         sizeof(float));
         if (model.batchLogits == nil) {
             return metal_fail(error, KIPP_ERROR_MEMORY,
                               "unable to allocate batched logits storage");
         }
+        /*
+         * Widen the round until it stops fitting the memory budget. Only the
+         * streaming attention kernel indexes gqaPartials per token, so a round
+         * that takes the matrix kernel leaves that buffer narrow; Q8_0 KV and
+         * devices without the matrix kernels always stream, so there it has to
+         * track the round. Keeping it narrow otherwise matters for speed as
+         * well as memory -- decode reads this buffer every step.
+         */
+        BOOL alwaysStreams =
+            !matrixKernel || view->config.kv_quant != KIPP_KV_QUANT_BF16;
+        uint64_t perToken = metal_workspace_bytes_per_token(view->config);
+        uint64_t perTokenPartials =
+            (uint64_t)view->config.attention_head_count *
+            KIPP_METAL_KSPLIT_MAX * KIPP_METAL_KSPLIT_STRIDE * sizeof(float);
+        uint64_t budget = KIPP_METAL_WORKSPACE_BUDGET_BYTES;
+        uint64_t deviceBudget = (uint64_t)device.recommendedMaxWorkingSetSize / 32u;
+        if (deviceBudget != 0 && deviceBudget < budget) {
+            budget = deviceBudget;
+        }
+        uint32_t prefillTokens = KIPP_METAL_PREFILL_TOKENS;
+        while (prefillTokens > KIPP_METAL_PREFILL_TOKENS_MIN) {
+            uint64_t partialTokens =
+                alwaysStreams ? prefillTokens : KIPP_METAL_PREFILL_TOKENS_MIN;
+            if ((uint64_t)prefillTokens * perToken +
+                    partialTokens * perTokenPartials <=
+                budget) {
+                break;
+            }
+            prefillTokens /= 2u;
+        }
+        model.prefillTokens = prefillTokens;
+        model.partialTokens =
+            alwaysStreams ? prefillTokens : KIPP_METAL_PREFILL_TOKENS_MIN;
+        model.workspace = metal_workspace_new(model, prefillTokens, error);
+        if (model.workspace == nil) {
+            return -1;
+        }
         model.gqaPartials = metal_new_shared_buffer(
             device, (NSUInteger)view->config.attention_head_count *
-                        KIPP_METAL_KSPLIT_MAX * KIPP_METAL_BATCH *
+                        KIPP_METAL_KSPLIT_MAX * model.partialTokens *
                         KIPP_METAL_KSPLIT_STRIDE * sizeof(float));
         if (model.gqaPartials == nil) {
             return metal_fail(error, KIPP_ERROR_MEMORY,
@@ -1336,10 +1573,10 @@ static int metal_eval(void *backendModel, kipp_eval_item *items,
             }
         }
         if (itemCount > 1) {
-            if (itemCount > KIPP_METAL_BATCH) {
+            if (itemCount > KIPP_METAL_LOGIT_ROWS) {
                 return metal_fail(error, KIPP_ERROR_RANGE,
                                   "Metal batch accepts at most %u items",
-                                  KIPP_METAL_BATCH);
+                                  KIPP_METAL_LOGIT_ROWS);
             }
             return metal_eval_multi(model, items, itemCount, error);
         }
@@ -1399,16 +1636,18 @@ static int metal_eval(void *backendModel, kipp_eval_item *items,
                               "logits_count %u exceeds token_count %u", rows,
                               item->token_count);
         }
-        if (rows > 1 && item->token_count > KIPP_METAL_BATCH) {
+        if (rows > 1 && item->token_count > KIPP_METAL_LOGIT_ROWS) {
             return metal_fail(
                 error, KIPP_ERROR_UNSUPPORTED,
-                "multi-row logits require token_count <= %u", KIPP_METAL_BATCH);
+                "multi-row logits require token_count <= %u",
+                KIPP_METAL_LOGIT_ROWS);
         }
         uint32_t initialLength = session.length;
+        uint32_t roundLimit = metal_round_token_limit(model, rows, item);
         for (uint32_t done = 0; done < item->token_count;) {
             uint32_t batch = item->token_count - done;
-            if (batch > KIPP_METAL_BATCH) {
-                batch = KIPP_METAL_BATCH;
+            if (batch > roundLimit) {
+                batch = roundLimit;
             }
             bool finalBatch = done + batch == item->token_count;
             metal_round_part part = {
@@ -1420,14 +1659,15 @@ static int metal_eval(void *backendModel, kipp_eval_item *items,
                 0,
                 finalBatch ? rows : 0,
             };
-            memcpy(session.tokens.contents, item->tokens + done,
+            memcpy(model.workspace.tokens.contents, item->tokens + done,
                    (size_t)batch * sizeof(uint32_t));
             /* Multi-row rounds force the vector kernels so every logit row
              * reproduces the decode path bitwise (the speculative-verify
              * contract). Scored evaluation (relaxed_order) opts out and
              * takes the matrix kernels within the 1e-4 tolerance. */
-            bool forceVector = rows > 1 && !item->relaxed_order;
-            if (metal_encode_round(model, session, &part, 1, batch,
+            bool forceVector =
+                (rows > 1 && !item->relaxed_order) || model.forceVectorTest;
+            if (metal_encode_round(model, model.workspace, &part, 1, batch,
                                    forceVector, error) != 0) {
                 if (!session.pooled) {
                     session.length = initialLength;
@@ -1473,6 +1713,15 @@ int kipp_metal_test_set_ksplit_cap(void *backendModel, uint32_t cap) {
     }
     KippMetalModel *model = (__bridge KippMetalModel *)backendModel;
     model.ksplitCap = cap;
+    return 0;
+}
+
+int kipp_metal_test_force_vector(void *backendModel, int force) {
+    if (backendModel == NULL) {
+        return -1;
+    }
+    KippMetalModel *model = (__bridge KippMetalModel *)backendModel;
+    model.forceVectorTest = force != 0;
     return 0;
 }
 
@@ -1975,8 +2224,10 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             enum {
                 QM_ROWS = 64,
                 QM_COLS = 64,
-                QM_TOKENS = 19,
-                QM_PADDED_TOKENS = 32,
+                /* Spans every token fragment of the widest tile and still
+                 * leaves a ragged tail in the following tile. */
+                QM_TOKENS = 35,
+                QM_PADDED_TOKENS = 64,
                 QM_BLOCKS = QM_COLS / 32,
                 QM_Q8_ROW_BYTES = QM_BLOCKS * 34,
                 QM_A4_ROW_BYTES = QM_BLOCKS * 20
@@ -2074,7 +2325,11 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                     device, (NSUInteger)QM_TOKENS * QM_ROWS * sizeof(float));
                 id<MTLCommandBuffer> command = [queue commandBuffer];
                 metal_dispatch_groups(
-                    command, pipelines[cases[index].pipeline], 1, 2,
+                    command, pipelines[cases[index].pipeline],
+                    (QM_ROWS + KIPP_METAL_MM_ROWS_PER_GROUP - 1u) /
+                        KIPP_METAL_MM_ROWS_PER_GROUP,
+                    (QM_TOKENS + KIPP_METAL_MM_QUANT_TOKEN_TILE - 1u) /
+                        KIPP_METAL_MM_QUANT_TOKEN_TILE,
                     KIPP_METAL_GROUP_THREADS,
                     ^(id<MTLComputeCommandEncoder> encoder) {
                       [encoder setBuffer:weightBuffer offset:0 atIndex:0];
@@ -2224,6 +2479,133 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                                       "Metal cached GQA mismatch at head %u",
                                       head);
                 }
+            }
+        }
+
+        /*
+         * Matrix prefill attention against the streaming kernel over the same
+         * cache. kipp_flash_gqa_prefill had no operator-level test at all: it
+         * is only reachable at KIPP_METAL_FA_QUERIES tokens or more, which the
+         * three-token pinned vectors never hit. A hermetic comparison here
+         * catches tiling and masking mistakes in seconds instead of waiting on
+         * a model-backed gate.
+         *
+         * The token count is deliberately ragged (not a multiple of the
+         * 8-query tile) so the tail path is covered, and positions stay under
+         * KIPP_METAL_KSPLIT_CHUNK so the streaming side is single-split and
+         * needs no partial-merge pass.
+         */
+        if (pipelines[@"kipp_flash_gqa_prefill"] != nil) {
+            /* FA_BLOCK_TOKENS mirrors the shift baked into kipp_kv_slot
+             * (position >> 5, position & 31) in metal/kipp_kernels.metal.
+             * Capacity spans two blocks so the reversed page table below is a
+             * real permutation rather than the identity. */
+            enum { FA_TOKENS = 21, FA_CAPACITY = 64, FA_BLOCK_TOKENS = 32 };
+            const size_t kvValues = (size_t)FA_CAPACITY *
+                                    KIPP_ATTENTION_HEAD_COUNT_KV *
+                                    KIPP_ATTENTION_HEAD_DIM;
+            const size_t queryValues = (size_t)FA_TOKENS * KIPP_TEST_Q_HEADS *
+                                       KIPP_ATTENTION_HEAD_DIM;
+            id<MTLBuffer> keyCache =
+                metal_new_shared_buffer(device, kvValues * sizeof(uint16_t));
+            id<MTLBuffer> valueCache =
+                metal_new_shared_buffer(device, kvValues * sizeof(uint16_t));
+            id<MTLBuffer> queryBuffer =
+                metal_new_shared_buffer(device, queryValues * sizeof(float));
+            id<MTLBuffer> matrixOut =
+                metal_new_shared_buffer(device, queryValues * sizeof(float));
+            id<MTLBuffer> streamOut =
+                metal_new_shared_buffer(device, queryValues * sizeof(float));
+            id<MTLBuffer> partials = metal_new_shared_buffer(
+                device, (size_t)KIPP_TEST_Q_HEADS * KIPP_METAL_KSPLIT_MAX *
+                            FA_TOKENS * KIPP_METAL_KSPLIT_STRIDE *
+                            sizeof(float));
+            id<MTLBuffer> blockTable = metal_new_shared_buffer(
+                device, (FA_CAPACITY / FA_BLOCK_TOKENS) * sizeof(uint32_t));
+            if (keyCache == nil || valueCache == nil || queryBuffer == nil ||
+                matrixOut == nil || streamOut == nil || partials == nil ||
+                blockTable == nil) {
+                return metal_fail(error, KIPP_ERROR_MEMORY,
+                                  "unable to allocate prefill-attention test "
+                                  "buffers");
+            }
+            /* Reversed page table: the comparison then also depends on both
+             * kernels resolving blocks identically, not just on their math. */
+            uint32_t blockCount = FA_CAPACITY / FA_BLOCK_TOKENS;
+            for (uint32_t block = 0; block < blockCount; ++block) {
+                ((uint32_t *)blockTable.contents)[block] =
+                    blockCount - 1u - block;
+            }
+            /* Deterministic, non-degenerate data: a constant cache would make
+             * every score equal and hide masking and rescaling bugs. */
+            uint16_t *keyValues = keyCache.contents;
+            uint16_t *valueValues = valueCache.contents;
+            for (size_t index = 0; index < kvValues; ++index) {
+                keyValues[index] =
+                    metal_test_float_to_bf16(sinf((float)index * 0.031f));
+                valueValues[index] =
+                    metal_test_float_to_bf16(cosf((float)index * 0.017f));
+            }
+            float *queryValuesHost = queryBuffer.contents;
+            for (size_t index = 0; index < queryValues; ++index) {
+                queryValuesHost[index] = sinf((float)index * 0.011f) * 0.5f;
+            }
+            metal_kv_params faParams = {0, 0, FA_TOKENS, FA_CAPACITY, 0};
+            void (^bindFa)(id<MTLComputeCommandEncoder>, id<MTLBuffer>) =
+                ^(id<MTLComputeCommandEncoder> encoder, id<MTLBuffer> out) {
+                  [encoder setBuffer:queryBuffer offset:0 atIndex:0];
+                  [encoder setBuffer:keyCache offset:0 atIndex:1];
+                  [encoder setBuffer:valueCache offset:0 atIndex:2];
+                  [encoder setBuffer:out offset:0 atIndex:3];
+                  [encoder setBytes:&faParams
+                             length:sizeof(faParams)
+                            atIndex:4];
+                  [encoder setBuffer:blockTable offset:0 atIndex:5];
+                  [encoder setBuffer:partials offset:0 atIndex:6];
+                };
+            id<MTLCommandBuffer> faCommand = [queue commandBuffer];
+            metal_dispatch_groups(
+                faCommand, pipelines[@"kipp_flash_gqa_prefill"],
+                KIPP_TEST_Q_HEADS,
+                (FA_TOKENS + KIPP_METAL_FA_QUERIES - 1) /
+                    KIPP_METAL_FA_QUERIES,
+                32, ^(id<MTLComputeCommandEncoder> encoder) {
+                  bindFa(encoder, matrixOut);
+                });
+            metal_enc_groups_3d_command(
+                faCommand, pipelines[@"kipp_flash_gqa"], KIPP_TEST_Q_HEADS, 1,
+                FA_TOKENS, KIPP_METAL_GQA_THREADS,
+                ^(id<MTLComputeCommandEncoder> encoder) {
+                  bindFa(encoder, streamOut);
+                });
+            if (metal_commit_and_wait(faCommand, error) != 0) {
+                return -1;
+            }
+            const float *matrixValues = matrixOut.contents;
+            const float *streamValues = streamOut.contents;
+            double numerator = 0.0;
+            double denominator = 0.0;
+            for (size_t index = 0; index < queryValues; ++index) {
+                double difference =
+                    (double)matrixValues[index] - (double)streamValues[index];
+                numerator += difference * difference;
+                denominator +=
+                    (double)streamValues[index] * (double)streamValues[index];
+            }
+            double nmse = denominator > 0.0 ? numerator / denominator : numerator;
+            /* The two kernels cannot agree bitwise: kipp_flash_gqa keeps the
+             * query in FP32 (float4 q = query4[lane]) while the matrix kernel
+             * stages an 8x128 BF16 query tile for simdgroup_load. An 8-bit
+             * mantissa over a 128-wide dot product puts the floor near 2e-6,
+             * which is what this comparison measures; 1e-5 leaves room for that
+             * without admitting a real tiling or masking fault, and stays far
+             * inside the 1e-4 the model-backed gates enforce. */
+            if (!(nmse <= 1.0e-5)) {
+                return metal_fail(
+                    error, KIPP_ERROR_INTERNAL,
+                    "matrix prefill attention diverges from the streaming "
+                    "kernel over %d tokens (nmse=%g)",
+                    FA_TOKENS, nmse);
             }
         }
     }

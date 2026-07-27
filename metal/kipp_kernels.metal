@@ -769,8 +769,36 @@ kernel void kipp_bf16_stage(device const float *input [[buffer(0)]],
 constant uint KIPP_MM_SIMDGROUPS = 4;
 constant uint KIPP_MM_ROWS_PER_SIMDGROUP = 32;
 constant uint KIPP_MM_ROW_FRAGMENTS = KIPP_MM_ROWS_PER_SIMDGROUP / 8;
-constant uint KIPP_MM_TOKEN_FRAGMENTS = 2;
+constant uint KIPP_MM_TOKEN_FRAGMENTS = 4;
 constant uint KIPP_MM_TOKEN_TILE = KIPP_MM_TOKEN_FRAGMENTS * 8;
+/*
+ * The quantized kernels keep a narrower token tile than the BF16 one. They
+ * already spend ~16.9 KiB of threadgroup memory staging dequantized weights,
+ * and doubling the accumulator fragments on top of that collapses occupancy:
+ * measured at 2,048 tokens, a 32-token tile takes Q8_0 prefill from 1139 to
+ * 135 tok/s while it *gains* 7% for BF16. Tile width is therefore a property
+ * of each kernel, not of the projection layer.
+ */
+constant uint KIPP_MM_QUANT_TOKEN_FRAGMENTS = 2;
+constant uint KIPP_MM_QUANT_TOKEN_TILE = KIPP_MM_QUANT_TOKEN_FRAGMENTS * 8;
+
+/*
+ * The host mirrors the tile geometry above to size matmul dispatch grids
+ * (KIPP_METAL_MM_TOKEN_TILE and KIPP_METAL_MM_ROWS_PER_GROUP in
+ * src/metal/kipp_metal.m). Drift between the two silently mis-shapes every
+ * projection, so model open reads these values back from the compiled library
+ * instead of trusting that both sides were edited together.
+ */
+kernel void kipp_mm_geometry(device uint *values [[buffer(0)]],
+                             uint index [[thread_position_in_grid]]) {
+    if (index != 0) {
+        return;
+    }
+    values[0] = KIPP_MM_TOKEN_TILE;
+    values[1] = KIPP_MM_ROWS_PER_SIMDGROUP;
+    values[2] = KIPP_MM_SIMDGROUPS;
+    values[3] = KIPP_MM_QUANT_TOKEN_TILE;
+}
 
 kernel void kipp_matmul_bf16(device const ushort *weight [[buffer(0)]],
                              device const ushort *input [[buffer(1)]],
@@ -786,6 +814,14 @@ kernel void kipp_matmul_bf16(device const ushort *weight [[buffer(0)]],
         return;
     }
     uint token_base = group_id.y * KIPP_MM_TOKEN_TILE;
+    /* A host grid taller than the token count would wrap the subtraction
+     * below and process a full phantom tile, writing past `output`. The host
+     * derives its grid from KIPP_METAL_MM_TOKEN_TILE, which the geometry probe
+     * pins to KIPP_MM_TOKEN_TILE at model open; this keeps a mismatch to
+     * wasted threadgroups rather than memory corruption. */
+    if (token_base >= params.token_count) {
+        return;
+    }
     uint tile = min(KIPP_MM_TOKEN_TILE, params.token_count - token_base);
     device const bfloat *w = (device const bfloat *)weight;
     device const bfloat *x = (device const bfloat *)input;
@@ -901,14 +937,18 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
     if (row_base >= params.rows) {
         return;
     }
-    uint token_base = group_id.y * KIPP_MM_TOKEN_TILE;
-    uint tile = min(KIPP_MM_TOKEN_TILE, params.token_count - token_base);
+    uint token_base = group_id.y * KIPP_MM_QUANT_TOKEN_TILE;
+    /* See kipp_matmul_bf16: guards the unsigned wrap on an over-tall grid. */
+    if (token_base >= params.token_count) {
+        return;
+    }
+    uint tile = min(KIPP_MM_QUANT_TOKEN_TILE, params.token_count - token_base);
     uint blocks = params.columns / KIPP_MM_BLOCK;
 
     simdgroup_float8x8 accumulators[KIPP_MM_ROW_FRAGMENTS]
-                                   [KIPP_MM_TOKEN_FRAGMENTS];
+                                   [KIPP_MM_QUANT_TOKEN_FRAGMENTS];
     for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
-        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+        for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
             accumulators[row_block][tf] = simdgroup_float8x8(0.0f);
         }
     }
@@ -926,8 +966,8 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
         uint column = block * KIPP_MM_BLOCK;
         for (uint sub = 0; sub < KIPP_MM_BLOCK / 8u; ++sub) {
-            simdgroup_float8x8 activation[KIPP_MM_TOKEN_FRAGMENTS];
-            for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+            simdgroup_float8x8 activation[KIPP_MM_QUANT_TOKEN_FRAGMENTS];
+            for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
                 if (tf < token_blocks) {
                     simdgroup_load(activation[tf],
                                    input + (ulong)(token_base + tf * 8u) *
@@ -943,7 +983,7 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
                     weights,
                     &staged_weights[group][row_block * 8u][sub * 8u],
                     KIPP_MM_STAGED_STRIDE);
-                for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+                for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
                     if (tf < token_blocks) {
                         simdgroup_multiply_accumulate(
                             accumulators[row_block][tf], weights,
@@ -955,7 +995,7 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
-        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+        for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
             uint sub_base = token_base + tf * 8u;
             if (sub_base >= params.token_count) {
                 continue;
@@ -1002,14 +1042,18 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
     if (row_base >= params.rows) {
         return;
     }
-    uint token_base = group_id.y * KIPP_MM_TOKEN_TILE;
-    uint tile = min(KIPP_MM_TOKEN_TILE, params.token_count - token_base);
+    uint token_base = group_id.y * KIPP_MM_QUANT_TOKEN_TILE;
+    /* See kipp_matmul_bf16: guards the unsigned wrap on an over-tall grid. */
+    if (token_base >= params.token_count) {
+        return;
+    }
+    uint tile = min(KIPP_MM_QUANT_TOKEN_TILE, params.token_count - token_base);
     uint groups = params.columns / KIPP_MM_BLOCK;
 
     simdgroup_float8x8 accumulators[KIPP_MM_ROW_FRAGMENTS]
-                                   [KIPP_MM_TOKEN_FRAGMENTS];
+                                   [KIPP_MM_QUANT_TOKEN_FRAGMENTS];
     for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
-        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+        for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
             accumulators[row_block][tf] = simdgroup_float8x8(0.0f);
         }
     }
@@ -1031,8 +1075,8 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
         uint column = quant_group * KIPP_MM_BLOCK;
         for (uint sub = 0; sub < KIPP_MM_BLOCK / 8u; ++sub) {
-            simdgroup_float8x8 activation[KIPP_MM_TOKEN_FRAGMENTS];
-            for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+            simdgroup_float8x8 activation[KIPP_MM_QUANT_TOKEN_FRAGMENTS];
+            for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
                 if (tf < token_blocks) {
                     simdgroup_load(activation[tf],
                                    input + (ulong)(token_base + tf * 8u) *
@@ -1048,7 +1092,7 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
                     weights,
                     &staged_weights[group][row_block * 8u][sub * 8u],
                     KIPP_MM_STAGED_STRIDE);
-                for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+                for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
                     if (tf < token_blocks) {
                         simdgroup_multiply_accumulate(
                             accumulators[row_block][tf], weights,
@@ -1060,7 +1104,7 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
-        for (uint tf = 0; tf < KIPP_MM_TOKEN_FRAGMENTS; ++tf) {
+        for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
             uint sub_base = token_base + tf * 8u;
             if (sub_base >= params.token_count) {
                 continue;
@@ -1131,6 +1175,12 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
     uint head = group_id.x;
     uint kv_head = head / (KIPP_Q_HEADS / KIPP_KV_HEADS);
     uint tile_first = group_id.y * KIPP_FA_QUERIES;
+    /* As in the matmul kernels: an over-tall grid would wrap the subtraction
+     * and stage a phantom query tile. No cross-simdgroup barrier runs before
+     * this point, so returning early is safe. */
+    if (tile_first >= params.token_count) {
+        return;
+    }
     uint tile_rows = min(KIPP_FA_QUERIES, params.token_count - tile_first);
     const float scale = rsqrt(float(KIPP_HEAD_DIM));
     ulong head_offset = ulong(kv_head) * KIPP_HEAD_DIM;
