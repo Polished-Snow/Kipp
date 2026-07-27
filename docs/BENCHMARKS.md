@@ -50,16 +50,22 @@ record results from a fallback build. Current reference numbers
 (Qwen3-4B, Metal, greedy; every value traces to a committed
 `bench/results/*.json`):
 
-- Decode tok/s (64 tokens, median of 5): BF16 **60.7**, Q8_0 **97.9**,
-  affine4 **130**.
+- Decode tok/s (64 tokens, median of 5): BF16 **59.8**, Q8_0 **94.3**,
+  affine4 **127.9**. These are 1–4% below the figures recorded before the
+  prefill work (60.7 / 97.9 / 130) purely as session drift: the controlled
+  back-to-back A/B in "Prefill round shape" measures decode unchanged on all
+  three schemes, and the whole campaign was re-run in one session so the
+  numbers stay comparable with each other.
 - Wikitext-2 perplexity (full test set, 2,048-token windows): BF16
   **7.731**, Q8_0 **7.733** (+0.02%), affine4 **8.171** (+5.7%) — Q8_0 is
   effectively lossless; affine4 is Q4-class.
-- Prefill tok/s (348-token / 2,048-token prompt): BF16 **528 / 481**,
-  Q8_0 **488 / 441**, affine4 **509 / 466**. The simdgroup-matrix kernels
-  dequantize once per 16-token tile, so quantized prefill stays near BF16
-  parity; the O(n²) attention tail brings Q8_0 prefill from ~485 tok/s at
-  short context to **177 tok/s** at 12,800 tokens.
+- Prefill tok/s (348-token / 2,048-token prompt): BF16 **1034 / 1308**,
+  Q8_0 **1048 / 1101**, affine4 **1060 / 1087** — roughly 2.1–2.7× the
+  528 / 481, 488 / 441 and 509 / 466 recorded before the prefill work. The
+  simdgroup-matrix kernels dequantize each 32-weight block once per token
+  tile, so quantized prefill stays near BF16 parity. See "Prefill round
+  shape" for the traffic model, the per-scheme A/B, and the changes that were
+  measured and rejected.
 - Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
   12,800-token prompt after the split-K long-context path (`ctx-*.json`).
 - Model-size sweep (BF16 decode): 0.6B **269**, 4B **60.7**, 8B **33.5**

@@ -3,22 +3,23 @@
     "batch_size": 1,
     "concurrency": 1,
     "decode_tokens": 8,
+    "kv_quant": "bf16",
     "measured_runs": 5,
-    "prompt": "The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today. The history of computing spans many decades and involves countless engineers, mathematicians, and scientists who each contributed foundational ideas that we still rely on today.",
+    "prompt": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
     "sampling": "greedy",
     "warmup_runs": 1
   },
   "decode_tokens_per_second": {
-    "maximum": 121.39789678143826,
-    "median": 121.1698953395029,
-    "median_absolute_deviation": 0.12650128273354255,
-    "minimum": 120.88426842351804
+    "maximum": 121.44212523719165,
+    "median": 119.15755607852482,
+    "median_absolute_deviation": 0.4737593838685399,
+    "minimum": 115.90675301719767
   },
   "engine": {
     "backend": "metal",
     "binary": "build/kipp-metal",
     "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
-    "commit": "8a04db95b27141350469c6091bf24e0004a9c6be",
+    "commit": "f5e9e1039338463d19b6b1eb81cd4a194b0c4b05",
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "dirty": false
   },
@@ -38,52 +39,52 @@
     "sha256": "33868c6b1317c61954d203b27d8b8b6c94e653ff74c88d5942c248756455a7b2"
   },
   "peak_resident_bytes": {
-    "maximum": 40861696.0,
-    "median": 40812544.0,
+    "maximum": 41975808.0,
+    "median": 41320448.0,
     "median_absolute_deviation": 32768.0,
-    "minimum": 40730624.0
+    "minimum": 41287680.0
   },
   "prefill_tokens_per_second": {
-    "maximum": 509.38408438210837,
-    "median": 508.88352708927397,
-    "median_absolute_deviation": 0.06177152853001644,
-    "minimum": 508.5592866140766
+    "maximum": 1074.590939049202,
+    "median": 1060.385414752082,
+    "median_absolute_deviation": 6.94434951247672,
+    "minimum": 1053.4410652396052
   },
   "runs": [
     {
-      "decode_seconds": 0.066002,
-      "decode_tokens_per_second": 121.20844822884155,
-      "peak_resident_bytes": 40812544,
-      "prefill_seconds": 0.683925,
-      "prefill_tokens_per_second": 508.8277223379757
+      "decode_seconds": 0.067087,
+      "decode_tokens_per_second": 119.2481404743095,
+      "peak_resident_bytes": 41304064,
+      "prefill_seconds": 0.279176,
+      "prefill_tokens_per_second": 1074.590939049202
     },
     {
-      "decode_seconds": 0.065899,
-      "decode_tokens_per_second": 121.39789678143826,
-      "peak_resident_bytes": 40845312,
-      "prefill_seconds": 0.683178,
-      "prefill_tokens_per_second": 509.38408438210837
+      "decode_seconds": 0.067406,
+      "decode_tokens_per_second": 118.68379669465628,
+      "peak_resident_bytes": 41320448,
+      "prefill_seconds": 0.283394,
+      "prefill_tokens_per_second": 1058.5968651418168
     },
     {
-      "decode_seconds": 0.066092,
-      "decode_tokens_per_second": 121.04339405676936,
-      "peak_resident_bytes": 40861696,
-      "prefill_seconds": 0.684286,
-      "prefill_tokens_per_second": 508.5592866140766
+      "decode_seconds": 0.067138,
+      "decode_tokens_per_second": 119.15755607852482,
+      "peak_resident_bytes": 41975808,
+      "prefill_seconds": 0.284781,
+      "prefill_tokens_per_second": 1053.4410652396052
     },
     {
-      "decode_seconds": 0.066179,
-      "decode_tokens_per_second": 120.88426842351804,
-      "peak_resident_bytes": 40730624,
-      "prefill_seconds": 0.683767,
-      "prefill_tokens_per_second": 508.945298617804
+      "decode_seconds": 0.069021,
+      "decode_tokens_per_second": 115.90675301719767,
+      "peak_resident_bytes": 41402368,
+      "prefill_seconds": 0.282916,
+      "prefill_tokens_per_second": 1060.385414752082
     },
     {
-      "decode_seconds": 0.066023,
-      "decode_tokens_per_second": 121.1698953395029,
-      "peak_resident_bytes": 40812544,
-      "prefill_seconds": 0.68385,
-      "prefill_tokens_per_second": 508.88352708927397
+      "decode_seconds": 0.065875,
+      "decode_tokens_per_second": 121.44212523719165,
+      "peak_resident_bytes": 41287680,
+      "prefill_seconds": 0.280141,
+      "prefill_tokens_per_second": 1070.8893021728345
     }
   ]
 }

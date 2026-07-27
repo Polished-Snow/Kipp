@@ -71,16 +71,22 @@ record results from a fallback build. Current reference numbers
 (Qwen3-4B, Metal, greedy; every value traces to a committed
 <code>bench/results/*.json</code>):</p>
 <ul>
-<li>Decode tok/s (64 tokens, median of 5): BF16 <strong>60.7</strong>, Q8_0 <strong>97.9</strong>,
-affine4 <strong>130</strong>.</li>
+<li>Decode tok/s (64 tokens, median of 5): BF16 <strong>59.8</strong>, Q8_0 <strong>94.3</strong>,
+affine4 <strong>127.9</strong>. These are 1–4% below the figures recorded before the
+prefill work (60.7 / 97.9 / 130) purely as session drift: the controlled
+back-to-back A/B in &quot;Prefill round shape&quot; measures decode unchanged on all
+three schemes, and the whole campaign was re-run in one session so the
+numbers stay comparable with each other.</li>
 <li>Wikitext-2 perplexity (full test set, 2,048-token windows): BF16
 <strong>7.731</strong>, Q8_0 <strong>7.733</strong> (+0.02%), affine4 <strong>8.171</strong> (+5.7%) — Q8_0 is
 effectively lossless; affine4 is Q4-class.</li>
-<li>Prefill tok/s (348-token / 2,048-token prompt): BF16 <strong>528 / 481</strong>,
-Q8_0 <strong>488 / 441</strong>, affine4 <strong>509 / 466</strong>. The simdgroup-matrix kernels
-dequantize once per 16-token tile, so quantized prefill stays near BF16
-parity; the O(n²) attention tail brings Q8_0 prefill from ~485 tok/s at
-short context to <strong>177 tok/s</strong> at 12,800 tokens.</li>
+<li>Prefill tok/s (348-token / 2,048-token prompt): BF16 <strong>1034 / 1308</strong>,
+Q8_0 <strong>1048 / 1101</strong>, affine4 <strong>1060 / 1087</strong> — roughly 2.1–2.7× the
+528 / 481, 488 / 441 and 509 / 466 recorded before the prefill work. The
+simdgroup-matrix kernels dequantize each 32-weight block once per token
+tile, so quantized prefill stays near BF16 parity. See &quot;Prefill round
+shape&quot; for the traffic model, the per-scheme A/B, and the changes that were
+measured and rejected.</li>
 <li>Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
 12,800-token prompt after the split-K long-context path (<code>ctx-*.json</code>).</li>
 <li>Model-size sweep (BF16 decode): 0.6B <strong>269</strong>, 4B <strong>60.7</strong>, 8B <strong>33.5</strong>
