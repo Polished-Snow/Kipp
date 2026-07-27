@@ -51,7 +51,7 @@
   </a>
 </p>
 <h2>Status</h2>
-<p>Kipp v0.0.3 targets the pinned <strong>Qwen3 dense family</strong> (0.6B–32B, base and
+<p>Kipp v0.0.4 targets the pinned <strong>Qwen3 dense family</strong> (0.6B–32B, base and
 instruct) through a strict compiled-in checkpoint registry.</p>
 <ul>
 <li><strong>Backends:</strong> scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
@@ -65,8 +65,9 @@ decode, full sampling, latency metrics, and cross-request KV prefix reuse
 through a content-addressed CPU/Metal block pool.</li>
 <li><strong>CLI:</strong> greedy or sampled generation, multi-turn chat, perplexity scoring,
 prompt-lookup speculation, and draft-model speculation.</li>
-<li><strong>Current work:</strong> split-K long-context Metal decode and all-lane prefill
-softmax are implemented and awaiting the next release.</li>
+<li><strong>Prefill:</strong> ~2.5× faster on Metal this release (BF16 1308, Q8_0 1101,
+affine4 1087 tok/s at a 2,048-token prompt on an M5 Max) with decode
+unchanged.</li>
 </ul>
 <h2>What is Kipp?</h2>
 <p>Kipp is a small, <strong>hand-written Qwen3 inference engine</strong> for local hardware.

@@ -1,6 +1,6 @@
 # Kipp Model Support
 
-This document describes Kipp v0.0.3 and the current unreleased changes.
+This document describes Kipp v0.0.4.
 
 "Supported" has a narrow meaning here: a checkpoint is supported only when
 it has a pinned entry in the compiled-in registry (`src/kipp_checkpoints.h`,

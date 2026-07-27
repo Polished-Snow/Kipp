@@ -1,6 +1,6 @@
 # Releasing Kipp
 
-The release pattern established by v0.0.1–v0.0.3 is a release
+The release pattern established by v0.0.1–v0.0.4 is a release
 branch, a single `Release vX.Y.Z` commit, a GitHub PR merged into `main`
 with a merge commit, and an annotated tag on that merge. Everything below
 must be green before the branch is cut.

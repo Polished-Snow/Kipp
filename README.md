@@ -27,7 +27,7 @@
 
 ## Status
 
-Kipp v0.0.3 targets the pinned **Qwen3 dense family** (0.6B–32B, base and
+Kipp v0.0.4 targets the pinned **Qwen3 dense family** (0.6B–32B, base and
 instruct) through a strict compiled-in checkpoint registry.
 
 - **Backends:** scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
@@ -41,8 +41,9 @@ instruct) through a strict compiled-in checkpoint registry.
   through a content-addressed CPU/Metal block pool.
 - **CLI:** greedy or sampled generation, multi-turn chat, perplexity scoring,
   prompt-lookup speculation, and draft-model speculation.
-- **Current work:** split-K long-context Metal decode and all-lane prefill
-  softmax are implemented and awaiting the next release.
+- **Prefill:** ~2.5× faster on Metal this release (BF16 1308, Q8_0 1101,
+  affine4 1087 tok/s at a 2,048-token prompt on an M5 Max) with decode
+  unchanged.
 
 ## What is Kipp?
 
