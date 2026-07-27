@@ -22,4 +22,13 @@ int kipp_metal_test_scramble_session(void *backendSession);
  */
 int kipp_metal_test_set_ksplit_cap(void *backendModel, uint32_t cap);
 
+/*
+ * Test hook: pin a Metal backend model to the vector/streaming kernels even
+ * when a round is wide enough for the simdgroup-matrix path. The vector path is
+ * the one anchored to the CPU oracle by the short-sequence gates, so forcing it
+ * turns "do the matrix kernels agree with the reference?" into a GPU-only
+ * comparison at any length. 1 forces vectors; 0 restores automatic selection.
+ */
+int kipp_metal_test_force_vector(void *backendModel, int force);
+
 #endif

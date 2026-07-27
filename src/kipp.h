@@ -330,6 +330,11 @@ int kipp_test_scramble_session_kv(kipp_session *session);
 /* Cap the Metal decode split-K count (1 = legacy single-split path, 0 =
  * automatic); returns -1 for non-Metal models. */
 int kipp_test_metal_ksplit_cap(kipp_model *model, uint32_t cap);
+/* Pin a Metal model to the vector/streaming kernels (1) or restore automatic
+ * matrix-kernel selection (0); returns -1 for non-Metal models. Lets a gate
+ * compare the simdgroup-matrix prefill path against the vector path, which the
+ * short-sequence gates already anchor to the CPU oracle. */
+int kipp_test_metal_force_vector(kipp_model *model, int force);
 #endif
 
 #ifdef __cplusplus
