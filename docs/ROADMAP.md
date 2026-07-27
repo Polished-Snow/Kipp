@@ -47,8 +47,8 @@ table gated bitwise-equal to the contiguous layout (`--paged-cpu`,
 `--paged-metal`). Everything is gated on Apple M5 (CPU + Metal); the whole
 family plus quantization is additionally validated on NVIDIA A100 via
 ephemeral cloud runs. At that point, cross-request KV pooling and Metal
-flash-attention prefill were still deferred; both are now delivered.
-Quantized KV remains deferred.
+flash-attention prefill were still deferred; both are now delivered, as is
+an opt-in Q8_0 quantized KV cache.
 
 **v2 expansion (approved 2026-07-16):** scope grew from one pinned
 checkpoint to the pinned Qwen3 dense family via a compiled-in registry
@@ -65,8 +65,10 @@ surface (top-k, min-p, penalties, logit_bias); a `/metrics` endpoint; and
 under the M5 Metal buffer cap) and affine 4-bit gs32 (~2× decode, 2.6×
 smaller, coherent output), both gated on CPU + Metal. Production KV block
 pooling with cross-request prefix caching is delivered and is the serving
-default on CPU/Metal. Remaining: a token-budget scheduler and quantized KV — each
-behind its own CPU-vs-GPU gate. Prompt-lookup and draft-model speculative
+default on CPU/Metal. An opt-in **Q8_0 KV cache** (`--kv-quant q8_0`) is
+delivered on CPU + Metal, ~1.9× smaller than BF16 and gated for tolerance
+and placement invariance. Remaining: a token-budget scheduler and 4-bit KV,
+each behind its own CPU-vs-GPU gate. Prompt-lookup and draft-model speculative
 decoding plus generated-token logprobs are already delivered.
 
 ## Phase 0 — Specify the model
@@ -125,6 +127,6 @@ Still deferred:
 - ROCm/HIP support, on a separate community-maintained branch
 - additional model families
 - generic tensor-runtime or arbitrary-GGUF compatibility
-- radix-tree prefix indexing, SSD streaming, and quantized KV
-  (cross-session prefix caching itself is delivered)
+- radix-tree prefix indexing, SSD streaming, and 4-bit KV
+  (cross-session prefix caching and an opt-in Q8_0 KV cache are delivered)
 - broad API parity with llama.cpp, vLLM, or SGLang

@@ -3,6 +3,28 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## Unreleased
+
+### Quantized KV cache (2026-07-24)
+- **Opt-in Q8_0 KV cache** (`--kv-quant q8_0` on the CLI and server;
+  `kipp_model_open_ex`): each 32-value block of the key/value cache is stored
+  as a bf16 scale plus int8 quants, ~1.9× smaller than the BF16 default (136
+  vs 256 bytes per head-row). It composes with the pooled KV cache and
+  speculation; CUDA rejects it and stays BF16. The BF16 KV path is
+  byte-identical to before (all existing gates unchanged).
+- **Gates**: `--qkv-cpu` / `--qkv-metal` (`make test-qkv-cpu` /
+  `test-qkv-metal`) prove Q8_0 KV within NMSE 1e-3 and an identical arg max
+  of the BF16 cache, and bitwise placement-invariant under a scrambled block
+  table. Measured on the 4B: CPU NMSE 1.36e-5, Metal 2.58e-5, arg max
+  identical, scramble bitwise; greedy output byte-identical to BF16 KV.
+- **Throughput** (Metal 4B, same-session A/B): Q8_0 KV trades a modest decode
+  slowdown (0.85–0.97× across 512–16,384 tokens) for the ~1.9× memory
+  reduction — the per-value dequantization outweighs the reduced byte
+  traffic, so it is a memory feature, not a speed one. Quantized prefill
+  routes through the streaming attention kernel (the MMA prefill kernel
+  cannot consume Q8_0 blocks); a threadgroup-dequant MMA prefill and a
+  faster decode dequant are the natural follow-ups.
+
 ## v0.0.3 — 2026-07-23
 
 ### Draft-model speculative decoding (2026-07-23)

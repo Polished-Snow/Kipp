@@ -1170,7 +1170,8 @@ int kipp_model_open(const char *path, kipp_model **out_model, kipp_error *error)
 }
 
 static int open_model(const char *path, kipp_backend_kind backend,
-                      uint32_t kv_pool_blocks, kipp_model **out_model,
+                      uint32_t kv_pool_blocks,
+                      kipp_kv_quant_scheme kv_quant, kipp_model **out_model,
                       kipp_error *error) {
     struct stat status;
     kipp_model *model;
@@ -1236,6 +1237,7 @@ static int open_model(const char *path, kipp_backend_kind backend,
         goto failure;
     }
     model->view.config.kv_pool_blocks = kv_pool_blocks;
+    model->view.config.kv_quant = kv_quant;
     if (kv_pool_blocks != 0) {
         model->kv_pool = kipp_kv_pool_create(kv_pool_blocks);
         if (model->kv_pool == NULL) {
@@ -1257,7 +1259,7 @@ failure:
 
 int kipp_model_open_backend(const char *path, kipp_backend_kind backend,
                             kipp_model **out_model, kipp_error *error) {
-    return open_model(path, backend, 0, out_model, error);
+    return open_model(path, backend, 0, KIPP_KV_QUANT_BF16, out_model, error);
 }
 
 int kipp_model_open_pooled(const char *path, kipp_backend_kind backend,
@@ -1272,7 +1274,32 @@ int kipp_model_open_pooled(const char *path, kipp_backend_kind backend,
         return fail(error, KIPP_ERROR_UNSUPPORTED,
                     "pooled KV is supported on the CPU and Metal backends");
     }
-    return open_model(path, backend, kv_pool_blocks, out_model, error);
+    return open_model(path, backend, kv_pool_blocks, KIPP_KV_QUANT_BF16,
+                      out_model, error);
+}
+
+int kipp_model_open_ex(const char *path, const kipp_model_open_config *config,
+                       kipp_model **out_model, kipp_error *error) {
+    clear_error(error);
+    if (config == NULL || out_model == NULL) {
+        return fail(error, KIPP_ERROR_ARGUMENT,
+                    "open config and output pointer are required");
+    }
+    *out_model = NULL;
+    if (config->kv_quant != KIPP_KV_QUANT_BF16 &&
+        config->kv_quant != KIPP_KV_QUANT_Q8_0) {
+        return fail(error, KIPP_ERROR_ARGUMENT, "unknown KV quant scheme %d",
+                    (int)config->kv_quant);
+    }
+    if (config->backend == KIPP_BACKEND_CUDA &&
+        (config->kv_pool_blocks != 0 ||
+         config->kv_quant != KIPP_KV_QUANT_BF16)) {
+        return fail(error, KIPP_ERROR_UNSUPPORTED,
+                    "the CUDA backend supports neither pooled nor quantized "
+                    "KV");
+    }
+    return open_model(path, config->backend, config->kv_pool_blocks,
+                      config->kv_quant, out_model, error);
 }
 
 static void destroy_model(kipp_model *model) {
@@ -2588,9 +2615,10 @@ typedef struct {
     const kipp_model_view *view;
     /* Pooled mode (config->kv_pool_blocks > 0): one shared KV slab, owned by
      * the backend model; pooled sessions point into it and carry no storage
-     * of their own. */
-    uint16_t *pool_key_cache;
-    uint16_t *pool_value_cache;
+     * of their own. Byte-addressed: bf16 stores 2 bytes/value, Q8_0 stores a
+     * fp16 scale plus int8 quants per 32-value block. */
+    uint8_t *pool_key_cache;
+    uint8_t *pool_value_cache;
     uint32_t pool_slab_positions;
 } cpu_backend_model;
 
@@ -2611,41 +2639,124 @@ typedef struct {
     uint32_t block_capacity; /* physical blocks allocated */
     uint32_t slab_positions; /* block_capacity * KIPP_KV_BLOCK_TOKENS */
     uint32_t *block_table;    /* logical block -> physical block */
-    size_t slab_elements;
-    uint16_t *key_cache;
-    uint16_t *value_cache;
+    size_t slab_bytes;        /* per-slab (K or V) byte size */
+    uint8_t *key_cache;
+    uint8_t *value_cache;
+    kipp_kv_quant_scheme kv_quant;
+    uint32_t bytes_per_group; /* bytes for one (layer,pos,head) head-row */
     cpu_workspace workspace;
     /* Pooled sessions borrow the model slab and the core's block table; the
      * core owns length tracking and per-eval table contents. */
     bool pooled;
 } cpu_backend_session;
 
-static uint64_t kv_cache_bytes_for_capacity(uint32_t block_count,
-                                            uint32_t capacity) {
-    return (uint64_t)capacity * block_count *
-           KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM *
-           sizeof(uint16_t) * 2u;
+/* Number of 32-value quant blocks in one head-row (head_dim / block). */
+#define KIPP_KV_HEAD_BLOCKS (KIPP_ATTENTION_HEAD_DIM / KIPP_QUANT_BLOCK)
+
+/* Bytes for one (layer, position, head) group of head_dim values. bf16 packs
+ * two bytes per value; Q8_0 packs each 32-value block as {fp16 scale;
+ * int8 qs[32]} = KIPP_Q8_0_BLOCK_BYTES. */
+static uint32_t kv_bytes_per_group(kipp_kv_quant_scheme scheme) {
+    if (scheme == KIPP_KV_QUANT_Q8_0) {
+        return KIPP_KV_HEAD_BLOCKS * KIPP_Q8_0_BLOCK_BYTES;
+    }
+    return KIPP_ATTENTION_HEAD_DIM * (uint32_t)sizeof(uint16_t);
 }
 
-static size_t kv_cache_offset_for_capacity(uint32_t capacity, uint32_t layer,
+static uint64_t kv_cache_bytes_for_capacity(uint32_t block_count,
+                                            uint32_t capacity,
+                                            kipp_kv_quant_scheme scheme) {
+    /* K and V slabs together. */
+    return (uint64_t)capacity * block_count * KIPP_ATTENTION_HEAD_COUNT_KV *
+           kv_bytes_per_group(scheme) * 2u;
+}
+
+/* Byte offset of a (layer, physical_position, head) head-row within a slab. */
+static size_t kv_cache_offset_for_capacity(uint32_t slab_positions,
+                                           uint32_t layer,
                                            uint32_t position, uint32_t head,
-                                           uint32_t dimension) {
-    return (((size_t)layer * capacity + position) *
-                KIPP_ATTENTION_HEAD_COUNT_KV +
-            head) *
-               KIPP_ATTENTION_HEAD_DIM +
-           dimension;
+                                           uint32_t bytes_per_group) {
+    size_t group = ((size_t)layer * slab_positions + position) *
+                       KIPP_ATTENTION_HEAD_COUNT_KV +
+                   head;
+    return group * bytes_per_group;
 }
 
 static size_t kv_cache_offset(const cpu_backend_session *session,
                               uint32_t layer, uint32_t position,
-                              uint32_t head, uint32_t dimension) {
+                              uint32_t head) {
     uint32_t logical_block = position / KIPP_KV_BLOCK_TOKENS;
     uint32_t slot = position % KIPP_KV_BLOCK_TOKENS;
     uint32_t physical = session->block_table[logical_block];
     uint32_t physical_position = physical * KIPP_KV_BLOCK_TOKENS + slot;
     return kv_cache_offset_for_capacity(session->slab_positions, layer,
-                                        physical_position, head, dimension);
+                                        physical_position, head,
+                                        session->bytes_per_group);
+}
+
+/*
+ * KV head-row (head_dim values) codec at a slab byte base. Q8_0 packs each
+ * 32-value block as {bf16 scale; int8 qs[32]} — the scale is bf16, not the
+ * weight format's fp16, because the KV cache is engine-internal (never on
+ * disk, never read by a weight kernel), which lets it reuse the existing
+ * float<->bf16 helpers with no separate fp16 encoder. Symmetric: q in
+ * [-127,127], w = scale*q.
+ */
+static void kv_read_row(const uint8_t *base, kipp_kv_quant_scheme scheme,
+                        float *out) {
+    if (scheme == KIPP_KV_QUANT_Q8_0) {
+        for (uint32_t b = 0; b < KIPP_KV_HEAD_BLOCKS; ++b) {
+            const uint8_t *block = base + (size_t)b * KIPP_Q8_0_BLOCK_BYTES;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, block, sizeof(scale_bits));
+            float scale = bf16_to_float(scale_bits);
+            const int8_t *qs = (const int8_t *)(block + sizeof(scale_bits));
+            for (uint32_t i = 0; i < KIPP_QUANT_BLOCK; ++i) {
+                out[b * KIPP_QUANT_BLOCK + i] = scale * (float)qs[i];
+            }
+        }
+    } else {
+        const uint16_t *k = (const uint16_t *)(const void *)base;
+        for (uint32_t i = 0; i < KIPP_ATTENTION_HEAD_DIM; ++i) {
+            out[i] = bf16_to_float(k[i]);
+        }
+    }
+}
+
+static void kv_write_row(uint8_t *base, kipp_kv_quant_scheme scheme,
+                         const float *in) {
+    if (scheme == KIPP_KV_QUANT_Q8_0) {
+        for (uint32_t b = 0; b < KIPP_KV_HEAD_BLOCKS; ++b) {
+            const float *v = in + b * KIPP_QUANT_BLOCK;
+            float amax = 0.0f;
+            for (uint32_t i = 0; i < KIPP_QUANT_BLOCK; ++i) {
+                float a = fabsf(v[i]);
+                if (a > amax) {
+                    amax = a;
+                }
+            }
+            float scale = amax / 127.0f;
+            float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
+            uint8_t *block = base + (size_t)b * KIPP_Q8_0_BLOCK_BYTES;
+            uint16_t scale_bits = float_to_bf16(scale);
+            memcpy(block, &scale_bits, sizeof(scale_bits));
+            int8_t *qs = (int8_t *)(block + sizeof(scale_bits));
+            for (uint32_t i = 0; i < KIPP_QUANT_BLOCK; ++i) {
+                float q = roundf(v[i] * inverse);
+                if (q > 127.0f) {
+                    q = 127.0f;
+                } else if (q < -127.0f) {
+                    q = -127.0f;
+                }
+                qs[i] = (int8_t)q;
+            }
+        }
+    } else {
+        uint16_t *k = (uint16_t *)(void *)base;
+        for (uint32_t i = 0; i < KIPP_ATTENTION_HEAD_DIM; ++i) {
+            k[i] = float_to_bf16(in[i]);
+        }
+    }
 }
 
 #ifdef KIPP_FAULT_INJECT
@@ -2678,7 +2789,7 @@ static int kipp_fault_selected(void) {
 
 static size_t kv_cache_offset_read(const cpu_backend_session *session,
                                    uint32_t layer, uint32_t position,
-                                   uint32_t head, uint32_t dimension) {
+                                   uint32_t head) {
     uint32_t logical_block = position / KIPP_KV_BLOCK_TOKENS;
     uint32_t slot = position % KIPP_KV_BLOCK_TOKENS;
     if (kipp_fault_selected() == 1) {
@@ -2686,17 +2797,18 @@ static size_t kv_cache_offset_read(const cpu_backend_session *session,
     } else if (kipp_fault_selected() == 2) {
         slot = (slot + 1u) % KIPP_KV_BLOCK_TOKENS;
     } else {
-        return kv_cache_offset(session, layer, position, head, dimension);
+        return kv_cache_offset(session, layer, position, head);
     }
     uint32_t physical = session->block_table[logical_block];
     uint32_t physical_position = physical * KIPP_KV_BLOCK_TOKENS + slot;
     return kv_cache_offset_for_capacity(session->slab_positions, layer,
-                                        physical_position, head, dimension);
+                                        physical_position, head,
+                                        session->bytes_per_group);
 }
 
 static size_t kv_cache_offset_write(const cpu_backend_session *session,
                                     uint32_t layer, uint32_t position,
-                                    uint32_t head, uint32_t dimension) {
+                                    uint32_t head) {
     uint32_t logical_block = position / KIPP_KV_BLOCK_TOKENS;
     uint32_t slot = position % KIPP_KV_BLOCK_TOKENS;
     if (kipp_fault_selected() == 3 && slot == 0u && logical_block > 0u) {
@@ -2706,9 +2818,9 @@ static size_t kv_cache_offset_write(const cpu_backend_session *session,
             session->slab_positions;
         return kv_cache_offset_for_capacity(session->slab_positions, layer,
                                             physical_position, head,
-                                            dimension);
+                                            session->bytes_per_group);
     }
-    return kv_cache_offset(session, layer, position, head, dimension);
+    return kv_cache_offset(session, layer, position, head);
 }
 #else
 #define kv_cache_offset_read kv_cache_offset
@@ -2723,6 +2835,7 @@ static void cached_gqa(const cpu_backend_session *session, uint32_t layer,
         query_head_count / KIPP_ATTENTION_HEAD_COUNT_KV;
     memset(output, 0, (size_t)query_head_count * KIPP_ATTENTION_HEAD_DIM *
                           sizeof(*output));
+    float row[KIPP_ATTENTION_HEAD_DIM];
     for (uint32_t query_head = 0; query_head < query_head_count;
          ++query_head) {
         uint32_t kv_head = query_head / queries_per_kv;
@@ -2730,12 +2843,13 @@ static void cached_gqa(const cpu_backend_session *session, uint32_t layer,
             query + (size_t)query_head * KIPP_ATTENTION_HEAD_DIM;
         for (uint32_t source = 0; source <= position; ++source) {
             size_t cache_base =
-                kv_cache_offset_read(session, layer, source, kv_head, 0);
+                kv_cache_offset_read(session, layer, source, kv_head);
+            kv_read_row(session->key_cache + cache_base, session->kv_quant,
+                        row);
             float dot = 0.0f;
             for (uint32_t dimension = 0;
                  dimension < KIPP_ATTENTION_HEAD_DIM; ++dimension) {
-                dot += query_values[dimension] *
-                       bf16_to_float(session->key_cache[cache_base + dimension]);
+                dot += query_values[dimension] * row[dimension];
             }
             scores[source] = dot * scale;
         }
@@ -2744,13 +2858,12 @@ static void cached_gqa(const cpu_backend_session *session, uint32_t layer,
             output + (size_t)query_head * KIPP_ATTENTION_HEAD_DIM;
         for (uint32_t source = 0; source <= position; ++source) {
             size_t cache_base =
-                kv_cache_offset_read(session, layer, source, kv_head, 0);
+                kv_cache_offset_read(session, layer, source, kv_head);
+            kv_read_row(session->value_cache + cache_base, session->kv_quant,
+                        row);
             for (uint32_t dimension = 0;
                  dimension < KIPP_ATTENTION_HEAD_DIM; ++dimension) {
-                destination[dimension] +=
-                    scores[source] *
-                    bf16_to_float(
-                        session->value_cache[cache_base + dimension]);
+                destination[dimension] += scores[source] * row[dimension];
             }
         }
     }
@@ -2799,8 +2912,8 @@ static int cpu_cached_token(const kipp_model_view *view,
         apply_rope(workspace->key, 1, KIPP_ATTENTION_HEAD_COUNT_KV, position,
                    config->rope_theta);
 
-        uint16_t *key_store = session->key_cache;
-        uint16_t *value_store = session->value_cache;
+        uint8_t *key_store = session->key_cache;
+        uint8_t *value_store = session->value_cache;
 #ifdef KIPP_FAULT_INJECT
         if (kipp_fault_selected() == 4 && layer_index == 0) {
             key_store = session->value_cache;
@@ -2809,15 +2922,12 @@ static int cpu_cached_token(const kipp_model_view *view,
 #endif
         for (uint32_t head = 0; head < KIPP_ATTENTION_HEAD_COUNT_KV; ++head) {
             size_t cache_base =
-                kv_cache_offset_write(session, layer_index, position, head, 0);
+                kv_cache_offset_write(session, layer_index, position, head);
             size_t state_base = (size_t)head * KIPP_ATTENTION_HEAD_DIM;
-            for (uint32_t dimension = 0;
-                 dimension < KIPP_ATTENTION_HEAD_DIM; ++dimension) {
-                key_store[cache_base + dimension] =
-                    float_to_bf16(workspace->key[state_base + dimension]);
-                value_store[cache_base + dimension] =
-                    float_to_bf16(workspace->value[state_base + dimension]);
-            }
+            kv_write_row(key_store + cache_base, session->kv_quant,
+                         workspace->key + state_base);
+            kv_write_row(value_store + cache_base, session->kv_quant,
+                         workspace->value + state_base);
         }
         cached_gqa(session, layer_index, position, workspace->query,
                    workspace->attention, workspace->scores,
@@ -2873,16 +2983,16 @@ static int cpu_backend_model_create(const kipp_model_view *view,
     if (view->config.kv_pool_blocks != 0) {
         size_t positions =
             (size_t)view->config.kv_pool_blocks * KIPP_KV_BLOCK_TOKENS;
-        size_t elements;
+        size_t groups;
         size_t bytes;
         if (positions > UINT32_MAX ||
             !checked_multiply_size(view->config.block_count, positions,
-                                   &elements) ||
-            !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_COUNT_KV,
-                                   &elements) ||
-            !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_DIM,
-                                   &elements) ||
-            !checked_multiply_size(elements, sizeof(uint16_t), &bytes)) {
+                                   &groups) ||
+            !checked_multiply_size(groups, KIPP_ATTENTION_HEAD_COUNT_KV,
+                                   &groups) ||
+            !checked_multiply_size(groups,
+                                   kv_bytes_per_group(view->config.kv_quant),
+                                   &bytes)) {
             free(state);
             return fail(error, KIPP_ERROR_MEMORY, "KV pool size overflows");
         }
@@ -2916,7 +3026,7 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
                                       void **backend_session,
                                       kipp_error *error) {
     cpu_backend_session *session;
-    size_t elements;
+    size_t groups;
     size_t bytes;
     if (backend_model == NULL || backend_session == NULL) {
         return fail(error, KIPP_ERROR_ARGUMENT,
@@ -2936,11 +3046,11 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
         (capacity + KIPP_KV_BLOCK_TOKENS - 1) / KIPP_KV_BLOCK_TOKENS;
     size_t slab_positions = (size_t)block_capacity * KIPP_KV_BLOCK_TOKENS;
     if (!checked_multiply_size(config->block_count, slab_positions,
-                               &elements) ||
-        !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_COUNT_KV,
-                               &elements) ||
-        !checked_multiply_size(elements, KIPP_ATTENTION_HEAD_DIM, &elements) ||
-        !checked_multiply_size(elements, sizeof(uint16_t), &bytes)) {
+                               &groups) ||
+        !checked_multiply_size(groups, KIPP_ATTENTION_HEAD_COUNT_KV,
+                               &groups) ||
+        !checked_multiply_size(groups, kv_bytes_per_group(config->kv_quant),
+                               &bytes)) {
         return fail(error, KIPP_ERROR_MEMORY, "KV cache size overflows");
     }
     session = calloc(1, sizeof(*session));
@@ -2951,6 +3061,8 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
     session->capacity = capacity;
     session->block_count = config->block_count;
     session->block_capacity = block_capacity;
+    session->kv_quant = config->kv_quant;
+    session->bytes_per_group = kv_bytes_per_group(config->kv_quant);
     if (config->kv_pool_blocks != 0) {
         /* Pooled: borrow the model slab; the core supplies a block table
          * with every eval item, so no per-session storage exists. */
@@ -2967,7 +3079,7 @@ static int cpu_backend_session_create(void *backend_model, uint32_t capacity,
         return 0;
     }
     session->slab_positions = (uint32_t)slab_positions;
-    session->slab_elements = elements;
+    session->slab_bytes = bytes;
     session->block_table = malloc((size_t)block_capacity *
                                   sizeof(*session->block_table));
     session->key_cache = malloc(bytes);
@@ -3549,7 +3661,8 @@ int kipp_session_create(kipp_model *model, uint32_t capacity,
     session->model = model;
     session->capacity = capacity;
     session->cache_bytes = kv_cache_bytes_for_capacity(
-        model->view.config.block_count, capacity);
+        model->view.config.block_count, capacity,
+        model->view.config.kv_quant);
     ++model->active_session_count;
     *out_session = session;
     return 0;
@@ -3948,14 +4061,18 @@ int kipp_test_checked_multiply_size(size_t left, size_t right, size_t *result) {
 }
 
 uint64_t kipp_test_kv_cache_bytes(uint32_t block_count, uint32_t capacity) {
-    return kv_cache_bytes_for_capacity(block_count, capacity);
+    return kv_cache_bytes_for_capacity(block_count, capacity,
+                                       KIPP_KV_QUANT_BF16);
 }
 
 size_t kipp_test_kv_cache_offset(uint32_t capacity, uint32_t layer,
                                  uint32_t position, uint32_t head,
                                  uint32_t dimension) {
-    return kv_cache_offset_for_capacity(capacity, layer, position, head,
-                                        dimension);
+    /* BF16 byte offset of a single cached value, for the layout test. */
+    return kv_cache_offset_for_capacity(
+               capacity, layer, position, head,
+               kv_bytes_per_group(KIPP_KV_QUANT_BF16)) +
+           (size_t)dimension * sizeof(uint16_t);
 }
 
 int kipp_test_scramble_session_kv(kipp_session *session) {

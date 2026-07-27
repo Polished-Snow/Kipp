@@ -167,6 +167,7 @@ def run_once(
     decode: int,
     backend: str = "metal",
     nvidia_smi: str | None = None,
+    kv_quant: str = "bf16",
 ) -> Measurement:
     requested_backend = backend
     command = [
@@ -182,6 +183,8 @@ def run_once(
         "--top",
         "1",
     ]
+    if kv_quant != "bf16":
+        command += ["--kv-quant", kv_quant]
     if requested_backend == "cuda" and nvidia_smi is None:
         nvidia_smi = shutil.which("nvidia-smi")
     _, stderr, peak_resident_bytes, peak_device_bytes = run_process(
@@ -260,6 +263,7 @@ def main() -> None:
     parser.add_argument("--decode", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--kv-quant", choices=("bf16", "q8_0"), default="bf16")
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
     if args.decode <= 0 or args.warmup < 0 or args.runs <= 0:
@@ -294,6 +298,7 @@ def main() -> None:
             args.decode,
             args.backend,
             nvidia_smi,
+            args.kv_quant,
         )
     measurements = []
     for index in range(args.runs):
@@ -306,6 +311,7 @@ def main() -> None:
                 args.decode,
                 args.backend,
                 nvidia_smi,
+                args.kv_quant,
             )
         )
 
@@ -315,6 +321,7 @@ def main() -> None:
         "hardware": hardware_metadata(args.backend, nvidia_smi),
         "configuration": {
             "prompt": args.prompt,
+            "kv_quant": args.kv_quant,
             "decode_tokens": args.decode,
             "warmup_runs": args.warmup,
             "measured_runs": args.runs,

@@ -67,6 +67,13 @@ typedef struct {
      * tables onto it. 0 keeps today's per-session slabs.
      */
     uint32_t kv_pool_blocks;
+    /*
+     * KV cache storage precision (independent of quant_scheme, which is for
+     * weights). Default BF16; Q8_0 packs each 32-value block as a fp16 scale
+     * plus int8 quants. Backends size their KV slabs and their write/read
+     * paths from this field.
+     */
+    kipp_kv_quant_scheme kv_quant;
 } kipp_model_config;
 
 /*

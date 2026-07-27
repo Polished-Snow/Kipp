@@ -85,6 +85,17 @@ record results from a fallback build. Current reference numbers
 - CUDA revalidation (`cuda-h100-gates.json`): all four default checkpoints
   pass `--model` and `--phase4-cuda` on an ephemeral NVIDIA H100 80GB
   (worst observed NMSE 5.9e-7 against the CPU oracle).
+- **Quantized KV cache** (`--kv-quant q8_0`, opt-in; `bench/results/qkv/`):
+  the KV cache is **~1.9× smaller** than BF16 (136 vs 256 bytes per
+  head-row), which is the point — it extends context and concurrent-session
+  count under Apple's single-buffer cap (the server's 0.6B pool drops from
+  ~3,584 to 1,904 MiB). It is a memory feature, **not** a speed one: in a
+  same-session Metal 4B decode A/B the per-value dequantization slightly
+  *outweighs* the reduced byte traffic, so Q8_0 KV decode runs at 0.85–0.97×
+  of BF16 across 512–16,384 tokens rather than faster. Quality is
+  near-lossless (NMSE 1.4e-5 CPU / 2.6e-5 Metal vs BF16 KV, arg max
+  identical). A faster decode dequant and an MMA quantized-prefill path are
+  follow-ups.
 
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 

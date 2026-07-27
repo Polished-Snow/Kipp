@@ -574,6 +574,8 @@ static void usage(const char *program) {
             "Usage: %s --model MODEL.gguf (--prompt TEXT | --chat | "
             "--ppl FILE)\n"
             "  [--backend cpu|metal|cuda]  execution backend (default cpu)\n"
+            "  [--kv-quant bf16|q8_0]      KV cache precision (default bf16; "
+            "q8_0 ~1.9x smaller)\n"
             "  [--decode N]                greedy/sampled tokens to generate\n"
             "  [--temperature F]           0 = greedy argmax (default)\n"
             "  [--top-p F]                 nucleus mass, 0 < F <= 1 "
@@ -819,6 +821,7 @@ int main(int argc, char **argv) {
     size_t ppl_limit = 0;
     uint64_t rng_state = 1;
     kipp_backend_kind backend = KIPP_BACKEND_CPU;
+    kipp_kv_quant_scheme kv_quant = KIPP_KV_QUANT_BF16;
     kipp_model *model = NULL;
     kipp_session *session = NULL;
     kipp_model *draft_model = NULL;
@@ -927,6 +930,18 @@ int main(int argc, char **argv) {
                 goto cleanup;
             }
             continue;
+        } else if (strcmp(argv[index], "--kv-quant") == 0 &&
+                   index + 1 < argc) {
+            const char *name = argv[++index];
+            if (strcmp(name, "bf16") == 0) {
+                kv_quant = KIPP_KV_QUANT_BF16;
+            } else if (strcmp(name, "q8_0") == 0) {
+                kv_quant = KIPP_KV_QUANT_Q8_0;
+            } else {
+                usage(argv[0]);
+                goto cleanup;
+            }
+            continue;
         } else {
             usage(argv[0]);
             goto cleanup;
@@ -954,7 +969,8 @@ int main(int argc, char **argv) {
                 "kipp: --chat cannot be combined with --prompt or --spec\n");
         goto cleanup;
     }
-    if (kipp_model_open_backend(model_path, backend, &model, &error) != 0) {
+    kipp_model_open_config open_config = {backend, 0, kv_quant};
+    if (kipp_model_open_ex(model_path, &open_config, &model, &error) != 0) {
         fprintf(stderr, "kipp: %s: %s\n", kipp_error_code_name(error.code),
                 error.message);
         goto cleanup;

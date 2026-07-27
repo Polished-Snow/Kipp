@@ -76,12 +76,13 @@ static void test_kv_layout(void) {
     CHECK(kipp_test_kv_cache_bytes(36, 8192) == UINT64_C(1207959552));
     CHECK(kipp_test_kv_cache_bytes(28, 1) == UINT64_C(114688));
     CHECK(kipp_test_kv_cache_bytes(64, 1) == UINT64_C(262144));
+    /* BF16 byte offsets: each of the 8 heads is a 256-byte head-row. */
     CHECK(kipp_test_kv_cache_offset(4, 0, 0, 0, 0) == 0);
-    CHECK(kipp_test_kv_cache_offset(4, 0, 0, 1, 0) == 128);
-    CHECK(kipp_test_kv_cache_offset(4, 0, 1, 0, 0) == 1024);
-    CHECK(kipp_test_kv_cache_offset(4, 1, 0, 0, 0) == 4096);
+    CHECK(kipp_test_kv_cache_offset(4, 0, 0, 1, 0) == 256);
+    CHECK(kipp_test_kv_cache_offset(4, 0, 1, 0, 0) == 8 * 256);
+    CHECK(kipp_test_kv_cache_offset(4, 1, 0, 0, 0) == 4 * 8 * 256);
     CHECK(kipp_test_kv_cache_offset(4, 35, 3, 7, 127) ==
-          (size_t)36 * 4 * 8 * 128 - 1);
+          (size_t)36 * 4 * 8 * 256 - 2);
 }
 
 static void test_rms_norm(void) {
@@ -1534,6 +1535,125 @@ cleanup:
     free(seed);
     free(tokens);
     free(rows_identity);
+    free(rows_scrambled);
+    return result;
+}
+
+/*
+ * Quantized KV gate. On a synthesized multi-block sequence: (1) a Q8_0 KV
+ * cache reproduces the BF16 KV cache within a tolerance NMSE with an
+ * identical arg max (quantization is lossy but near-lossless at 8 bits), and
+ * (2) the Q8_0 cache is still bitwise placement-invariant under a scrambled
+ * block table (the quantized bytes relocate exactly as bf16 does). The
+ * backend argument selects CPU or Metal; the tolerance is looser on the
+ * cross-backend Metal path.
+ */
+static int run_qkv_test(const char *model_path, const char *vector_directory,
+                        kipp_backend_kind backend, const char *label) {
+    char *tokens_path = join_path(vector_directory, "tokens.u32");
+    uint32_t *seed = NULL;
+    uint32_t *tokens = NULL;
+    size_t token_bytes = 0;
+    kipp_model *bf16_model = NULL;
+    kipp_model *q8_model = NULL;
+    kipp_session *session = NULL;
+    kipp_session *scrambled = NULL;
+    float *rows_bf16 = NULL;
+    float *rows_q8 = NULL;
+    float *rows_scrambled = NULL;
+    kipp_error error = {0};
+    int result = -1;
+
+    if (tokens_path == NULL ||
+        read_file(tokens_path, (void **)&seed, &token_bytes) != 0 ||
+        token_bytes < sizeof(*seed) || token_bytes % sizeof(*seed)) {
+        fprintf(stderr, "unable to read qkv token vector\n");
+        goto cleanup;
+    }
+    size_t seed_count = token_bytes / sizeof(*seed);
+    uint32_t n = 3 * KIPP_KV_BLOCK_TOKENS;
+    tokens = malloc((size_t)n * sizeof(*tokens));
+    rows_bf16 = malloc(KIPP_VOCAB_SIZE * sizeof(float));
+    rows_q8 = malloc(KIPP_VOCAB_SIZE * sizeof(float));
+    rows_scrambled = malloc(KIPP_VOCAB_SIZE * sizeof(float));
+    if (tokens == NULL || rows_bf16 == NULL || rows_q8 == NULL ||
+        rows_scrambled == NULL) {
+        fprintf(stderr, "qkv allocation failed\n");
+        goto cleanup;
+    }
+    for (uint32_t index = 0; index < n; ++index) {
+        tokens[index] = seed[index % seed_count];
+    }
+
+    /* BF16-KV reference. */
+    if (kipp_model_open_backend(model_path, backend, &bf16_model, &error) != 0 ||
+        kipp_session_create(bf16_model, n, &session, &error) != 0 ||
+        kipp_session_eval(session, tokens, n, rows_bf16, KIPP_VOCAB_SIZE,
+                          &error) != 0) {
+        fprintf(stderr, "qkv-%s bf16 reference failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    kipp_session_destroy(session);
+    session = NULL;
+
+    /* Q8_0-KV model. */
+    kipp_model_open_config config = {backend, 0, KIPP_KV_QUANT_Q8_0};
+    if (kipp_model_open_ex(model_path, &config, &q8_model, &error) != 0 ||
+        kipp_session_create(q8_model, n, &session, &error) != 0 ||
+        kipp_session_eval(session, tokens, n, rows_q8, KIPP_VOCAB_SIZE,
+                          &error) != 0) {
+        fprintf(stderr, "qkv-%s q8_0 eval failed: %s\n", label, error.message);
+        goto cleanup;
+    }
+
+    /* Tolerance vs bf16 KV. Q8_0 KV is near-lossless. */
+    double tolerance = 1.0e-3;
+    double nmse = logit_nmse(rows_q8, rows_bf16, KIPP_VOCAB_SIZE);
+    int q8_argmax = argmax(rows_q8, KIPP_VOCAB_SIZE);
+    int bf16_argmax = argmax(rows_bf16, KIPP_VOCAB_SIZE);
+    fprintf(stderr, "QKV-%s vs bf16 KV nmse=%.9g bf16_argmax=%d q8_argmax=%d\n",
+            label, nmse, bf16_argmax, q8_argmax);
+    if (nmse > tolerance || q8_argmax != bf16_argmax) {
+        fprintf(stderr, "QKV-%s exceeds tolerance or arg max differs\n", label);
+        goto cleanup;
+    }
+
+    /* Placement invariance under Q8_0: scrambled == identity, bitwise. */
+    if (kipp_session_create(q8_model, n, &scrambled, &error) != 0 ||
+        kipp_test_scramble_session_kv(scrambled) != 0 ||
+        kipp_session_eval(scrambled, tokens, n, rows_scrambled,
+                          KIPP_VOCAB_SIZE, &error) != 0) {
+        fprintf(stderr, "qkv-%s scrambled eval failed: %s\n", label,
+                error.message);
+        goto cleanup;
+    }
+    if (memcmp(rows_q8, rows_scrambled, KIPP_VOCAB_SIZE * sizeof(float)) != 0) {
+        fprintf(stderr,
+                "QKV-%s scrambled block table changed quantized logits\n",
+                label);
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "QKV-%s Q8_0 KV within tolerance of bf16 and bitwise "
+            "placement-invariant over %u blocks\n",
+            label, n / KIPP_KV_BLOCK_TOKENS);
+    result = 0;
+
+cleanup:
+    kipp_session_destroy(scrambled);
+    kipp_session_destroy(session);
+    if (q8_model != NULL) {
+        (void)kipp_model_close(q8_model, NULL);
+    }
+    if (bf16_model != NULL) {
+        (void)kipp_model_close(bf16_model, NULL);
+    }
+    free(tokens_path);
+    free(seed);
+    free(tokens);
+    free(rows_bf16);
+    free(rows_q8);
     free(rows_scrambled);
     return result;
 }
@@ -3200,6 +3320,24 @@ int main(int argc, char **argv) {
         } else {
             fprintf(stderr, "PASS pooled_cpu\n");
         }
+    } else if (argc == 4 && strcmp(argv[1], "--qkv-cpu") == 0) {
+        ++tests_run;
+        if (run_qkv_test(argv[2], argv[3], KIPP_BACKEND_CPU, "CPU") != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL qkv_cpu\n");
+        } else {
+            fprintf(stderr, "PASS qkv_cpu\n");
+        }
+#ifdef KIPP_ENABLE_METAL
+    } else if (argc == 4 && strcmp(argv[1], "--qkv-metal") == 0) {
+        ++tests_run;
+        if (run_qkv_test(argv[2], argv[3], KIPP_BACKEND_METAL, "METAL") != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL qkv_metal\n");
+        } else {
+            fprintf(stderr, "PASS qkv_metal\n");
+        }
+#endif
 #ifdef KIPP_ENABLE_METAL
     } else if (argc == 4 && strcmp(argv[1], "--pooled-metal") == 0) {
         ++tests_run;

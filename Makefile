@@ -1,7 +1,8 @@
 .PHONY: all cpu server server-metal server-cuda test test-tools test-sanitize \
 	tools-env model convert vectors chat-vectors test-model test-cpu-model \
 	test-ppl test-phase2 \
-	test-paged-cpu test-pooled-cpu test-multilogit metal test-metal-ops \
+	test-paged-cpu test-pooled-cpu test-qkv-cpu test-multilogit metal \
+	test-metal-ops test-qkv-metal \
 	test-multilogit-metal test-paged-metal test-pooled-metal test-metal \
 	test-longctx-metal test-chat test-draft-spec test-server \
 	cuda-spark cuda-generic \
@@ -196,6 +197,9 @@ test-paged-cpu: $(BUILD_DIR)/kipp_test vectors
 test-pooled-cpu: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --pooled-cpu $(MODEL_GGUF) $(VECTOR_DIR)
 
+test-qkv-cpu: $(BUILD_DIR)/kipp_test vectors
+	$(BUILD_DIR)/kipp_test --qkv-cpu $(MODEL_GGUF) $(VECTOR_DIR)
+
 test-multilogit: $(BUILD_DIR)/kipp_test vectors
 	$(BUILD_DIR)/kipp_test --multilogit $(MODEL_GGUF) $(VECTOR_DIR)
 
@@ -216,8 +220,11 @@ test-longctx-metal: $(BUILD_DIR)/kipp_test_metal vectors
 test-pooled-metal: $(BUILD_DIR)/kipp_test_metal vectors
 	$(BUILD_DIR)/kipp_test_metal --pooled-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
+test-qkv-metal: $(BUILD_DIR)/kipp_test_metal vectors
+	$(BUILD_DIR)/kipp_test_metal --qkv-metal $(MODEL_GGUF) $(VECTOR_DIR)
+
 test-metal: test-metal-ops test-multilogit-metal test-paged-metal \
-		test-pooled-metal test-longctx-metal
+		test-pooled-metal test-longctx-metal test-qkv-metal
 	$(BUILD_DIR)/kipp_test_metal --phase3-metal $(MODEL_GGUF) $(VECTOR_DIR)
 
 # Chat REPL smoke test against an already-converted instruct GGUF; does not

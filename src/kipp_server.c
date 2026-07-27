@@ -2561,6 +2561,7 @@ static void serve(kipp_model *model, int listener) {
 static void server_usage(const char *program) {
     fprintf(stderr,
             "Usage: %s --model MODEL.gguf [--backend cpu|metal|cuda] "
+            "[--kv-quant bf16|q8_0] "
             "[--port N] [--kv-pool-mib N] [--idle-timeout SECONDS]\n"
             "Serves GET /healthz, GET /metrics, GET /v1/models, "
             "POST /v1/completions, and POST /v1/chat/completions "
@@ -2577,6 +2578,7 @@ static void server_usage(const char *program) {
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     kipp_backend_kind backend = KIPP_BACKEND_CPU;
+    kipp_kv_quant_scheme kv_quant = KIPP_KV_QUANT_BF16;
     unsigned long port = SERVER_DEFAULT_PORT;
     unsigned long pool_mib = ULONG_MAX; /* ULONG_MAX = auto-size */
     kipp_model *model = NULL;
@@ -2630,6 +2632,17 @@ int main(int argc, char **argv) {
                 return 1;
             }
             server_idle_timeout_ns = (long long)seconds * 1000000000LL;
+        } else if (strcmp(argv[index], "--kv-quant") == 0 &&
+                   index + 1 < argc) {
+            const char *name = argv[++index];
+            if (strcmp(name, "bf16") == 0) {
+                kv_quant = KIPP_KV_QUANT_BF16;
+            } else if (strcmp(name, "q8_0") == 0) {
+                kv_quant = KIPP_KV_QUANT_Q8_0;
+            } else {
+                server_usage(argv[0]);
+                return 1;
+            }
         } else {
             server_usage(argv[0]);
             return 1;
@@ -2648,7 +2661,8 @@ int main(int argc, char **argv) {
     (void)sigaction(SIGINT, &stop_action, NULL);
     (void)sigaction(SIGTERM, &stop_action, NULL);
 
-    if (kipp_model_open_backend(model_path, backend, &model, &error) != 0) {
+    kipp_model_open_config open_config = {backend, 0, kv_quant};
+    if (kipp_model_open_ex(model_path, &open_config, &model, &error) != 0) {
         fprintf(stderr, "kipp-server: %s: %s\n",
                 kipp_error_code_name(error.code), error.message);
         return 1;
@@ -2665,9 +2679,14 @@ int main(int argc, char **argv) {
      * stays on the legacy per-session path.
      */
     if (pool_mib != 0 && backend != KIPP_BACKEND_CUDA) {
+        /* Bytes for one head-row: bf16 = head_dim*2; q8_0 packs each 32-value
+         * block as a fp16-style scale plus int8 quants, so head_dim/32*34. */
+        uint64_t bytes_per_row =
+            kv_quant == KIPP_KV_QUANT_Q8_0
+                ? (uint64_t)(KIPP_ATTENTION_HEAD_DIM / 32u) * 34u
+                : (uint64_t)KIPP_ATTENTION_HEAD_DIM * sizeof(uint16_t);
         uint64_t per_token_bytes = (uint64_t)server_info.block_count * 2u *
-                                   KIPP_ATTENTION_HEAD_COUNT_KV *
-                                   KIPP_ATTENTION_HEAD_DIM * sizeof(uint16_t);
+                                   KIPP_ATTENTION_HEAD_COUNT_KV * bytes_per_row;
         uint64_t per_block_bytes = per_token_bytes * KIPP_KV_BLOCK_TOKENS;
         uint64_t pool_blocks;
         if (pool_mib == ULONG_MAX) {
@@ -2692,9 +2711,10 @@ int main(int argc, char **argv) {
             return 1;
         }
         model = NULL;
-        if (kipp_model_open_pooled(model_path, backend,
-                                   (uint32_t)pool_blocks, &pooled_model,
-                                   &error) != 0) {
+        kipp_model_open_config pooled_config = {backend, (uint32_t)pool_blocks,
+                                                kv_quant};
+        if (kipp_model_open_ex(model_path, &pooled_config, &pooled_model,
+                               &error) != 0) {
             fprintf(stderr, "kipp-server: pooled open: %s: %s\n",
                     kipp_error_code_name(error.code), error.message);
             return 1;

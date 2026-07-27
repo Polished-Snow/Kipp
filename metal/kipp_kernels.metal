@@ -21,6 +21,13 @@ constant uint KIPP_Q_HEADS [[function_constant(2)]];
 constant uint KIPP_HALF_HEAD_DIM = KIPP_HEAD_DIM / 2;
 constant uint KIPP_GQA_GROUPS = 8;
 constant uint KIPP_KV_VALUES_PER_TOKEN = KIPP_KV_HEADS * KIPP_HEAD_DIM;
+/* Q8_0 KV cache: each 32-value block is {bf16 scale; int8 qs[32]} = 34 bytes.
+ * A position holds KIPP_KV_VALUES_PER_TOKEN/32 blocks; the scale is bf16, not
+ * fp16, to match the CPU reference (src/kipp.c kv_read_row/kv_write_row). */
+constant uint KIPP_KV_Q8_BLOCK = 32;
+constant uint KIPP_KV_Q8_BLOCK_BYTES = 34;
+constant uint KIPP_KV_Q8_POS_BYTES =
+    KIPP_KV_VALUES_PER_TOKEN / KIPP_KV_Q8_BLOCK * KIPP_KV_Q8_BLOCK_BYTES;
 
 inline float kipp_bf16_to_float(ushort value) {
     return as_type<float>(uint(value) << 16);
@@ -392,6 +399,61 @@ kernel void kipp_kv_write(device const float *key [[buffer(0)]],
     value_cache[cache_index] = kipp_float_to_bf16(value[state_index]);
 }
 
+/* Quantize one 32-value block into {bf16 scale; int8 qs[32]} (symmetric,
+ * scale = maxabs/127, round-half-away-from-zero to match the CPU roundf). */
+inline void kipp_kv_q8_store(device uchar *block, device const float *v) {
+    float amax = 0.0f;
+    for (uint i = 0; i < KIPP_KV_Q8_BLOCK; ++i) {
+        amax = max(amax, fabs(v[i]));
+    }
+    float scale = amax / 127.0f;
+    float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
+    *(device ushort *)block = kipp_float_to_bf16(scale);
+    device char *qs = (device char *)(block + 2);
+    for (uint i = 0; i < KIPP_KV_Q8_BLOCK; ++i) {
+        qs[i] = char(clamp(round(v[i] * inverse), -127.0f, 127.0f));
+    }
+}
+
+/* Dequantize the four head-dim values a lane owns (values [4*lane, 4*lane+3]
+ * of the head that starts at value index head_offset). Those four values lie
+ * in a single 32-value block. */
+inline float4 kipp_kv_q8_load(device const uchar *cache, ulong slot,
+                              uint head_offset, uint lane) {
+    uint value_index = head_offset + 4u * lane;
+    uint block = value_index / KIPP_KV_Q8_BLOCK;
+    uint local = value_index & (KIPP_KV_Q8_BLOCK - 1u);
+    device const uchar *blk = cache + slot * KIPP_KV_Q8_POS_BYTES +
+                              ulong(block) * KIPP_KV_Q8_BLOCK_BYTES;
+    float scale = kipp_bf16_to_float(*(device const ushort *)blk);
+    device const char *qs = (device const char *)(blk + 2);
+    return scale * float4(float(qs[local]), float(qs[local + 1]),
+                          float(qs[local + 2]), float(qs[local + 3]));
+}
+
+/* One thread per (32-value block, token). */
+kernel void kipp_kv_write_q8_0(device const float *key [[buffer(0)]],
+                               device const float *value [[buffer(1)]],
+                               device uchar *key_cache [[buffer(2)]],
+                               device uchar *value_cache [[buffer(3)]],
+                               constant KvParams &params [[buffer(4)]],
+                               device const uint *block_table [[buffer(5)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    uint block = gid.x;
+    uint token = gid.y;
+    if (block >= KIPP_KV_VALUES_PER_TOKEN / KIPP_KV_Q8_BLOCK) {
+        return;
+    }
+    uint position = params.start_position + token;
+    ulong slot = kipp_kv_slot(params, block_table, position);
+    ulong block_byte =
+        slot * KIPP_KV_Q8_POS_BYTES + ulong(block) * KIPP_KV_Q8_BLOCK_BYTES;
+    ulong state_base =
+        ulong(token) * KIPP_KV_VALUES_PER_TOKEN + ulong(block) * KIPP_KV_Q8_BLOCK;
+    kipp_kv_q8_store(key_cache + block_byte, key + state_base);
+    kipp_kv_q8_store(value_cache + block_byte, value + state_base);
+}
+
 /*
  * Causal grouped-query attention with a streaming (online-softmax) scan
  * over the KV cache. One 256-thread threadgroup per (query head, token):
@@ -498,6 +560,113 @@ kernel void kipp_flash_gqa(device const float *query [[buffer(0)]],
         } else {
             /* Un-normalized numerator at this split's local maximum; the
              * reduce kernel merges the splits in fixed order. */
+            ulong base = ((ulong(token) * KIPP_Q_HEADS + head) *
+                              KIPP_KSPLIT_MAX +
+                          split) *
+                         KIPP_KSPLIT_STRIDE;
+            partials[base + 4u + thread_id] = value;
+            if (thread_id == 0u) {
+                partials[base + 0u] = global_maximum;
+                partials[base + 1u] = total;
+            }
+        }
+    }
+}
+
+/*
+ * Q8_0-KV variant of kipp_flash_gqa. Identical streaming/split-K structure
+ * (so decode, speculative-verify, and the reduce kernel are unchanged); only
+ * the KV load dequantizes each lane's four head-dim values from its 34-byte
+ * block. Shares kipp_flash_gqa_reduce for the split merge.
+ */
+kernel void kipp_flash_gqa_q8_0(device const float *query [[buffer(0)]],
+                                device const uchar *key_cache [[buffer(1)]],
+                                device const uchar *value_cache [[buffer(2)]],
+                                device float *output [[buffer(3)]],
+                                constant KvParams &params [[buffer(4)]],
+                                device const uint *block_table [[buffer(5)]],
+                                device float *partials [[buffer(6)]],
+                                uint3 group_id [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float partial_values[KIPP_GQA_GROUPS][KIPP_HEAD_DIM];
+    uint thread_id = group * 32u + lane;
+    threadgroup float partial_maximum[KIPP_GQA_GROUPS];
+    threadgroup float partial_denominator[KIPP_GQA_GROUPS];
+    threadgroup uint partial_count[KIPP_GQA_GROUPS];
+
+    uint head = group_id.x;
+    uint split = group_id.y;
+    uint token = group_id.z;
+    uint kv_head = head / (KIPP_Q_HEADS / KIPP_KV_HEADS);
+    device const float4 *query4 = (device const float4 *)(
+        query + (ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM);
+    float4 q = query4[lane];
+    const float scale = rsqrt(float(KIPP_HEAD_DIM));
+    uint last_source = params.start_position + token;
+    uint splits = kipp_ksplit_count(last_source, params.ksplit_cap);
+    if (split >= splits) {
+        return;
+    }
+    uint head_offset = kv_head * KIPP_HEAD_DIM;
+
+    uint first_source = split * KIPP_GQA_GROUPS + group;
+    uint source_stride = splits * KIPP_GQA_GROUPS;
+    float maximum = 0.0f;
+    float denominator = 0.0f;
+    float4 accumulator = 0.0f;
+    uint count = 0;
+    for (uint source = first_source; source <= last_source;
+         source += source_stride) {
+        ulong slot = kipp_kv_slot(params, block_table, source);
+        float4 k = kipp_kv_q8_load(key_cache, slot, head_offset, lane);
+        float score = simd_sum(dot(q, k)) * scale;
+        float4 v = kipp_kv_q8_load(value_cache, slot, head_offset, lane);
+        if (count == 0) {
+            maximum = score;
+            denominator = 1.0f;
+            accumulator = v;
+        } else {
+            float new_maximum = max(maximum, score);
+            float correction = exp(maximum - new_maximum);
+            float weight = exp(score - new_maximum);
+            accumulator = accumulator * correction + weight * v;
+            denominator = denominator * correction + weight;
+            maximum = new_maximum;
+        }
+        ++count;
+    }
+
+    ((threadgroup float4 *)partial_values[group])[lane] = accumulator;
+    if (lane == 0) {
+        partial_maximum[group] = maximum;
+        partial_denominator[group] = denominator;
+        partial_count[group] = count;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (thread_id < KIPP_HEAD_DIM) {
+        float global_maximum = KIPP_FLT_LOWEST;
+        for (uint g = 0; g < KIPP_GQA_GROUPS; ++g) {
+            if (partial_count[g] != 0 &&
+                partial_maximum[g] > global_maximum) {
+                global_maximum = partial_maximum[g];
+            }
+        }
+        float value = 0.0f;
+        float total = 0.0f;
+        for (uint g = 0; g < KIPP_GQA_GROUPS; ++g) {
+            if (partial_count[g] == 0) {
+                continue;
+            }
+            float weight = exp(partial_maximum[g] - global_maximum);
+            value += partial_values[g][thread_id] * weight;
+            total += partial_denominator[g] * weight;
+        }
+        if (splits == 1u) {
+            output[(ulong(token) * KIPP_Q_HEADS + head) * KIPP_HEAD_DIM +
+                   thread_id] = value / total;
+        } else {
             ulong base = ((ulong(token) * KIPP_Q_HEADS + head) *
                               KIPP_KSPLIT_MAX +
                           split) *
