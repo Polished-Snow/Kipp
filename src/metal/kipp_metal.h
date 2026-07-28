@@ -10,6 +10,14 @@ const kipp_backend_ops *kipp_metal_backend_operations(void);
  * device compiled and executed every operator test successfully.
  */
 int kipp_metal_run_operator_tests(kipp_error *error);
+
+/*
+ * Isolated projection-matmul micro-benchmark on the live pipelines: every
+ * Qwen3-4B projection shape, per weight scheme, with rotating vs reused
+ * weight buffers to separate traffic-bound from compute-bound behaviour.
+ * A measurement instrument, not a correctness gate.
+ */
+int kipp_metal_run_mm_bench(kipp_error *error);
 const char *kipp_metal_device_name(void);
 
 /* Test hook: reverse a Metal backend session's KV page table before eval. */

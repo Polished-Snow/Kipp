@@ -2611,3 +2611,212 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
     }
     return 0;
 }
+
+/* Isolated projection matmul micro-benchmark; a measurement instrument, not a
+ * correctness gate. Each Qwen3-4B projection shape runs on the live matmul
+ * pipelines at a 512-token round, twice: cycling through eight distinct weight
+ * buffers (so the system-level cache cannot keep serving one resident copy,
+ * which is how a real 36-layer pass behaves) and reusing a single buffer (the
+ * cache-resident best case). A rotating time near the reused time means the
+ * kernel is compute- or issue-bound and weight-traffic reductions cannot help
+ * it; rotating weight-bytes/s near sustained DRAM bandwidth means it is
+ * genuinely traffic-bound. GPU time comes from the command buffer's own
+ * GPUStartTime/GPUEndTime, so host encode cost is excluded. */
+int kipp_metal_run_mm_bench(kipp_error *error) {
+    enum { MM_BENCH_TOKENS = 512, MM_BENCH_ROT = 8, MM_BENCH_ITERS = 24 };
+    static const struct {
+        const char *name;
+        uint32_t rows;
+        uint32_t columns;
+        /* Dispatches per layer with this shape (K and V share one shape, as
+         * do gate and up), so a whole-pass share can be reconstructed. */
+        uint32_t perLayer;
+    } shapes[] = {
+        {"q", 4096, 2560, 1},    {"kv", 1024, 2560, 2},
+        {"o", 2560, 4096, 1},    {"gateup", 9728, 2560, 2},
+        {"down", 2560, 9728, 1},
+    };
+    static const struct {
+        const char *name;
+        const char *pipeline;
+        uint32_t tokenTile;
+    } schemes[] = {
+        {"bf16", "kipp_matmul_bf16", KIPP_METAL_MM_TOKEN_TILE},
+        {"q8_0", "kipp_matmul_q8_0", KIPP_METAL_MM_QUANT_TOKEN_TILE},
+        {"affine4", "kipp_matmul_affine4", KIPP_METAL_MM_QUANT_TOKEN_TILE},
+    };
+    metal_clear_error(error);
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (device == nil) {
+            return metal_fail(error, KIPP_ERROR_UNSUPPORTED,
+                              "no Metal device is available");
+        }
+        id<MTLLibrary> library = nil;
+        NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
+        BOOL matrixKernel = NO;
+        if (metal_compile_pipelines(device, KIPP_TEST_EMBED, KIPP_TEST_Q_HEADS,
+                                    &library, &pipelines, &matrixKernel,
+                                    error) != 0) {
+            return -1;
+        }
+        if (!matrixKernel) {
+            return metal_fail(error, KIPP_ERROR_UNSUPPORTED,
+                              "the matmul bench requires the simdgroup-matrix "
+                              "kernels");
+        }
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        for (size_t s = 0; s < sizeof(schemes) / sizeof(schemes[0]); ++s) {
+            id<MTLComputePipelineState> pipeline =
+                pipelines[@(schemes[s].pipeline)];
+            if (pipeline == nil) {
+                return metal_fail(error, KIPP_ERROR_INTERNAL,
+                                  "missing pipeline %s", schemes[s].pipeline);
+            }
+            int isBf16 = strcmp(schemes[s].name, "bf16") == 0;
+            for (size_t h = 0; h < sizeof(shapes) / sizeof(shapes[0]); ++h) {
+                uint32_t rows = shapes[h].rows;
+                uint32_t columns = shapes[h].columns;
+                size_t rowBytes;
+                if (isBf16) {
+                    rowBytes = (size_t)columns * sizeof(uint16_t);
+                } else if (strcmp(schemes[s].name, "q8_0") == 0) {
+                    rowBytes = (size_t)(columns / 32) * 34;
+                } else {
+                    rowBytes = (size_t)(columns / 32) * 20;
+                }
+                size_t weightBytes = rowBytes * rows;
+                id<MTLBuffer> weights[MM_BENCH_ROT];
+                weights[0] = metal_new_shared_buffer(device, weightBytes);
+                if (weights[0] == nil) {
+                    return metal_fail(error, KIPP_ERROR_MEMORY,
+                                      "mm bench weight allocation failed");
+                }
+                if (isBf16) {
+                    uint16_t *w = weights[0].contents;
+                    for (size_t i = 0; i < (size_t)rows * columns; ++i) {
+                        w[i] = metal_test_float_to_bf16(
+                            (float)((int)(i % 7) - 3));
+                    }
+                } else {
+                    /* Per 32-value block: an FP16 scale (0.5 = 0x3800; the
+                     * affine kernel adds bias -3.5 = 0xc300 at offset 18) in
+                     * front of patterned int8 or packed-nibble payloads. */
+                    uint8_t *w = weights[0].contents;
+                    size_t blockBytes = rowBytes / (columns / 32);
+                    for (size_t b = 0; b < weightBytes / blockBytes; ++b) {
+                        uint8_t *block = w + b * blockBytes;
+                        if (blockBytes == 34) {
+                            block[0] = 0x00;
+                            block[1] = 0x38;
+                            for (size_t i = 0; i < 32; ++i) {
+                                block[2 + i] = (uint8_t)(i * 5 + b);
+                            }
+                        } else {
+                            for (size_t i = 0; i < 16; ++i) {
+                                block[i] = (uint8_t)(i * 3 + b);
+                            }
+                            block[16] = 0x00;
+                            block[17] = 0x38;
+                            block[18] = 0x00;
+                            block[19] = 0xc3;
+                        }
+                    }
+                }
+                for (size_t r = 1; r < MM_BENCH_ROT; ++r) {
+                    weights[r] = metal_new_shared_buffer(device, weightBytes);
+                    if (weights[r] == nil) {
+                        return metal_fail(error, KIPP_ERROR_MEMORY,
+                                          "mm bench weight allocation failed");
+                    }
+                    memcpy(weights[r].contents, weights[0].contents,
+                           weightBytes);
+                }
+                size_t inputElement = isBf16 ? sizeof(uint16_t)
+                                             : sizeof(float);
+                id<MTLBuffer> input = metal_new_shared_buffer(
+                    device,
+                    (size_t)MM_BENCH_TOKENS * columns * inputElement);
+                id<MTLBuffer> output = metal_new_shared_buffer(
+                    device, (size_t)MM_BENCH_TOKENS * rows * sizeof(float));
+                if (input == nil || output == nil) {
+                    return metal_fail(error, KIPP_ERROR_MEMORY,
+                                      "mm bench buffer allocation failed");
+                }
+                if (isBf16) {
+                    uint16_t *x = input.contents;
+                    for (size_t i = 0;
+                         i < (size_t)MM_BENCH_TOKENS * columns; ++i) {
+                        x[i] = metal_test_float_to_bf16(
+                            (float)((int)(i % 5) - 2));
+                    }
+                } else {
+                    float *x = input.contents;
+                    for (size_t i = 0;
+                         i < (size_t)MM_BENCH_TOKENS * columns; ++i) {
+                        x[i] = (float)((int)(i % 5) - 2);
+                    }
+                }
+                metal_matvec_params params = {rows, columns, MM_BENCH_TOKENS};
+                NSUInteger rowGroups =
+                    (rows + KIPP_METAL_MM_ROWS_PER_GROUP - 1) /
+                    KIPP_METAL_MM_ROWS_PER_GROUP;
+                NSUInteger tokenGroups =
+                    (MM_BENCH_TOKENS + schemes[s].tokenTile - 1) /
+                    schemes[s].tokenTile;
+                double seconds[2];
+                for (int mode = 0; mode < 2; ++mode) {
+                    /* mode 0 rotates weight buffers, mode 1 reuses one. A
+                     * discarded warm-up buffer precedes each measurement. */
+                    for (int pass = 0; pass < 2; ++pass) {
+                        id<MTLCommandBuffer> command = [queue commandBuffer];
+                        int iters = pass == 0 ? 2 : MM_BENCH_ITERS;
+                        for (int i = 0; i < iters; ++i) {
+                            id<MTLBuffer> weight =
+                                weights[mode == 0 ? (size_t)i % MM_BENCH_ROT
+                                                  : 0];
+                            metal_dispatch_groups(
+                                command, pipeline, rowGroups, tokenGroups,
+                                KIPP_METAL_GROUP_THREADS,
+                                ^(id<MTLComputeCommandEncoder> encoder) {
+                                  [encoder setBuffer:weight
+                                              offset:0
+                                             atIndex:0];
+                                  [encoder setBuffer:input
+                                              offset:0
+                                             atIndex:1];
+                                  [encoder setBuffer:output
+                                              offset:0
+                                             atIndex:2];
+                                  [encoder setBytes:&params
+                                             length:sizeof(params)
+                                            atIndex:3];
+                                });
+                        }
+                        if (metal_commit_and_wait(command, error) != 0) {
+                            return -1;
+                        }
+                        if (pass == 1) {
+                            seconds[mode] =
+                                command.GPUEndTime - command.GPUStartTime;
+                        }
+                    }
+                }
+                double rotMs = seconds[0] * 1000.0 / MM_BENCH_ITERS;
+                double reuseMs = seconds[1] * 1000.0 / MM_BENCH_ITERS;
+                double flops = 2.0 * rows * columns * MM_BENCH_TOKENS;
+                fprintf(stderr,
+                        "MMBENCH scheme=%s shape=%s rows=%u cols=%u "
+                        "per_layer=%u rot_ms=%.4f reuse_ms=%.4f "
+                        "rot_weight_gbps=%.1f rot_tflops=%.2f "
+                        "reuse_tflops=%.2f\n",
+                        schemes[s].name, shapes[h].name, rows, columns,
+                        shapes[h].perLayer, rotMs, reuseMs,
+                        (double)weightBytes / (rotMs / 1000.0) / 1.0e9,
+                        flops / (rotMs / 1000.0) / 1.0e12,
+                        flops / (reuseMs / 1000.0) / 1.0e12);
+            }
+        }
+    }
+    return 0;
+}

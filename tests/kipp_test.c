@@ -3430,6 +3430,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Metal is not compiled into this test binary\n");
         return 2;
 #endif
+    } else if (argc == 2 && strcmp(argv[1], "--mm-bench-metal") == 0) {
+#ifdef KIPP_ENABLE_METAL
+        kipp_error error = {0};
+        ++tests_run;
+        if (kipp_metal_run_mm_bench(&error) != 0) {
+            ++failures;
+            fprintf(stderr, "FAIL mm_bench: %s\n", error.message);
+        } else {
+            fprintf(stderr, "PASS mm_bench device=%s\n",
+                    kipp_metal_device_name());
+        }
+#else
+        fprintf(stderr, "Metal is not compiled into this test binary\n");
+        return 2;
+#endif
     } else if (argc == 2 && strcmp(argv[1], "--cuda-operators") == 0) {
 #ifdef KIPP_ENABLE_CUDA
         kipp_error error = {0};
