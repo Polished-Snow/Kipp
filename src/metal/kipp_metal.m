@@ -57,13 +57,15 @@
  * values back at model open, so a one-sided edit fails loudly instead of
  * mis-shaping every projection grid. */
 #define KIPP_METAL_MM_TOKEN_TILE 32u
-/* The quantized matmul kernels use a narrower token tile. They already stage
- * dequantized weights in ~16.9 KiB of threadgroup memory, so the wider tile's
- * extra accumulator registers cost far more than its halved weight traffic
- * wins: measured at a 2,048-token prompt, widening the tile takes Q8_0 prefill
- * from 1139 to 135 tok/s while gaining 7% for BF16. Tile width belongs to the
- * kernel, not to the projection layer. */
-#define KIPP_METAL_MM_QUANT_TOKEN_TILE 16u
+/* The quantized matmul kernels keep a narrower 16-token slice per simdgroup:
+ * widening it doubles the accumulator registers on top of the staged
+ * dequantized weights and collapses occupancy (measured at a 2,048-token
+ * prompt, Q8_0 prefill 1139 -> 135 tok/s, while BF16 gains 7%). Their
+ * threadgroup still covers 64 tokens because the four simdgroups share one
+ * 32-row dequantized block, which is also why their row grid advances 32 rows
+ * per threadgroup where the BF16 kernel's advances 128. */
+#define KIPP_METAL_MM_QUANT_TOKEN_TILE 64u
+#define KIPP_METAL_MM_QUANT_ROWS_PER_GROUP 32u
 #define KIPP_METAL_MM_ROWS_PER_GROUP 128u
 
 typedef struct {
@@ -572,18 +574,20 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
     NSString *name = @"kipp_matmul_bf16";
     id<MTLBuffer> activations = workspace.staging;
     NSUInteger tokenTile = KIPP_METAL_MM_TOKEN_TILE;
+    NSUInteger rowsPerGroup = KIPP_METAL_MM_ROWS_PER_GROUP;
     if (weight->type == KIPP_TENSOR_Q8_0) {
         name = @"kipp_matmul_q8_0";
         activations = input;
         tokenTile = KIPP_METAL_MM_QUANT_TOKEN_TILE;
+        rowsPerGroup = KIPP_METAL_MM_QUANT_ROWS_PER_GROUP;
     } else if (weight->type == KIPP_TENSOR_AFFINE4_GS32) {
         name = @"kipp_matmul_affine4";
         activations = input;
         tokenTile = KIPP_METAL_MM_QUANT_TOKEN_TILE;
+        rowsPerGroup = KIPP_METAL_MM_QUANT_ROWS_PER_GROUP;
     }
     metal_matvec_params params = {rows, columns, tokenCount};
-    NSUInteger rowGroups =
-        (rows + KIPP_METAL_MM_ROWS_PER_GROUP - 1u) / KIPP_METAL_MM_ROWS_PER_GROUP;
+    NSUInteger rowGroups = (rows + rowsPerGroup - 1u) / rowsPerGroup;
     NSUInteger tokenGroups = (tokenCount + tokenTile - 1u) / tokenTile;
     metal_enc_groups(
         target, metal_pipeline(model, name), rowGroups, tokenGroups,
@@ -1177,7 +1181,7 @@ static int metal_verify_mm_geometry(
         return 0;
     }
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    id<MTLBuffer> values = metal_new_shared_buffer(device, 4 * sizeof(uint32_t));
+    id<MTLBuffer> values = metal_new_shared_buffer(device, 5 * sizeof(uint32_t));
     if (queue == nil || values == nil) {
         return metal_fail(error, KIPP_ERROR_MEMORY,
                           "unable to allocate the matmul geometry probe");
@@ -1194,15 +1198,16 @@ static int metal_verify_mm_geometry(
     uint32_t hostRows = KIPP_METAL_MM_ROWS_PER_GROUP;
     if (shader[0] != KIPP_METAL_MM_TOKEN_TILE ||
         shader[1] * shader[2] != hostRows ||
-        shader[3] != KIPP_METAL_MM_QUANT_TOKEN_TILE) {
+        shader[3] != KIPP_METAL_MM_QUANT_TOKEN_TILE ||
+        shader[4] != KIPP_METAL_MM_QUANT_ROWS_PER_GROUP) {
         return metal_fail(
             error, KIPP_ERROR_UNSUPPORTED,
             "matmul tile geometry drifted: shader reports %u/%u tokens "
-            "(bf16/quantized) and %u rows per threadgroup, host expects "
-            "%u/%u and %u",
-            shader[0], shader[3], shader[1] * shader[2],
+            "(bf16/quantized) and %u/%u rows per threadgroup, host expects "
+            "%u/%u and %u/%u",
+            shader[0], shader[3], shader[1] * shader[2], shader[4],
             KIPP_METAL_MM_TOKEN_TILE, KIPP_METAL_MM_QUANT_TOKEN_TILE,
-            hostRows);
+            hostRows, KIPP_METAL_MM_QUANT_ROWS_PER_GROUP);
     }
     return 0;
 }
@@ -2217,17 +2222,18 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
         if (matrixKernel) {
             /* Integer-valued quantized matmuls: scale 0.5 (and bias -3.5 for
              * affine4) keep every product exact in FP32, so the comparison is
-             * exact. 19 tokens exercise both the full-16 transposed-store
-             * path (token group 0) and the partial-tail path (group 1); the
-             * input buffer is padded to whole 8-token fragments because the
-             * kernels load full fragments and discard the invalid rows. */
+             * exact. 67 tokens span two 64-token threadgroup tiles: group 0
+             * runs all four simdgroup slices full, and group 1 runs one
+             * ragged 3-token slice with the other three simdgroups inactive
+             * but still participating in the dequant barriers — the
+             * deadlock-shaped path a barrier bug would hang. The input buffer
+             * is padded to whole 8-token fragments because the kernels load
+             * full fragments and discard the invalid rows. */
             enum {
                 QM_ROWS = 64,
                 QM_COLS = 64,
-                /* Spans every token fragment of the widest tile and still
-                 * leaves a ragged tail in the following tile. */
-                QM_TOKENS = 35,
-                QM_PADDED_TOKENS = 64,
+                QM_TOKENS = 67,
+                QM_PADDED_TOKENS = 72,
                 QM_BLOCKS = QM_COLS / 32,
                 QM_Q8_ROW_BYTES = QM_BLOCKS * 34,
                 QM_A4_ROW_BYTES = QM_BLOCKS * 20
@@ -2326,8 +2332,8 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                 id<MTLCommandBuffer> command = [queue commandBuffer];
                 metal_dispatch_groups(
                     command, pipelines[cases[index].pipeline],
-                    (QM_ROWS + KIPP_METAL_MM_ROWS_PER_GROUP - 1u) /
-                        KIPP_METAL_MM_ROWS_PER_GROUP,
+                    (QM_ROWS + KIPP_METAL_MM_QUANT_ROWS_PER_GROUP - 1u) /
+                        KIPP_METAL_MM_QUANT_ROWS_PER_GROUP,
                     (QM_TOKENS + KIPP_METAL_MM_QUANT_TOKEN_TILE - 1u) /
                         KIPP_METAL_MM_QUANT_TOKEN_TILE,
                     KIPP_METAL_GROUP_THREADS,
@@ -2640,10 +2646,14 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
         const char *name;
         const char *pipeline;
         uint32_t tokenTile;
+        uint32_t rowsPerGroup;
     } schemes[] = {
-        {"bf16", "kipp_matmul_bf16", KIPP_METAL_MM_TOKEN_TILE},
-        {"q8_0", "kipp_matmul_q8_0", KIPP_METAL_MM_QUANT_TOKEN_TILE},
-        {"affine4", "kipp_matmul_affine4", KIPP_METAL_MM_QUANT_TOKEN_TILE},
+        {"bf16", "kipp_matmul_bf16", KIPP_METAL_MM_TOKEN_TILE,
+         KIPP_METAL_MM_ROWS_PER_GROUP},
+        {"q8_0", "kipp_matmul_q8_0", KIPP_METAL_MM_QUANT_TOKEN_TILE,
+         KIPP_METAL_MM_QUANT_ROWS_PER_GROUP},
+        {"affine4", "kipp_matmul_affine4", KIPP_METAL_MM_QUANT_TOKEN_TILE,
+         KIPP_METAL_MM_QUANT_ROWS_PER_GROUP},
     };
     metal_clear_error(error);
     @autoreleasepool {
@@ -2759,8 +2769,8 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
                 }
                 metal_matvec_params params = {rows, columns, MM_BENCH_TOKENS};
                 NSUInteger rowGroups =
-                    (rows + KIPP_METAL_MM_ROWS_PER_GROUP - 1) /
-                    KIPP_METAL_MM_ROWS_PER_GROUP;
+                    (rows + schemes[s].rowsPerGroup - 1) /
+                    schemes[s].rowsPerGroup;
                 NSUInteger tokenGroups =
                     (MM_BENCH_TOKENS + schemes[s].tokenTile - 1) /
                     schemes[s].tokenTile;
