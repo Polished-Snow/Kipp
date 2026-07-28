@@ -1,0 +1,140 @@
+name: Release
+
+# Attach prebuilt binaries to a GitHub release. Runs when a release is
+# published (not on tag push, which would race the maintainer's
+# `gh release create`), and by hand via workflow_dispatch for retroactive
+# uploads — `ref` exists because an old tag may predate `make dist`.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload assets to, e.g. v0.0.4"
+        required: true
+      ref:
+        description: "Ref to build (defaults to the tag)"
+        required: false
+      dry_run:
+        description: "Build and gate but skip the upload"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  macos:
+    name: macOS arm64 assets
+    runs-on: macos-15
+    env:
+      # MSL `bfloat` needs Metal 3.1, which is macOS 14 — and macOS 14 runs on
+      # every Apple Silicon Mac, so nothing that could run the Metal binary is
+      # excluded. Set here rather than in the Makefile so local dev builds are
+      # untouched; clang reads this env var as -mmacosx-version-min.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref || inputs.tag }}
+      - name: Version must match the tag
+        run: |
+          tag="${RELEASE_TAG#v}"
+          header="$(sed -n 's/#define KIPP_VERSION "\(.*\)"/\1/p' src/kipp.h)"
+          citation="$(sed -n 's/^version: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' CITATION.cff)"
+          if [ "$header" != "$tag" ] || [ "$citation" != "$tag" ]; then
+            echo "mismatch: tag=$tag kipp.h=$header CITATION.cff=$citation"
+            exit 1
+          fi
+      - name: Build distribution tarball
+        run: make dist
+      # The arm64 linker ad-hoc signs automatically and the signature lives
+      # inside the Mach-O, so tar preserves it; this just proves both held.
+      - name: Verify signatures and deployment target
+        run: |
+          for b in kipp kipp-metal kipp-server kipp-server-metal; do
+            codesign --verify --strict "build/$b"
+            otool -l "build/$b" \
+              | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}' \
+              | grep -qx '14.0'
+          done
+      # A broken binary must not ship: rerun the hermetic suite and the Metal
+      # operator comparisons against the exact objects that were packaged.
+      - name: Hermetic unit tests
+        run: |
+          make build/kipp_test
+          build/kipp_test
+      - name: Metal operator tests
+        env:
+          KIPP_METAL_REQUIRE_MMA: "1"
+        run: |
+          make build/kipp_test_metal
+          build/kipp_test_metal --metal-operators
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-arm64
+          path: build/dist/kipp-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 assets
+    # Deliberately the oldest supported runner: binaries link the glibc they
+    # are built against, and 22.04's 2.35 floor keeps them running on older
+    # distributions. CPU binaries only — runners have no CUDA toolkit or GPU
+    # to gate a CUDA build against, so that backend stays build-from-source.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref || inputs.tag }}
+      - name: Version must match the tag
+        run: |
+          tag="${RELEASE_TAG#v}"
+          header="$(sed -n 's/#define KIPP_VERSION "\(.*\)"/\1/p' src/kipp.h)"
+          citation="$(sed -n 's/^version: "\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' CITATION.cff)"
+          if [ "$header" != "$tag" ] || [ "$citation" != "$tag" ]; then
+            echo "mismatch: tag=$tag kipp.h=$header CITATION.cff=$citation"
+            exit 1
+          fi
+      - name: Build distribution tarball
+        run: make dist
+      - name: Hermetic unit tests
+        run: |
+          make build/kipp_test
+          build/kipp_test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-x86_64
+          path: build/dist/kipp-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Upload release assets
+    needs: [macos, linux]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum kipp-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$RELEASE_TAG" dist/kipp-*.tar.gz dist/SHA256SUMS \
+            --clobber -R "$GITHUB_REPOSITORY"
