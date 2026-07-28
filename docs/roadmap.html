@@ -30,6 +30,24 @@
 <p>This sequence is binding unless <code>ARCHITECTURE.md</code> is explicitly revised.
 Correctness gates every phase. Status notes summarize delivered work and
 link measured claims back to the benchmark records.</p>
+<p><strong>Status (v0.0.5):</strong> This release corrects the record and closes the campaign
+the correction reframed. The published llama.cpp head-to-head proved <strong>stale
+in Kipp's favor</strong> — the same command, binary, and weights measure ~2× the
+recorded llama.cpp numbers today, so the comparison was re-measured
+same-session and the README table replaced (decode: llama.cpp ~3% ahead on
+matched schemes, not the claimed 1.7× Kipp win; prefill: llama.cpp
+2.9×/2.25× ahead on BF16/Q8_0). The cause of that prefill lead is an instruction class: on M5,
+llama.cpp routes GEMM through the Metal 4 tensor API (neural accelerators),
+worth ~2.3–3× on prefill and nothing on decode; restricted to the
+simdgroup-matrix class Kipp uses, llama.cpp trails Kipp on every scheme. A
+new isolated matmul instrument (<code>--mm-bench-metal</code>) showed the simdgroup
+kernels are compute/issue-bound (not traffic-bound), which retires the
+planned &quot;threadgroup-staged K-blocked matmul&quot;; what shipped instead is a
+bit-exact shared-dequant rotation of the quantized matmuls (<strong>Q8_0 +10.2%,
+affine4 +11.7%</strong> at a 2,048-token prompt, decode unchanged) plus prebuilt
+release binaries on every GitHub release. <strong>The next engine campaign is a
+gated <code>mpp::tensor_ops</code> matmul path</strong> behind the same runtime-probe ladder
+and oracle gates as the simdgroup kernels. CUDA was not revalidated.</p>
 <p><strong>Status (v0.0.4):</strong> This release is about Metal prefill, which was the one
 axis where Kipp measurably lost to llama.cpp. Prefill is now <strong>~2.5× faster on
 every weight scheme</strong> at a 2,048-token prompt (BF16 504→1308, Q8_0 453→1142,
@@ -108,10 +126,13 @@ smaller, coherent output), both gated on CPU + Metal. Production KV block
 pooling with cross-request prefix caching is delivered and is the serving
 default on CPU/Metal. An opt-in <strong>Q8_0 KV cache</strong> (<code>--kv-quant q8_0</code>) is
 delivered on CPU + Metal, ~1.9× smaller than BF16 and gated for tolerance
-and placement invariance. Remaining: a token-budget scheduler and 4-bit KV,
-each behind its own CPU-vs-GPU gate, plus a threadgroup-staged K-blocked
-matmul, which is what the remaining prefill gap to llama.cpp now needs. Prompt-lookup and draft-model speculative
-decoding plus generated-token logprobs are already delivered.</p>
+and placement invariance. Remaining: a <strong>Metal 4 <code>mpp::tensor_ops</code> matmul
+path</strong> (the instruction class behind llama.cpp's remaining prefill lead on
+M5-class hardware; the previously planned K-blocked matmul was measured
+unnecessary — the simdgroup kernels are compute-bound, not traffic-bound),
+plus a token-budget scheduler and 4-bit KV, each behind its own CPU-vs-GPU
+gate. Prompt-lookup and draft-model speculative decoding plus
+generated-token logprobs are already delivered.</p>
 <h2>Phase 0 — Specify the model</h2>
 <ul>
 <li>Pin <code>Qwen/Qwen3-4B-Base</code> and its exact revision.</li>
