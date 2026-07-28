@@ -32,6 +32,9 @@
   </a>
 </p>
 <p align="center">
+  <a href="https://github.com/Polished-Snow/Kipp/actions/workflows/ci.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/Polished-Snow/Kipp/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI">
+  </a>
   <a href="https://polished-snow.github.io/Kipp/">
     <img src="https://img.shields.io/badge/documentation-github%20pages-6366F1?style=for-the-badge" alt="Documentation">
   </a>
@@ -50,30 +53,55 @@
     <img src="https://img.shields.io/badge/follow-Polished%20Snow-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" alt="Follow on LinkedIn">
   </a>
 </p>
-<h2>Status</h2>
-<p>Kipp v0.0.4 targets the pinned <strong>Qwen3 dense family</strong> (0.6B–32B, base and
-instruct) through a strict compiled-in checkpoint registry.</p>
-<ul>
-<li><strong>Backends:</strong> scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
-revalidated on H100 for the current default checkpoints. Larger 14B/32B
-CUDA gates were previously validated on A100.</li>
-<li><strong>Weights:</strong> BF16, near-lossless Q8_0, and Q4-class affine 4-bit projection
-weights. Quantization improves decode by roughly 1.6–2.2× on the measured
-4B setup while Metal prefill remains near BF16 parity.</li>
-<li><strong>Serving:</strong> OpenAI Completions and Chat Completions, SSE, 32-way batched
-decode, full sampling, latency metrics, and cross-request KV prefix reuse
-through a content-addressed CPU/Metal block pool.</li>
-<li><strong>CLI:</strong> greedy or sampled generation, multi-turn chat, perplexity scoring,
-prompt-lookup speculation, and draft-model speculation.</li>
-<li><strong>Prefill:</strong> ~2.5× faster on Metal this release (BF16 1308, Q8_0 1101,
-affine4 1087 tok/s at a 2,048-token prompt on an M5 Max) with decode
-unchanged.</li>
-</ul>
-<h2>What is Kipp?</h2>
-<p>Kipp is a small, <strong>hand-written Qwen3 inference engine</strong> for local hardware.
-Most engines try to run everything; Kipp deliberately runs one pinned model
-family and aims to run it well enough that you can read the engine in an
+<p>A small, <strong>hand-written Qwen3 inference engine</strong> for local hardware — C11 core,
+no frameworks in the hot path, and every GPU kernel gated against a scalar CPU
+oracle on real hardware before it counts as working.</p>
+<p>Most engines try to run everything. Kipp deliberately runs one pinned model
+family and aims to run it well enough that you can read the whole engine in an
 afternoon.</p>
+<h3>How fast</h3>
+<p>Qwen3-4B on an Apple M5 Max, against llama.cpp on the <strong>same host, the same
+weights, and the same session</strong> — the honest comparison, prefill row included:</p>
+<table>
+<thead>
+<tr>
+<th>tokens/s</th>
+<th>Kipp</th>
+<th>llama.cpp</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Decode</strong>, BF16</td>
+<td><strong>59.8</strong></td>
+<td>35.0</td>
+<td>Kipp <strong>1.7×</strong></td>
+</tr>
+<tr>
+<td><strong>Decode</strong>, Q8_0</td>
+<td><strong>94.3</strong></td>
+<td>56.5</td>
+<td>Kipp <strong>1.7×</strong></td>
+</tr>
+<tr>
+<td><strong>Prefill</strong>, BF16 @2048</td>
+<td><strong>1308</strong></td>
+<td>2174</td>
+<td>llama.cpp <strong>1.7×</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Decode is where Kipp wins and where most local use lives. Prefill was ~4.5×
+behind until v0.0.4 rebuilt the round shape (~2.5× on every weight scheme); the
+rest of that gap needs a K-blocked matmul and is honestly still open. Every
+number traces to a committed file in <a href="https://github.com/Polished-Snow/Kipp/tree/main/bench/results"><code>bench/results/</code></a>, and the
+<a href="https://polished-snow.github.io/Kipp/benchmarks.html">measurement protocol</a>
+explains why they are all same-session medians rather than best-of runs.</p>
+<p>Also measured: <strong>175× faster TTFT</strong> on a repeated 6,890-token prompt via
+cross-request prefix reuse, Q8_0 perplexity within <strong>0.02%</strong> of BF16, and 4-bit
+affine weights at <strong>128 tok/s</strong> decode.</p>
+<h3>What it is</h3>
 <ul>
 <li><strong>Readable by design</strong> — follow one token from embeddings to logits through
 the linear, model-specific reference pass in <code>src/kipp.c</code>.</li>
@@ -84,29 +112,48 @@ PyTorch, JAX, and similar frameworks never enter inference.</li>
 <li><strong>One model family, deeply</strong> — closer to <code>whisper.cpp</code> and <code>antirez/ds4</code>
 than a generic runner such as llama.cpp or vLLM.</li>
 <li><strong>Correctness first</strong> — every GPU backend must match the CPU oracle on real
-hardware before it is called working.</li>
+hardware before it is called working. Kernels that no gate exercises are
+treated as untested, not as working.</li>
 <li><strong>mmap-backed loading</strong> — weights are mapped instead of eagerly copied into
 RAM wherever the backend permits.</li>
 <li><strong>Registry, not runner</strong> — every supported checkpoint is pinned to one
 revision in <code>src/kipp_checkpoints.h</code>; anything else is rejected at load.</li>
 </ul>
+<h3>What is in v0.0.4</h3>
+<ul>
+<li><strong>Backends:</strong> scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
+validated on H100 for the current default checkpoints (14B/32B on A100).</li>
+<li><strong>Weights:</strong> BF16, near-lossless Q8_0, and Q4-class affine 4-bit projections.</li>
+<li><strong>KV cache:</strong> paged 32-position blocks, cross-request prefix sharing, and an
+opt-in Q8_0 KV cache (~1.9× smaller; a memory feature, not a speed one).</li>
+<li><strong>Serving:</strong> OpenAI Completions and Chat Completions, SSE, 32-way batched
+decode, full sampling, Prometheus metrics.</li>
+<li><strong>CLI:</strong> greedy or sampled generation, multi-turn chat, perplexity scoring,
+prompt-lookup and draft-model speculation.</li>
+</ul>
 <h2>Quickstart</h2>
+<p><strong>Prerequisites:</strong> a C11 compiler, <a href="https://docs.astral.sh/uv/"><code>uv</code></a> for the
+Python tooling, and Xcode command-line tools for the Metal build. The tooling
+environment includes PyTorch, because weight conversion reads the original
+safetensors — inference itself never touches it.</p>
 <pre><code class="language-bash">git clone https://github.com/Polished-Snow/Kipp.git
 cd Kipp
-make test         # warning-clean native unit tests; no model download
-make cpu          # builds the session-backed CPU CLI
-make metal        # builds the Apple Metal CLI
-make server-metal # builds the completions/chat/metrics server on Metal
+make quickstart   # downloads + converts Qwen3-0.6B (~1.5 GB), then generates
 </code></pre>
-<p>The real-model correctness gates are explicit because they download and
-convert gigabytes of pinned BF16 weights. <code>CHECKPOINT</code> selects any id from
-the supported registry (default <code>qwen3-4b-base</code>):</p>
-<pre><code class="language-bash">make test-cpu-model                   # complete CPU model suite
-make test-metal
-make test-server
-make CHECKPOINT=qwen3-0.6b-base test-model   # any registry checkpoint
+<p>That is clone to first token in one command. It uses the smallest registered
+checkpoint so the first run costs a couple of gigabytes rather than the ~16 GB
+the 4B default needs, and picks Metal on macOS or the CPU path elsewhere.</p>
+<p>Build the individual binaries directly if you prefer:</p>
+<pre><code class="language-bash">make cpu          # session-backed CPU CLI
+make metal        # Apple Metal CLI
+make server-metal # completions/chat/metrics server on Metal
+make test         # hermetic unit tests; no model download (needs uv)
 </code></pre>
-<p>Run a short Metal decode — greedy by default, or sampled with a seed:</p>
+<p>Converting a larger checkpoint is explicit, because it downloads and rewrites
+multiple gigabytes. <code>CHECKPOINT</code> selects any id from the registry:</p>
+<pre><code class="language-bash">make CHECKPOINT=qwen3-4b-base convert   # ~8 GB download, ~7.5 GiB GGUF
+</code></pre>
+<p>Then run a decode — greedy by default, or sampled with a seed:</p>
 <pre><code class="language-bash">build/kipp-metal --backend metal \
   --model models/qwen3-4b-base/kipp-qwen3-4b-base-bf16.gguf \
   --prompt &quot;Hi 世界&quot; --decode 8
@@ -115,6 +162,13 @@ build/kipp-metal --backend metal \
   --model models/qwen3-4b-base/kipp-qwen3-4b-base-bf16.gguf \
   --prompt &quot;Once upon a time&quot; --decode 64 \
   --temperature 0.8 --top-p 0.95 --seed 7
+</code></pre>
+<p>The real-model correctness gates need a converted checkpoint and its pinned
+vectors:</p>
+<pre><code class="language-bash">make test-cpu-model                          # complete CPU model suite
+make test-metal                              # complete Metal suite
+make test-server
+make CHECKPOINT=qwen3-0.6b-base test-model   # any registry checkpoint
 </code></pre>
 <p>Or serve the OpenAI Completions subset on loopback:</p>
 <pre><code class="language-bash">build/kipp-server-metal --backend metal --port 8080 \

@@ -1,5 +1,6 @@
 .PHONY: all cpu server server-metal server-cuda test test-tools test-sanitize \
-	tools-env model convert vectors chat-vectors test-model test-cpu-model \
+	tools-env quickstart model convert vectors chat-vectors test-model \
+	test-cpu-model \
 	test-ppl test-phase2 \
 	test-paged-cpu test-pooled-cpu test-qkv-cpu test-multilogit metal \
 	test-metal-ops test-qkv-metal \
@@ -23,6 +24,19 @@ VECTOR_DIR := tests/test-vectors/$(CHECKPOINT)
 CHAT_SOURCE := models/$(CHAT_CHECKPOINT)/source
 CHAT_VECTOR := tests/test-vectors/$(CHAT_CHECKPOINT)/chat-cases.json
 CHAT_MODEL_GGUF := models/$(CHAT_CHECKPOINT)/kipp-$(CHAT_CHECKPOINT)-bf16.gguf
+# `make quickstart` uses the smallest registered checkpoint so a first run costs
+# a ~1.5 GB download rather than the ~16 GB the 4B default needs, and picks the
+# GPU backend that exists on this platform.
+QUICKSTART_CHECKPOINT := qwen3-0.6b-base
+QUICKSTART_GGUF := \
+	models/$(QUICKSTART_CHECKPOINT)/kipp-$(QUICKSTART_CHECKPOINT)-bf16.gguf
+ifeq ($(shell uname -s),Darwin)
+QUICKSTART_BACKEND := metal
+QUICKSTART_BINARY := $(BUILD_DIR)/kipp-metal
+else
+QUICKSTART_BACKEND := cpu
+QUICKSTART_BINARY := $(BUILD_DIR)/kipp
+endif
 
 CPPFLAGS := -Isrc
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
@@ -154,6 +168,15 @@ docs-check: tools-env
 test-tools: docs-check
 	uv run --project $(TOOLS_DIR) --python 3.12 \
 		python -m unittest tests/test_tooling.py
+
+# Clone to first token in one command. Downloads and converts the 0.6B
+# checkpoint (~1.5 GB) rather than the 4B default, so a first run is minutes
+# instead of most of an hour, then generates from it.
+quickstart: $(QUICKSTART_BINARY)
+	$(MAKE) CHECKPOINT=$(QUICKSTART_CHECKPOINT) convert
+	$(QUICKSTART_BINARY) --backend $(QUICKSTART_BACKEND) \
+		--model $(QUICKSTART_GGUF) \
+		--prompt "The capital of France is" --decode 32
 
 model: tools-env
 	tools/download_model.sh --checkpoint $(CHECKPOINT)
