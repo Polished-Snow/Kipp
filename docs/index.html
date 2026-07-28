@@ -273,6 +273,15 @@ ground rules for human and AI contributors</li>
 contributor: keep a C11 core, isolate backends, preserve mmap-backed loading,
 test on real hardware before claiming success, and never vendor code from the
 <a href="research/inspiration-notes.html">reference repositories</a>.</p>
+<h2>Security</h2>
+<p>Kipp's server is a hand-written C11 HTTP server with its own HTTP and JSON
+parsers. It binds loopback only and has no authentication or TLS by design —
+see <a href="https://github.com/Polished-Snow/Kipp/blob/main/SECURITY.md"><code>SECURITY.md</code></a> for the threat model and for how to report a
+vulnerability privately.</p>
+<h2>Citing</h2>
+<p>If you use Kipp or its measurements in academic work, see
+<a href="https://github.com/Polished-Snow/Kipp/blob/main/CITATION.cff"><code>CITATION.cff</code></a> (GitHub renders a &quot;Cite this repository&quot; button
+from it).</p>
 <h2>Enjoying Kipp?</h2>
 <p>Kipp is built in the open by <a href="https://github.com/Polished-Snow">Polished Snow</a>.
 If you find it useful, star the repository and follow project updates:</p>

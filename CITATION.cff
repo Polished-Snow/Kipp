@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+title: "Kipp: a hand-written Qwen3 inference engine"
+message: "If you use Kipp or its measurements in academic work, please cite it."
+type: software
+authors:
+  - given-names: David
+    family-names: "Khachatryan Johansson"
+    affiliation: "Polished Snow"
+repository-code: "https://github.com/Polished-Snow/Kipp"
+url: "https://polished-snow.github.io/Kipp/"
+abstract: >-
+  Kipp is a small inference engine written by hand in C11 for the pinned Qwen3
+  dense checkpoints, with an Apple Metal backend and an isolated NVIDIA CUDA
+  backend. Every GPU kernel is gated against a scalar CPU reference on real
+  hardware: paged and pooled KV layouts must reproduce the contiguous layout
+  bitwise under a deliberately scrambled block table, and GPU logits must match
+  the oracle within a documented tolerance with an identical arg max.
+keywords:
+  - inference engine
+  - large language models
+  - Qwen3
+  - Metal
+  - CUDA
+  - Apple silicon
+  - quantization
+  - paged attention
+  - speculative decoding
+license: MIT
+version: 0.0.4
+date-released: "2026-07-27"

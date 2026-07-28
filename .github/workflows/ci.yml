@@ -3,6 +3,11 @@ name: CI
 on:
   push:
   pull_request:
+  # A weekly run catches toolchain and runner-image drift on a repository whose
+  # correctness claims rest on compiler and GPU behaviour.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,9 +38,35 @@ jobs:
         run: git diff --check
 
   macos:
-    name: macOS compile
+    name: macOS build and Metal operators
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: CPU and Metal binaries
         run: make cpu server metal server-metal
+      # The unit binary builds without the Python tooling, so macOS can run the
+      # hermetic suite without pulling a multi-gigabyte environment; the Linux
+      # job already covers the tooling and docs-drift checks.
+      - name: Hermetic unit tests
+        run: |
+          make build/kipp_test
+          build/kipp_test
+      # Model-free Metal kernel comparisons, and the only place CI executes a
+      # GPU kernel. A reserved-keyword typo once disabled every
+      # simdgroup-matrix kernel for two days while every gate still passed,
+      # because nothing automated ran Metal at all.
+      #
+      # Confirmed on the macos-15-arm64 image: the operator suite runs on an
+      # "Apple Paravirtual device" and the bfloat simdgroup-matrix library
+      # compiles there, so the matmul and prefill-attention comparisons are
+      # genuinely exercised rather than skipped. KIPP_METAL_REQUIRE_MMA turns a
+      # silent fallback to the vector path into a hard failure. If a future
+      # runner image legitimately loses bfloat simdgroup-matrix support, drop
+      # the flag deliberately rather than ignoring the failure -- losing that
+      # coverage is itself worth noticing.
+      - name: Metal operator tests
+        env:
+          KIPP_METAL_REQUIRE_MMA: "1"
+        run: |
+          make build/kipp_test_metal
+          build/kipp_test_metal --metal-operators

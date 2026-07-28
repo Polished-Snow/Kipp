@@ -229,6 +229,19 @@ contributor: keep a C11 core, isolate backends, preserve mmap-backed loading,
 test on real hardware before claiming success, and never vendor code from the
 [reference repositories](docs/research/inspiration-notes.md).
 
+## Security
+
+Kipp's server is a hand-written C11 HTTP server with its own HTTP and JSON
+parsers. It binds loopback only and has no authentication or TLS by design —
+see [`SECURITY.md`](SECURITY.md) for the threat model and for how to report a
+vulnerability privately.
+
+## Citing
+
+If you use Kipp or its measurements in academic work, see
+[`CITATION.cff`](CITATION.cff) (GitHub renders a "Cite this repository" button
+from it).
+
 ## Enjoying Kipp?
 
 Kipp is built in the open by [Polished Snow](https://github.com/Polished-Snow).
