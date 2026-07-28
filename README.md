@@ -39,18 +39,31 @@ afternoon.
 ### How fast
 
 Qwen3-4B on an Apple M5 Max, against llama.cpp on the **same host, the same
-weights, and the same session** — the honest comparison, prefill row included:
+weights, and the same session** — the honest comparison, losing rows included
+(re-measured 2026-07-28; an earlier table here compared against a degraded
+llama.cpp session and overstated Kipp — withdrawn and documented in the
+[benchmarks](https://polished-snow.github.io/Kipp/benchmarks.html)):
 
 | tokens/s | Kipp | llama.cpp | |
 |---|---|---|---|
-| **Decode**, BF16 | **59.8** | 35.0 | Kipp **1.7×** |
-| **Decode**, Q8_0 | **94.3** | 56.5 | Kipp **1.7×** |
-| **Prefill**, BF16 @2048 | **1308** | 2174 | llama.cpp **1.7×** |
+| **Decode**, BF16 | 61.2 | **63.1** | llama.cpp +3% |
+| **Decode**, Q8_0 | 97.4 | **100.5** | llama.cpp +3% |
+| **Decode**, 4-bit | 128.8 (affine4) | **149.6** (Q4_0) | llama.cpp **1.16×**\* |
+| **Prefill**, BF16 @2048 | 1,312 | **3,788** | llama.cpp **2.9×** |
+| **Prefill**, Q8_0 @2048 | 1,213 | **2,729** | llama.cpp **2.25×** |
+| **Prefill**, 4-bit @2048 | **1,214** (affine4) | 1,225 (Q4_0) | parity\* |
 
-Decode is where Kipp wins and where most local use lives. Prefill was ~4.5×
-behind until v0.0.4 rebuilt the round shape (~2.5× on every weight scheme); the
-rest of that gap needs a K-blocked matmul and is honestly still open. Every
-number traces to a committed file in [`bench/results/`](bench/results/), and the
+\* affine4 (scale+bias, gs32) and Q4_0 (scale-only) are the closest available
+4-bit schemes, not identical ones — Q4_0 dequantizes more cheaply, affine4
+carries a bias term.
+
+The prefill gap has one specific cause: on M5, llama.cpp routes GEMM through
+the Metal 4 tensor API (the neural accelerators), an instruction class worth
+~2.3–3× on prefill and nothing on decode. Restricted to the same
+simdgroup-matrix class Kipp uses, llama.cpp's prefill measures 1,261 / 1,022 /
+608 on those three rows — Kipp leads its instruction class on every scheme,
+and a tensor-API path is the next roadmap item. Every number traces to a
+committed file in [`bench/results/`](bench/results/), and the
 [measurement protocol](https://polished-snow.github.io/Kipp/benchmarks.html)
 explains why they are all same-session medians rather than best-of runs.
 
@@ -76,7 +89,7 @@ affine weights at **128 tok/s** decode.
 - **Registry, not runner** — every supported checkpoint is pinned to one
   revision in `src/kipp_checkpoints.h`; anything else is rejected at load.
 
-### What is in v0.0.4
+### What is in v0.0.5
 
 - **Backends:** scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
   validated on H100 for the current default checkpoints (14B/32B on A100).

@@ -61,7 +61,10 @@ family and aims to run it well enough that you can read the whole engine in an
 afternoon.</p>
 <h3>How fast</h3>
 <p>Qwen3-4B on an Apple M5 Max, against llama.cpp on the <strong>same host, the same
-weights, and the same session</strong> — the honest comparison, prefill row included:</p>
+weights, and the same session</strong> — the honest comparison, losing rows included
+(re-measured 2026-07-28; an earlier table here compared against a degraded
+llama.cpp session and overstated Kipp — withdrawn and documented in the
+<a href="https://polished-snow.github.io/Kipp/benchmarks.html">benchmarks</a>):</p>
 <table>
 <thead>
 <tr>
@@ -74,28 +77,52 @@ weights, and the same session</strong> — the honest comparison, prefill row in
 <tbody>
 <tr>
 <td><strong>Decode</strong>, BF16</td>
-<td><strong>59.8</strong></td>
-<td>35.0</td>
-<td>Kipp <strong>1.7×</strong></td>
+<td>61.2</td>
+<td><strong>63.1</strong></td>
+<td>llama.cpp +3%</td>
 </tr>
 <tr>
 <td><strong>Decode</strong>, Q8_0</td>
-<td><strong>94.3</strong></td>
-<td>56.5</td>
-<td>Kipp <strong>1.7×</strong></td>
+<td>97.4</td>
+<td><strong>100.5</strong></td>
+<td>llama.cpp +3%</td>
+</tr>
+<tr>
+<td><strong>Decode</strong>, 4-bit</td>
+<td>128.8 (affine4)</td>
+<td><strong>149.6</strong> (Q4_0)</td>
+<td>llama.cpp <strong>1.16×</strong>*</td>
 </tr>
 <tr>
 <td><strong>Prefill</strong>, BF16 @2048</td>
-<td><strong>1308</strong></td>
-<td>2174</td>
-<td>llama.cpp <strong>1.7×</strong></td>
+<td>1,312</td>
+<td><strong>3,788</strong></td>
+<td>llama.cpp <strong>2.9×</strong></td>
+</tr>
+<tr>
+<td><strong>Prefill</strong>, Q8_0 @2048</td>
+<td>1,213</td>
+<td><strong>2,729</strong></td>
+<td>llama.cpp <strong>2.25×</strong></td>
+</tr>
+<tr>
+<td><strong>Prefill</strong>, 4-bit @2048</td>
+<td><strong>1,214</strong> (affine4)</td>
+<td>1,225 (Q4_0)</td>
+<td>parity*</td>
 </tr>
 </tbody>
 </table>
-<p>Decode is where Kipp wins and where most local use lives. Prefill was ~4.5×
-behind until v0.0.4 rebuilt the round shape (~2.5× on every weight scheme); the
-rest of that gap needs a K-blocked matmul and is honestly still open. Every
-number traces to a committed file in <a href="https://github.com/Polished-Snow/Kipp/tree/main/bench/results"><code>bench/results/</code></a>, and the
+<p>* affine4 (scale+bias, gs32) and Q4_0 (scale-only) are the closest available
+4-bit schemes, not identical ones — Q4_0 dequantizes more cheaply, affine4
+carries a bias term.</p>
+<p>The prefill gap has one specific cause: on M5, llama.cpp routes GEMM through
+the Metal 4 tensor API (the neural accelerators), an instruction class worth
+~2.3–3× on prefill and nothing on decode. Restricted to the same
+simdgroup-matrix class Kipp uses, llama.cpp's prefill measures 1,261 / 1,022 /
+608 on those three rows — Kipp leads its instruction class on every scheme,
+and a tensor-API path is the next roadmap item. Every number traces to a
+committed file in <a href="https://github.com/Polished-Snow/Kipp/tree/main/bench/results"><code>bench/results/</code></a>, and the
 <a href="https://polished-snow.github.io/Kipp/benchmarks.html">measurement protocol</a>
 explains why they are all same-session medians rather than best-of runs.</p>
 <p>Also measured: <strong>175× faster TTFT</strong> on a repeated 6,890-token prompt via
@@ -119,7 +146,7 @@ RAM wherever the backend permits.</li>
 <li><strong>Registry, not runner</strong> — every supported checkpoint is pinned to one
 revision in <code>src/kipp_checkpoints.h</code>; anything else is rejected at load.</li>
 </ul>
-<h3>What is in v0.0.4</h3>
+<h3>What is in v0.0.5</h3>
 <ul>
 <li><strong>Backends:</strong> scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
 validated on H100 for the current default checkpoints (14B/32B on A100).</li>

@@ -3,6 +3,66 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## v0.0.5 — 2026-07-28
+
+### The llama.cpp comparison was stale — corrected, and the loss stated plainly
+- **The published head-to-head was wrong in Kipp's favor and is withdrawn.**
+  Re-running the exact committed llama-bench command, binary, weights, and OS
+  gives ~2× the recorded llama.cpp numbers on both axes (prefill 2,174 →
+  ~3,800; decode 35.0 → ~62), while Kipp reproduces its own committed numbers
+  in the same session — the 2026-07-22 llama.cpp session ran in a degraded
+  GPU-clock state. Corrected table (Qwen3-4B, M5 Max,
+  `llamacpp-qwen3-4b.json`): decode is **llama.cpp ~3% ahead on matched
+  schemes** (63.1/100.5 vs Kipp 61.2/97.4, BF16/Q8_0, isolated cooled runs)
+  and clearly ahead on 4-bit decode (Q4_0 149.6 vs affine4 128.8, schemes
+  differ); prefill @2048 is a **2.9×/2.25× llama.cpp win** on BF16/Q8_0 and
+  parity on 4-bit. Cross-engine numbers are now re-validated in the same
+  session as the Kipp numbers they are compared against.
+- **The cause is an instruction class, and it sets the roadmap.** On M5,
+  llama.cpp routes prefill GEMM through the Metal 4 tensor API
+  (`mpp::tensor_ops`, the neural accelerators) — enabled by its own allow-list
+  only on M5/M6/A19/A20, worth ~2.3–3× on prefill and nothing on decode.
+  Forced onto the simdgroup-matrix class Kipp uses
+  (`GGML_METAL_TENSOR_DISABLE=1`), llama.cpp measures 1,261/1,022/608 —
+  **Kipp leads its own instruction class on every scheme.** A gated
+  tensor-API matmul path is the next roadmap item.
+
+### Quantized prefill +10–12%, and what the matmuls are actually bound by
+- **One shared dequant block per quantized matmul threadgroup.** The
+  Q8_0/affine4 kernels' four private 32-row staging blocks (16.9 KiB) became
+  one cooperatively-dequantized shared block (4.2 KiB) under a 32-row ×
+  64-token tile: weights dequantize once per 64 tokens instead of once per
+  16, and occupancy rises several-fold. Bit-exact (fingerprints and the
+  pooled tripwire unchanged to the digit); against the committed v0.0.4
+  records, 2,048-token prefill is **Q8_0 1,101 → 1,213 (+10.2%)** and
+  **affine4 1,087 → 1,214 (+11.7%)**, decode unchanged. BF16 untouched.
+- **`--mm-bench-metal`: an isolated projection-matmul instrument.** Runs the
+  live matmul pipelines on every 4B shape with rotating vs reused weight
+  buffers. It shows the matmuls are **compute/issue-bound** (rotating ≈
+  reused; 17–24 GB/s effective weight fetch against ~455 GB/s available;
+  8.7–12.3 TFLOP/s), attributing ~82% of prefill wall clock to projections —
+  which retires the roadmap's traffic-motivated "K-blocked matmul" plan.
+- **Measured and reverted:** threadgroup-staging the activation tile (−7–10%
+  every shape — the fourth loss of explicit staging to the implicit cache);
+  widening the quant token slice 16 → 32 per simdgroup (~−90%, register
+  spilling, confirming the slice's register ceiling).
+
+### Distribution
+- **Prebuilt binaries on releases.** `make dist` builds
+  `kipp-macos-arm64.tar.gz` (kipp, kipp-metal, kipp-server,
+  kipp-server-metal) and `kipp-linux-x86_64.tar.gz` (CPU binaries), and
+  `.github/workflows/release.yml` gates them (version check, ad-hoc-signature
+  and deployment-target verification, hermetic suite, Metal operators with
+  `KIPP_METAL_REQUIRE_MMA=1`) and attaches them with `SHA256SUMS` to every
+  published release. macOS binaries target macOS 14+.
+
+### Validation
+- CPU and Metal gated on M5 Max (full suite, including the 67-token
+  inactive-simdgroup barrier case added to the quant operator test and a
+  five-value shader geometry probe). **CUDA is untouched and was not run** —
+  no NVIDIA hardware was available; the backend carries its v0.0.3 H100
+  validation.
+
 ## v0.0.4 — 2026-07-27
 
 ### Metal prefill: ~2.5× faster, and the gate hole that hid the kernels (2026-07-26)

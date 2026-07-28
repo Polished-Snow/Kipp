@@ -50,22 +50,21 @@ record results from a fallback build. Current reference numbers
 (Qwen3-4B, Metal, greedy; every value traces to a committed
 `bench/results/*.json`):
 
-- Decode tok/s (64 tokens, median of 5): BF16 **59.8**, Q8_0 **94.3**,
-  affine4 **127.9**. These are 1–4% below the figures recorded before the
-  prefill work (60.7 / 97.9 / 130) purely as session drift: the controlled
-  back-to-back A/B in "Prefill round shape" measures decode unchanged on all
-  three schemes, and the whole campaign was re-run in one session so the
-  numbers stay comparable with each other.
+- Decode tok/s (64 tokens, median of 5, 2026-07-28 session): BF16 **61.2**,
+  Q8_0 **97.4**, affine4 **128.8**. Session-to-session drift on this machine
+  is a few percent in either direction (the previous campaign read 59.8 /
+  94.3 / 127.9); the controlled back-to-back A/Bs measure decode unchanged
+  through every kernel change, and each campaign is re-run in one session so
+  its numbers stay comparable with each other.
 - Wikitext-2 perplexity (full test set, 2,048-token windows): BF16
   **7.731**, Q8_0 **7.733** (+0.02%), affine4 **8.171** (+5.7%) — Q8_0 is
   effectively lossless; affine4 is Q4-class.
-- Prefill tok/s (348-token / 2,048-token prompt): BF16 **1034 / 1308**,
-  Q8_0 **1048 / 1101**, affine4 **1060 / 1087** — roughly 2.1–2.7× the
-  528 / 481, 488 / 441 and 509 / 466 recorded before the prefill work. The
-  simdgroup-matrix kernels dequantize each 32-weight block once per token
-  tile, so quantized prefill stays near BF16 parity. See "Prefill round
-  shape" for the traffic model, the per-scheme A/B, and the changes that were
-  measured and rejected.
+- Prefill tok/s (348-token / 2,048-token prompt, 2026-07-28): BF16
+  **1034 / 1312**, Q8_0 **1065 / 1213**, affine4 **1080 / 1214** — the
+  quantized schemes gained 10–12% at 2,048 tokens from the shared-dequant
+  rotation ("What the matmuls are actually bound by", below); BF16 is
+  unchanged. The quantized kernels dequantize each 32-weight block once per
+  64-token tile, so quantized prefill stays near BF16 parity.
 - Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
   12,800-token prompt after the split-K long-context path (`ctx-*.json`).
 - Model-size sweep (BF16 decode): 0.6B **269**, 4B **60.7**, 8B **33.5**
@@ -83,11 +82,11 @@ record results from a fallback build. Current reference numbers
   **0.84×** floor elsewhere (ungated: 2.10× / down to 0.27×). Gains are
   smaller than earlier drafts because the sampling fast path made the
   plain-decode baseline itself faster.
-- llama.cpp A/B (same weights/host, pinned commit, same session,
-  `llamacpp-qwen3-4b.json`): Kipp decode 60.7/97.9 vs llama.cpp 35.0/56.5
-  (BF16/Q8_0, ~1.7× in Kipp's favor); llama.cpp Q4_0 decodes 89.1 vs
-  affine4's 130 (schemes differ). llama.cpp prefill is ~4.5× faster at a
-  matched 2,048-token prompt (2,174 vs 481 BF16).
+- llama.cpp A/B: **the 2026-07-22 comparison (decode 35.0/56.5, prefill
+  2,174) proved irreproducible and is superseded** — see "The llama.cpp
+  comparison was stale" below for the corrected, much less flattering
+  numbers and what caused the discrepancy. `llamacpp-qwen3-4b.json` now
+  holds the 2026-07-28 measurements.
 - CUDA revalidation (`cuda-h100-gates.json`): all four default checkpoints
   pass `--model` and `--phase4-cuda` on an ephemeral NVIDIA H100 80GB
   (worst observed NMSE 5.9e-7 against the CPU oracle).
@@ -207,14 +206,105 @@ shipped, because the repository's standard is that a change earns its place:
   reaches 32 fragments.
 
 Remaining prefill cost is therefore neither weight traffic nor attention
-locality. llama.cpp's 2,174 tok/s is ~15.8 TFLOP/s against the 14.9 TFLOP this
-prompt requires, i.e. compute-bound; closing the rest needs a
-threadgroup-staged, K-blocked matmul rather than more of the levers above.
+locality. *(Superseded 2026-07-28: the conclusion that "closing the rest needs
+a threadgroup-staged, K-blocked matmul" was tested and falsified — see the next
+section. The 2,174 tok/s reference figure it reasoned from was itself stale.)*
 
-*Provenance note: the figures in this section were measured on a working tree
-that also carried the change under test, so they are not yet backed by committed
-`bench/results/*.json` records. The full campaign is re-run on the clean tree at
-release, per the policy at the top of this file.*
+*Provenance note: the shipped-configuration figures in this section are backed
+by the committed `bench/results/4b-*.json` records from the release re-run; the
+intermediate sweep values were measured on the working tree that carried the
+change under test, per the policy at the top of this file.*
+
+### What the matmuls are actually bound by, and the llama.cpp comparison was stale (2026-07-28)
+
+Two findings from one measurement day, both of which correct this file.
+
+**The llama.cpp comparison was stale.** The 2026-07-22 A/B recorded llama.cpp
+at 2,174 tok/s prefill / 35.0 decode (BF16). Re-running the *exact committed
+command, binary, model, and OS* on 2026-07-28 gives ~3,800–4,100 tok/s prefill
+and ~60–63 decode — roughly 2× on both axes — while Kipp reproduces its own
+committed numbers to within noise in the same session. The old llama.cpp
+session was evidently measured in a degraded GPU-clock state (the uniform ~2×
+across unrelated workloads is the signature; the exact cause is not
+reconstructable). The head-to-head below replaces it, and the lesson is
+recorded here precisely because this repository's claims are only as good as
+their worst measurement: **cross-engine numbers are now re-validated in the
+same session as the Kipp numbers they are compared against.**
+
+**Where the missing prefill time actually goes.** A new isolated instrument
+(`build/kipp_test_metal --mm-bench-metal`) runs the live projection-matmul
+pipelines on every Qwen3-4B shape at a 512-token round, cycling through eight
+distinct weight buffers (so the system-level cache cannot serve one resident
+copy) versus reusing one. The result is unambiguous: rotating equals reusing
+on every shape, effective weight fetch is 17–24 GB/s against ~455 GB/s of
+demonstrated sustained bandwidth, and the kernels run at 8.7–12.3 TFLOP/s.
+The matmuls are **compute/issue-bound, not traffic-bound**, and summing the
+per-shape times attributes ~82% of 2,048-token prefill wall clock to them.
+Weight-traffic reduction — the motivation this file previously assigned to a
+future "K-blocked matmul" — cannot help; that plan is retired.
+
+Consistent with that, explicitly staging the activation tile through
+threadgroup memory (removing the transposed device-memory gathers from the hot
+loop) was implemented, measured at **−7 to −10% on every shape**, and
+reverted: the fourth time explicit staging has lost to this GPU's implicit
+cache hierarchy. The simdgroup-matrix BF16 kernel sits at ~80% of the
+achievable ALU-issue ceiling and stays as is.
+
+**What did work: one shared dequant block per quantized threadgroup.** The
+Q8_0/affine4 kernels staged four private 32-row dequantized blocks (16.9 KiB
+of threadgroup memory) — one per simdgroup, each serving 16 tokens. They now
+share a single cooperatively-dequantized 32-row block (4.2 KiB) across a
+32-row × 64-token threadgroup tile: weight bytes are dequantized once per 64
+tokens instead of once per 16, and the 4× smaller staging keeps several
+threadgroups resident per core. Accumulators, dequant expressions, and FP32
+accumulation order are unchanged, so the kernels are **bit-exact** — the
+`--prefill-metal` fingerprints and the `--pooled-metal` tripwire did not move
+a digit. Same-session interleaved A/Bs: Q8_0 1137.7 → 1206.0 tok/s, affine4
+1139.4 → 1213.9 (two passes each, decode dead flat); against the committed
+v0.0.4 records the release re-run reads **+10.2% (Q8_0) and +11.7% (affine4)
+at 2,048 tokens**. Widening the quant token slice on top of it (16 → 32
+tokens per simdgroup) collapses to ~1 TFLOP/s from register spilling — the
+third confirmation that the 2-fragment slice is that kernel's register
+ceiling — and was reverted.
+
+**The corrected head-to-head** (same session, same host and weights, llama.cpp
+178a6c449 with Metal, `llama-bench -p 2048 -n 256 -r 5`; every figure traces
+to `llamacpp-qwen3-4b.json` and `4b-*.json`, 2026-07-28):
+
+| Qwen3-4B, M5 Max | Kipp | llama.cpp (default) | llama.cpp (`GGML_METAL_TENSOR_DISABLE=1`) |
+|---|---|---|---|
+| Prefill BF16 @2048 | 1,312 | **3,788** | 1,261 |
+| Prefill Q8_0 @2048 | 1,213 | **2,729** | 1,022 |
+| Prefill Q4-class @2048 | **1,214** (affine4) | 1,225 (Q4_0) | 608 (Q4_0) |
+| Decode BF16 | 61.2 | **63.1** | 47.0 (interleaved; see note) |
+| Decode Q8_0 | 97.4 | **100.5** | 46.8 (interleaved; see note) |
+| Decode Q4-class | 128.8 (affine4) | **149.6** (Q4_0) | 51.2 (interleaved) |
+
+llama.cpp's decode figures are from isolated decode-only runs (`-p 0 -n 256`,
+cooled machine): its interleaved `-p 2048 -n 256` run heats the GPU enough to
+depress its own tg readings to 47–69 tok/s, and quoting those would flatter
+Kipp. The honest decode summary is therefore: **llama.cpp is ~3% ahead on the
+matched schemes** (63.1/100.5 vs 61.2/97.4) and clearly ahead on 4-bit decode
+(scale-only Q4_0 dequantizes more cheaply than scale+bias affine4; the schemes
+also differ in quality — affine4's perplexity cost is documented above, Q4_0's
+on the llama.cpp stack was not measured here). The prior "decode 1.7× in
+Kipp's favor" claim derived entirely from the stale llama.cpp session and is
+withdrawn.
+
+The decisive prefill variable is the **instruction class**. On M5, llama.cpp
+routes GEMM through the Metal 4 tensor API (`mpp::tensor_ops`, the neural
+accelerators) by default — it enables that path only on M5/M6/A19/A20-class
+devices, and its own source notes it is a wash or a loss on M4 and earlier.
+That path is worth ~2.3–3× on prefill GEMM and nothing on decode (matvec).
+Forced onto the same simdgroup-matrix instruction class Kipp uses
+(`GGML_METAL_TENSOR_DISABLE=1`), llama.cpp's prefill drops to 1,261 / 1,022 /
+608 — **Kipp leads its own instruction class on every scheme** (1.04× /
+1.19× / 2.0×).
+
+What follows from this: matching llama.cpp's default BF16/Q8_0 prefill on M5
+requires an `mpp::tensor_ops` matmul path, not further simdgroup tuning —
+that is the next roadmap item, behind the same runtime-probe-and-fall-back
+ladder and oracle gates as the simdgroup kernels.
 
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 

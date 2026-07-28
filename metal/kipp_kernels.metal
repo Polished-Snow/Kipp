@@ -772,15 +772,21 @@ constant uint KIPP_MM_ROW_FRAGMENTS = KIPP_MM_ROWS_PER_SIMDGROUP / 8;
 constant uint KIPP_MM_TOKEN_FRAGMENTS = 4;
 constant uint KIPP_MM_TOKEN_TILE = KIPP_MM_TOKEN_FRAGMENTS * 8;
 /*
- * The quantized kernels keep a narrower token tile than the BF16 one. They
- * already spend ~16.9 KiB of threadgroup memory staging dequantized weights,
- * and doubling the accumulator fragments on top of that collapses occupancy:
- * measured at 2,048 tokens, a 32-token tile takes Q8_0 prefill from 1139 to
- * 135 tok/s while it *gains* 7% for BF16. Tile width is therefore a property
- * of each kernel, not of the projection layer.
+ * The quantized kernels keep a narrower 16-token slice per simdgroup than the
+ * BF16 kernel's 32: doubling their accumulator fragments on top of the staged
+ * dequantized weights collapses occupancy (measured at 2,048 tokens, a
+ * 32-token slice takes Q8_0 prefill from 1139 to 135 tok/s while it *gains*
+ * 7% for BF16). Tile width is therefore a property of each kernel, not of the
+ * projection layer. The threadgroup still covers 64 tokens, because its four
+ * simdgroups share one 32-row dequantized block instead of staging four
+ * private ones: the staging allocation drops 16.9 KiB -> 4.2 KiB (so more
+ * threadgroups fit a core) and each weight block is dequantized once per 64
+ * tokens instead of once per 16.
  */
 constant uint KIPP_MM_QUANT_TOKEN_FRAGMENTS = 2;
-constant uint KIPP_MM_QUANT_TOKEN_TILE = KIPP_MM_QUANT_TOKEN_FRAGMENTS * 8;
+constant uint KIPP_MM_QUANT_SG_TOKEN_TILE = KIPP_MM_QUANT_TOKEN_FRAGMENTS * 8;
+constant uint KIPP_MM_QUANT_TOKEN_TILE =
+    KIPP_MM_SIMDGROUPS * KIPP_MM_QUANT_SG_TOKEN_TILE;
 
 /*
  * The host mirrors the tile geometry above to size matmul dispatch grids
@@ -798,6 +804,10 @@ kernel void kipp_mm_geometry(device uint *values [[buffer(0)]],
     values[1] = KIPP_MM_ROWS_PER_SIMDGROUP;
     values[2] = KIPP_MM_SIMDGROUPS;
     values[3] = KIPP_MM_QUANT_TOKEN_TILE;
+    /* The quantized kernels share one 32-row block across the whole
+     * threadgroup, so their row grid is per-simdgroup-rows, not
+     * rows-per-simdgroup times simdgroups. */
+    values[4] = KIPP_MM_ROWS_PER_SIMDGROUP;
 }
 
 kernel void kipp_matmul_bf16(device const ushort *weight [[buffer(0)]],
@@ -900,16 +910,20 @@ kernel void kipp_matmul_bf16(device const ushort *weight [[buffer(0)]],
 }
 
 /*
- * Quantized batched-prefill projections. Same threadgroup geometry as
- * kipp_matmul_bf16 (four simdgroups, each owning a 32-row x 16-token output
- * tile), but the shared dimension advances one 32-weight quantization block
- * at a time: every lane dequantizes its own row's block into a threadgroup
- * float tile once, and the tile is then swept with the same 8-wide simdgroup
- * matrix fragments. Weight bytes are read exactly once per 16 tokens, so the
- * dequantization cost no longer scales with the token count the way the
- * vector kernels' does. Activations are read directly from the FP32 buffer
- * (no BF16 staging), so the dequantized math matches the vector kernels and
- * the CPU oracle up to reduction order.
+ * Quantized batched-prefill projections. The threadgroup owns a 32-row x
+ * 64-token output tile: its four simdgroups cooperatively dequantize one
+ * shared 32-row quantization block into a threadgroup float tile (eight
+ * values per thread), then each sweeps the block against its own 16-token
+ * slice with 8-wide simdgroup matrix fragments. Weight bytes are read and
+ * dequantized exactly once per 64 tokens, and the shared block keeps the
+ * staging allocation at 4.2 KiB so several threadgroups stay resident per
+ * core. Activations are read directly from the FP32 buffer (no BF16
+ * staging), so the dequantized math matches the vector kernels and the CPU
+ * oracle up to reduction order.
+ *
+ * The block loop carries threadgroup barriers, so a simdgroup whose token
+ * slice falls past the token count keeps dequantizing and barriering with
+ * token_blocks == 0 instead of returning early.
  *
  * Both kernels assume params.rows % 32 == 0 and params.columns % 32 == 0:
  * every quantized projection in the registry satisfies both.
@@ -929,20 +943,26 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float staged[KIPP_MM_SIMDGROUPS][64];
-    threadgroup float staged_weights[KIPP_MM_SIMDGROUPS]
-                                    [KIPP_MM_ROWS_PER_SIMDGROUP]
+    threadgroup float staged_weights[KIPP_MM_ROWS_PER_SIMDGROUP]
                                     [KIPP_MM_STAGED_STRIDE];
-    uint row_base =
-        (group_id.x * KIPP_MM_SIMDGROUPS + group) * KIPP_MM_ROWS_PER_SIMDGROUP;
+    uint row_base = group_id.x * KIPP_MM_ROWS_PER_SIMDGROUP;
+    /* Threadgroup-uniform, so it cannot strand the barriers below. */
     if (row_base >= params.rows) {
         return;
     }
-    uint token_base = group_id.y * KIPP_MM_QUANT_TOKEN_TILE;
-    /* See kipp_matmul_bf16: guards the unsigned wrap on an over-tall grid. */
-    if (token_base >= params.token_count) {
+    uint tile_base = group_id.y * KIPP_MM_QUANT_TOKEN_TILE;
+    /* See kipp_matmul_bf16: guards the unsigned wrap on an over-tall grid.
+     * Also threadgroup-uniform. */
+    if (tile_base >= params.token_count) {
         return;
     }
-    uint tile = min(KIPP_MM_QUANT_TOKEN_TILE, params.token_count - token_base);
+    /* Each simdgroup owns a 16-token slice of the 64-token tile; a slice
+     * past the token count runs the loop for dequant and barriers only. */
+    uint token_base = tile_base + group * KIPP_MM_QUANT_SG_TOKEN_TILE;
+    uint tile = token_base < params.token_count
+                    ? min(KIPP_MM_QUANT_SG_TOKEN_TILE,
+                          params.token_count - token_base)
+                    : 0u;
     uint blocks = params.columns / KIPP_MM_BLOCK;
 
     simdgroup_float8x8 accumulators[KIPP_MM_ROW_FRAGMENTS]
@@ -953,17 +973,21 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
         }
     }
     uint token_blocks = (tile + 7u) / 8u;
+    /* Thread t dequantizes values 8*(t%4) .. 8*(t%4)+7 of row t/4's block;
+     * the addresses land in 32 distinct threadgroup-memory banks. */
+    uint dq_row = (group * 32u + lane) / 4u;
+    uint dq_chunk = ((group * 32u + lane) % 4u) * 8u;
     for (uint block = 0; block < blocks; ++block) {
-        /* Lane l dequantizes row row_base + l's block. */
         device const uchar *blk = weight +
-            (ulong(row_base + lane) * blocks + block) *
+            (ulong(row_base + dq_row) * blocks + block) *
                 ulong(KIPP_MM_Q8_BLOCK_BYTES);
         float d = kipp_fp16_bytes(blk);
         device const char *qs = (device const char *)(blk + 2);
-        for (uint j = 0; j < KIPP_MM_BLOCK; ++j) {
-            staged_weights[group][lane][j] = d * float(qs[j]);
+        for (uint j = 0; j < 8u; ++j) {
+            staged_weights[dq_row][dq_chunk + j] =
+                d * float(qs[dq_chunk + j]);
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         uint column = block * KIPP_MM_BLOCK;
         for (uint sub = 0; sub < KIPP_MM_BLOCK / 8u; ++sub) {
             simdgroup_float8x8 activation[KIPP_MM_QUANT_TOKEN_FRAGMENTS];
@@ -981,7 +1005,7 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
                 simdgroup_float8x8 weights;
                 simdgroup_load(
                     weights,
-                    &staged_weights[group][row_block * 8u][sub * 8u],
+                    &staged_weights[row_block * 8u][sub * 8u],
                     KIPP_MM_STAGED_STRIDE);
                 for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
                     if (tf < token_blocks) {
@@ -992,7 +1016,7 @@ kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
                 }
             }
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
         for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
@@ -1034,20 +1058,26 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
                                 uint lane [[thread_index_in_simdgroup]],
                                 uint group [[simdgroup_index_in_threadgroup]]) {
     threadgroup float staged[KIPP_MM_SIMDGROUPS][64];
-    threadgroup float staged_weights[KIPP_MM_SIMDGROUPS]
-                                    [KIPP_MM_ROWS_PER_SIMDGROUP]
+    threadgroup float staged_weights[KIPP_MM_ROWS_PER_SIMDGROUP]
                                     [KIPP_MM_STAGED_STRIDE];
-    uint row_base =
-        (group_id.x * KIPP_MM_SIMDGROUPS + group) * KIPP_MM_ROWS_PER_SIMDGROUP;
+    uint row_base = group_id.x * KIPP_MM_ROWS_PER_SIMDGROUP;
+    /* Threadgroup-uniform, so it cannot strand the barriers below. */
     if (row_base >= params.rows) {
         return;
     }
-    uint token_base = group_id.y * KIPP_MM_QUANT_TOKEN_TILE;
-    /* See kipp_matmul_bf16: guards the unsigned wrap on an over-tall grid. */
-    if (token_base >= params.token_count) {
+    uint tile_base = group_id.y * KIPP_MM_QUANT_TOKEN_TILE;
+    /* See kipp_matmul_bf16: guards the unsigned wrap on an over-tall grid.
+     * Also threadgroup-uniform. */
+    if (tile_base >= params.token_count) {
         return;
     }
-    uint tile = min(KIPP_MM_QUANT_TOKEN_TILE, params.token_count - token_base);
+    /* Each simdgroup owns a 16-token slice of the 64-token tile; a slice
+     * past the token count runs the loop for dequant and barriers only. */
+    uint token_base = tile_base + group * KIPP_MM_QUANT_SG_TOKEN_TILE;
+    uint tile = token_base < params.token_count
+                    ? min(KIPP_MM_QUANT_SG_TOKEN_TILE,
+                          params.token_count - token_base)
+                    : 0u;
     uint groups = params.columns / KIPP_MM_BLOCK;
 
     simdgroup_float8x8 accumulators[KIPP_MM_ROW_FRAGMENTS]
@@ -1058,21 +1088,24 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
         }
     }
     uint token_blocks = (tile + 7u) / 8u;
+    /* Thread t dequantizes nibble bytes 4*(t%4) .. 4*(t%4)+3 of row t/4's
+     * group (values 8*(t%4) .. 8*(t%4)+7): w = scale*q + bias. */
+    uint dq_row = (group * 32u + lane) / 4u;
+    uint dq_byte = ((group * 32u + lane) % 4u) * 4u;
     for (uint quant_group = 0; quant_group < groups; ++quant_group) {
-        /* Lane l dequantizes row row_base + l's group: w = scale*q + bias. */
         device const uchar *grp = weight +
-            (ulong(row_base + lane) * groups + quant_group) *
+            (ulong(row_base + dq_row) * groups + quant_group) *
                 ulong(KIPP_MM_A4_GROUP_BYTES);
         float scale = kipp_fp16_bytes(grp + 16);
         float bias = kipp_fp16_bytes(grp + 18);
-        for (uint k = 0; k < KIPP_MM_BLOCK / 2u; ++k) {
-            uchar packed = grp[k];
-            staged_weights[group][lane][2u * k] =
+        for (uint k = 0; k < 4u; ++k) {
+            uchar packed = grp[dq_byte + k];
+            staged_weights[dq_row][2u * (dq_byte + k)] =
                 scale * float(packed & 0x0fu) + bias;
-            staged_weights[group][lane][2u * k + 1u] =
+            staged_weights[dq_row][2u * (dq_byte + k) + 1u] =
                 scale * float(packed >> 4) + bias;
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         uint column = quant_group * KIPP_MM_BLOCK;
         for (uint sub = 0; sub < KIPP_MM_BLOCK / 8u; ++sub) {
             simdgroup_float8x8 activation[KIPP_MM_QUANT_TOKEN_FRAGMENTS];
@@ -1090,7 +1123,7 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
                 simdgroup_float8x8 weights;
                 simdgroup_load(
                     weights,
-                    &staged_weights[group][row_block * 8u][sub * 8u],
+                    &staged_weights[row_block * 8u][sub * 8u],
                     KIPP_MM_STAGED_STRIDE);
                 for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
                     if (tf < token_blocks) {
@@ -1101,7 +1134,7 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
                 }
             }
         }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
         for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
