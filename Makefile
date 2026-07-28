@@ -8,7 +8,7 @@
 	test-longctx-metal test-prefill-metal test-chat test-draft-spec \
 	test-server \
 	cuda-spark cuda-generic \
-	test-cuda-ops test-cuda docs docs-check clean
+	test-cuda-ops test-cuda docs docs-check dist clean
 
 BUILD_DIR := build
 TOOLS_DIR := tools
@@ -380,6 +380,32 @@ test-cuda-ops: $(BUILD_DIR)/kipp_test_cuda
 test-cuda: $(BUILD_DIR)/kipp_test_cuda vectors
 	$(BUILD_DIR)/kipp_test_cuda --cuda-operators
 	$(BUILD_DIR)/kipp_test_cuda --phase4-cuda $(MODEL_GGUF) $(VECTOR_DIR)
+
+# Release tarball: the platform's inference binaries, the license, and a
+# RELEASE.txt that keeps a stray tarball self-identifying. Asset filenames are
+# deliberately unversioned so the README's releases/latest/download URL never
+# goes stale; the release tag disambiguates versions. Checksums are produced by
+# the release workflow, which sees both platforms' tarballs at once.
+DIST_DIR := $(BUILD_DIR)/dist
+ifeq ($(shell uname -s),Darwin)
+DIST_PLATFORM := macos-arm64
+DIST_BINARIES := $(BUILD_DIR)/kipp $(BUILD_DIR)/kipp-metal \
+	$(BUILD_DIR)/kipp-server $(BUILD_DIR)/kipp-server-metal
+else
+DIST_PLATFORM := linux-$(shell uname -m)
+DIST_BINARIES := $(BUILD_DIR)/kipp $(BUILD_DIR)/kipp-server
+endif
+DIST_NAME := kipp-$(DIST_PLATFORM)
+
+dist: $(DIST_BINARIES)
+	rm -rf $(DIST_DIR)/$(DIST_NAME)
+	mkdir -p $(DIST_DIR)/$(DIST_NAME)
+	cp $(DIST_BINARIES) LICENSE $(DIST_DIR)/$(DIST_NAME)/
+	printf 'kipp %s\ncommit %s\nplatform %s\n' \
+		"$$(sed -n 's/#define KIPP_VERSION "\(.*\)"/\1/p' src/kipp.h)" \
+		"$$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
+		"$(DIST_PLATFORM)" > $(DIST_DIR)/$(DIST_NAME)/RELEASE.txt
+	tar -C $(DIST_DIR) -czf $(DIST_DIR)/$(DIST_NAME).tar.gz $(DIST_NAME)
 
 clean:
 	rm -rf $(BUILD_DIR)

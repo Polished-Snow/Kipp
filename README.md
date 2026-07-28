@@ -105,6 +105,24 @@ That is clone to first token in one command. It uses the smallest registered
 checkpoint so the first run costs a couple of gigabytes rather than the ~16 GB
 the 4B default needs, and picks Metal on macOS or the CPU path elsewhere.
 
+### Or install a prebuilt binary (macOS arm64, Linux x86_64)
+
+Releases ship tarballs with the CLI and server binaries, so inference needs no
+toolchain at all — the Python tooling is only required to convert weights:
+
+```bash
+curl -fsSLO https://github.com/Polished-Snow/Kipp/releases/latest/download/kipp-macos-arm64.tar.gz
+curl -fsSLO https://github.com/Polished-Snow/Kipp/releases/latest/download/SHA256SUMS
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf kipp-macos-arm64.tar.gz   # kipp, kipp-metal, kipp-server, kipp-server-metal
+```
+
+On Linux, substitute `kipp-linux-x86_64.tar.gz` (CPU binaries; build the CUDA
+backend from source with `make cuda-generic`). The macOS binaries are ad-hoc
+signed and need macOS 14 or newer. The `curl` path above just works; if you
+download through a browser instead, clear Gatekeeper's quarantine flag first
+with `xattr -dr com.apple.quarantine kipp-macos-arm64`.
+
 Build the individual binaries directly if you prefer:
 
 ```bash
