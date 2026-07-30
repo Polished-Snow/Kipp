@@ -1439,7 +1439,7 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
  */
 kernel void kipp_matmul_bf16_tensor(
         device bfloat *weight [[buffer(0)]],
-        device bfloat *input [[buffer(1)]],
+        device float *input [[buffer(1)]],
         device float *output [[buffer(2)]],
         constant MatvecParams &params [[buffer(3)]],
         uint2 group_id [[threadgroup_position_in_grid]]) {
@@ -1452,7 +1452,11 @@ kernel void kipp_matmul_bf16_tensor(
 
     /* Weights are [row][column], activations [token][column], output
      * [token][row] -- exactly the layouts the engine already keeps, wrapped
-     * with K-contiguous strides. */
+     * with K-contiguous strides. Activations are consumed as FP32 straight
+     * from the round's working buffer: matmul2d takes float sources, which
+     * makes the whole kipp_bf16_stage pass unnecessary on this path and
+     * removes an activation rounding step (measured ~12-18% slower per GEMM
+     * than bf16 activations, but the staging it deletes costs more). */
     auto tA = tensor(weight, dextents<int32_t, 2>(columns, rows),
                      array<int, 2>({1, columns}));
     auto tB = tensor(input, dextents<int32_t, 2>(columns, tokens),
