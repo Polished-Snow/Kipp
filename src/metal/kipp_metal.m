@@ -1191,13 +1191,13 @@ static int metal_eval_multi(KippMetalModel *model, kipp_eval_item *items,
 static int metal_verify_mm_geometry(
     id<MTLDevice> device,
     NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines,
-    kipp_error *error) {
+    BOOL tensorKernel, kipp_error *error) {
     id<MTLComputePipelineState> pipeline = pipelines[@"kipp_mm_geometry"];
     if (pipeline == nil) {
         return 0;
     }
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    id<MTLBuffer> values = metal_new_shared_buffer(device, 5 * sizeof(uint32_t));
+    id<MTLBuffer> values = metal_new_shared_buffer(device, 7 * sizeof(uint32_t));
     if (queue == nil || values == nil) {
         return metal_fail(error, KIPP_ERROR_MEMORY,
                           "unable to allocate the matmul geometry probe");
@@ -1224,6 +1224,18 @@ static int metal_verify_mm_geometry(
             shader[0], shader[3], shader[1] * shader[2], shader[4],
             KIPP_METAL_MM_TOKEN_TILE, KIPP_METAL_MM_QUANT_TOKEN_TILE,
             hostRows, KIPP_METAL_MM_QUANT_ROWS_PER_GROUP);
+    }
+    /* The tensor slots read zero from a library compiled without the tensor
+     * path; only compare them when that rung actually produced kernels. */
+    if (tensorKernel &&
+        (shader[5] != KIPP_METAL_MM_TENSOR_TOKEN_TILE ||
+         shader[6] != KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP)) {
+        return metal_fail(
+            error, KIPP_ERROR_UNSUPPORTED,
+            "tensor tile geometry drifted: shader reports %u tokens and %u "
+            "rows per threadgroup, host expects %u and %u",
+            shader[5], shader[6], KIPP_METAL_MM_TENSOR_TOKEN_TILE,
+            KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP);
     }
     return 0;
 }
@@ -1397,6 +1409,9 @@ static int metal_compile_pipelines(
         tiles[@"kipp_flash_gqa_prefill"] = @0;
         tiles[@"kipp_mm_geometry"] = @0;
     }
+    if (tensorKernel) {
+        tiles[@"kipp_matmul_bf16_tensor"] = @0;
+    }
     NSMutableDictionary *pipelines =
         [NSMutableDictionary dictionaryWithCapacity:tiles.count];
     for (NSString *name in tiles) {
@@ -1456,7 +1471,7 @@ static int metal_compile_pipelines(
         }
         pipelines[name] = pipeline;
     }
-    if (metal_verify_mm_geometry(device, pipelines, error) != 0) {
+    if (metal_verify_mm_geometry(device, pipelines, tensorKernel, error) != 0) {
         return -1;
     }
     *outLibrary = library;
@@ -2473,6 +2488,102 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             free(inputHost);
             free(q8Expected);
             free(a4Expected);
+            if (status != 0) {
+                return -1;
+            }
+        }
+
+        if (caps.tensor) {
+            /* Tensor-path matmul against an exact-integer reference. Integer
+             * products accumulate exactly in FP32 regardless of reduction
+             * order, so the comparison is exact and a wrong matmul2d
+             * descriptor (a silent transpose or mis-accumulation) cannot
+             * hide inside a tolerance. The shape is deliberately ragged on
+             * both axes: 72 rows exercises the row-edge clipping that no
+             * production projection reaches (every registry dimension is a
+             * multiple of 64), and 133 tokens spans two 128-token tiles with
+             * a 5-token tail. The tensor extents do that clipping; there are
+             * no tail guards in the kernel to test separately. */
+            enum {
+                TM_ROWS = 72,
+                TM_COLS = 64,
+                TM_TOKENS = 133,
+                TM_PADDED_TOKENS = 136
+            };
+            uint16_t *weightsHost =
+                malloc((size_t)TM_ROWS * TM_COLS * sizeof(*weightsHost));
+            uint16_t *inputHost = calloc((size_t)TM_PADDED_TOKENS * TM_COLS,
+                                         sizeof(*inputHost));
+            float *expected =
+                malloc((size_t)TM_TOKENS * TM_ROWS * sizeof(*expected));
+            if (weightsHost == NULL || inputHost == NULL || expected == NULL) {
+                free(weightsHost);
+                free(inputHost);
+                free(expected);
+                return metal_fail(error, KIPP_ERROR_MEMORY,
+                                  "tensor matmul test allocation failed");
+            }
+            for (uint32_t r = 0; r < TM_ROWS; ++r) {
+                for (uint32_t c = 0; c < TM_COLS; ++c) {
+                    weightsHost[r * TM_COLS + c] = metal_test_float_to_bf16(
+                        (float)((int)((r + 2 * c) % 7) - 3));
+                }
+            }
+            for (uint32_t t = 0; t < TM_TOKENS; ++t) {
+                for (uint32_t c = 0; c < TM_COLS; ++c) {
+                    inputHost[t * TM_COLS + c] = metal_test_float_to_bf16(
+                        (float)((int)((t + c) % 5) - 2));
+                }
+            }
+            for (uint32_t t = 0; t < TM_TOKENS; ++t) {
+                for (uint32_t r = 0; r < TM_ROWS; ++r) {
+                    float sum = 0.0f;
+                    for (uint32_t c = 0; c < TM_COLS; ++c) {
+                        sum += (float)((int)((r + 2 * c) % 7) - 3) *
+                               (float)((int)((t + c) % 5) - 2);
+                    }
+                    expected[t * TM_ROWS + r] = sum;
+                }
+            }
+            id<MTLBuffer> weightBuffer = [device
+                newBufferWithBytes:weightsHost
+                            length:(NSUInteger)TM_ROWS * TM_COLS *
+                                   sizeof(uint16_t)
+                           options:MTLResourceStorageModeShared];
+            id<MTLBuffer> inputBuffer = [device
+                newBufferWithBytes:inputHost
+                            length:(NSUInteger)TM_PADDED_TOKENS * TM_COLS *
+                                   sizeof(uint16_t)
+                           options:MTLResourceStorageModeShared];
+            id<MTLBuffer> outputBuffer = metal_new_shared_buffer(
+                device, (NSUInteger)TM_TOKENS * TM_ROWS * sizeof(float));
+            metal_matvec_params params = {TM_ROWS, TM_COLS, TM_TOKENS};
+            id<MTLCommandBuffer> command = [queue commandBuffer];
+            /* Transposed grid relative to the simdgroup kernels: x advances
+             * tokens, y advances rows. */
+            metal_dispatch_groups(
+                command, pipelines[@"kipp_matmul_bf16_tensor"],
+                (TM_TOKENS + KIPP_METAL_MM_TENSOR_TOKEN_TILE - 1u) /
+                    KIPP_METAL_MM_TENSOR_TOKEN_TILE,
+                (TM_ROWS + KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP - 1u) /
+                    KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP,
+                KIPP_METAL_GROUP_THREADS,
+                ^(id<MTLComputeCommandEncoder> encoder) {
+                  [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+                  [encoder setBuffer:inputBuffer offset:0 atIndex:1];
+                  [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+                  [encoder setBytes:&params length:sizeof(params) atIndex:3];
+                });
+            int status = metal_commit_and_wait(command, error);
+            if (status == 0) {
+                status = metal_expect_near("matmul_bf16_tensor",
+                                           outputBuffer.contents, expected,
+                                           (size_t)TM_TOKENS * TM_ROWS, 0.0f,
+                                           error);
+            }
+            free(weightsHost);
+            free(inputHost);
+            free(expected);
             if (status != 0) {
                 return -1;
             }

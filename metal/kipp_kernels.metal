@@ -787,6 +787,14 @@ constant uint KIPP_MM_QUANT_TOKEN_FRAGMENTS = 2;
 constant uint KIPP_MM_QUANT_SG_TOKEN_TILE = KIPP_MM_QUANT_TOKEN_FRAGMENTS * 8;
 constant uint KIPP_MM_QUANT_TOKEN_TILE =
     KIPP_MM_SIMDGROUPS * KIPP_MM_QUANT_SG_TOKEN_TILE;
+/* Geometry of the Metal 4 tensor projection kernel (defined further down,
+ * inside the KIPP_ENABLE_TENSOR_OPS block); declared here so the geometry
+ * probe can report it alongside the simdgroup tiles. */
+#if defined(KIPP_ENABLE_TENSOR_OPS)
+constant uint KIPP_MM_TENSOR_ROWS = 64;
+constant uint KIPP_MM_TENSOR_TOKEN_TILE = 128;
+constant uint KIPP_MM_TENSOR_K_CHUNK = 32;
+#endif
 
 /*
  * The host mirrors the tile geometry above to size matmul dispatch grids
@@ -808,6 +816,15 @@ kernel void kipp_mm_geometry(device uint *values [[buffer(0)]],
      * threadgroup, so their row grid is per-simdgroup-rows, not
      * rows-per-simdgroup times simdgroups. */
     values[4] = KIPP_MM_ROWS_PER_SIMDGROUP;
+    /* Tensor-kernel tile; zero when this library was compiled without the
+     * tensor path, which tells the host not to compare these slots. */
+#if defined(KIPP_ENABLE_TENSOR_OPS)
+    values[5] = KIPP_MM_TENSOR_TOKEN_TILE;
+    values[6] = KIPP_MM_TENSOR_ROWS;
+#else
+    values[5] = 0;
+    values[6] = 0;
+#endif
 }
 
 kernel void kipp_matmul_bf16(device const ushort *weight [[buffer(0)]],
@@ -1403,6 +1420,64 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
  * demote the whole tensor path rather than surface later as a pipeline error
  * on the real kernel.
  */
+/*
+ * Batched-prefill projection on the Metal 4 tensor pipeline. Weights,
+ * activations, and output are all device tensors whose extents carry the true
+ * matrix dimensions, so ragged row/token edges are clipped by the tensor API
+ * on both reads and stores -- there are no manual tail guards. No operand is
+ * staged: on this hardware class the accelerators stream both operands faster
+ * than any threadgroup-staging scheme (measured 4.9-6.2x the simdgroup
+ * kernels at a 512-token round, and ~2x even at 8 tokens; the llama.cpp-style
+ * staged variant reached only 0.96-2.9x). The kernel assumes
+ * params.columns % 32 == 0, which every registry projection satisfies.
+ *
+ * The threadgroup covers a 64-row x 128-token output tile with four
+ * cooperating simdgroups, and the dispatch grid is TRANSPOSED relative to
+ * the simdgroup kernels: x advances tokens, y advances rows. The host-side
+ * mirror constants are KIPP_METAL_MM_TENSOR_* and the geometry probe reads
+ * these values back at model open.
+ */
+kernel void kipp_matmul_bf16_tensor(
+        device bfloat *weight [[buffer(0)]],
+        device bfloat *input [[buffer(1)]],
+        device float *output [[buffer(2)]],
+        constant MatvecParams &params [[buffer(3)]],
+        uint2 group_id [[threadgroup_position_in_grid]]) {
+    const int columns = (int)params.columns;
+    const int rows = (int)params.rows;
+    const int tokens = (int)params.token_count;
+
+    const int row_base = (int)(group_id.y * KIPP_MM_TENSOR_ROWS);
+    const int token_base = (int)(group_id.x * KIPP_MM_TENSOR_TOKEN_TILE);
+
+    /* Weights are [row][column], activations [token][column], output
+     * [token][row] -- exactly the layouts the engine already keeps, wrapped
+     * with K-contiguous strides. */
+    auto tA = tensor(weight, dextents<int32_t, 2>(columns, rows),
+                     array<int, 2>({1, columns}));
+    auto tB = tensor(input, dextents<int32_t, 2>(columns, tokens),
+                     array<int, 2>({1, columns}));
+    auto tD = tensor(output, dextents<int32_t, 2>(rows, tokens),
+                     array<int, 2>({1, rows}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            (int)KIPP_MM_TENSOR_TOKEN_TILE, (int)KIPP_MM_TENSOR_ROWS,
+            (int)KIPP_MM_TENSOR_K_CHUNK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto accumulator =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA),
+                                              float>();
+    for (int chunk = 0; chunk < columns; chunk += (int)KIPP_MM_TENSOR_K_CHUNK) {
+        auto weightSlice = tA.slice(chunk, row_base);
+        auto activationSlice = tB.slice(chunk, token_base);
+        mm.run(activationSlice, weightSlice, accumulator);
+    }
+    auto outputSlice = tD.slice(row_base, token_base);
+    accumulator.store(outputSlice);
+}
+
 kernel void kipp_tensor_probe_bf16(device bfloat *a [[buffer(0)]],
                                    device bfloat *b [[buffer(1)]],
                                    device float *c [[buffer(2)]]) {
