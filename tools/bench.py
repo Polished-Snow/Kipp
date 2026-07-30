@@ -207,6 +207,21 @@ def run_once(
             "active); fix the kernel source before benchmarking:\n"
             + stderr[:1000]
         )
+    # Same tripwire for the Metal 4 tensor path. Only enforced when the run
+    # asked for it: the tensor kernels legitimately stay off on most devices,
+    # so a bench that intends to measure them must export
+    # KIPP_METAL_REQUIRE_TENSOR=1 (which also makes the engine itself refuse
+    # to load on a silent fallback).
+    if (
+        requested_backend == "metal"
+        and os.environ.get("KIPP_METAL_REQUIRE_TENSOR") == "1"
+        and "tensor kernels unavailable" in stderr
+    ):
+        raise RuntimeError(
+            "Metal tensor kernels failed to compile while "
+            "KIPP_METAL_REQUIRE_TENSOR=1; fix the kernel source before "
+            "benchmarking:\n" + stderr[:1000]
+        )
     (
         metric_backend,
         prefill_tokens,

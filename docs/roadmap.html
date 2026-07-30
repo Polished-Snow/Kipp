@@ -30,6 +30,23 @@
 <p>This sequence is binding unless <code>ARCHITECTURE.md</code> is explicitly revised.
 Correctness gates every phase. Status notes summarize delivered work and
 link measured claims back to the benchmark records.</p>
+<p><strong>Status (v0.0.6):</strong> The instruction-class gap v0.0.5 documented is closed.
+A gated Metal 4 <code>mpp::tensor_ops</code> matmul path now runs BF16 layer
+projections on M5-class devices: <strong>prefill 1,312 → 3,682 tok/s (2.80×) at a
+2,048-token prompt</strong>, decode untouched, quantized schemes bit-frozen, at
+parity with llama.cpp's own tensor path. The kernel deliberately departs
+from llama.cpp's staged design — no operand staging (explicit threadgroup
+staging lost its sixth straight measurement on this hardware) and FP32
+activations consumed directly, which deletes the whole BF16 staging pass
+and an activation rounding step; the path is numerically tighter than the
+simdgroup class it replaces (pooled NMSE 5.1e-07 vs 2.1e-06). It ships
+behind a runtime compile-and-probe ladder with an allow-list, env kill
+switches, <code>KIPP_METAL_REQUIRE_TENSOR</code> as the anti-silent-fallback tripwire,
+an affirmative disabled-line assertion in CI (which cannot run this path),
+and per-kernel-class fingerprint tripwires. Remaining after this release:
+the attention/elementwise residue now dominates prefill (1.40× at 12,800
+tokens vs 2.80× at 2,048 — long-context attention is the next lever),
+quant tensor variants, server prefill chunk tuning, and CUDA revalidation.</p>
 <p><strong>Status (v0.0.5):</strong> This release corrects the record and closes the campaign
 the correction reframed. The published llama.cpp head-to-head proved <strong>stale
 in Kipp's favor</strong> — the same command, binary, and weights measure ~2× the
@@ -126,13 +143,16 @@ smaller, coherent output), both gated on CPU + Metal. Production KV block
 pooling with cross-request prefix caching is delivered and is the serving
 default on CPU/Metal. An opt-in <strong>Q8_0 KV cache</strong> (<code>--kv-quant q8_0</code>) is
 delivered on CPU + Metal, ~1.9× smaller than BF16 and gated for tolerance
-and placement invariance. Remaining: a <strong>Metal 4 <code>mpp::tensor_ops</code> matmul
-path</strong> (the instruction class behind llama.cpp's remaining prefill lead on
-M5-class hardware; the previously planned K-blocked matmul was measured
-unnecessary — the simdgroup kernels are compute-bound, not traffic-bound),
-plus a token-budget scheduler and 4-bit KV, each behind its own CPU-vs-GPU
-gate. Prompt-lookup and draft-model speculative decoding plus
-generated-token logprobs are already delivered.</p>
+and placement invariance. The <strong>Metal 4 <code>mpp::tensor_ops</code> matmul path</strong> is
+delivered for BF16 projections on M5-class devices (prefill 2.80× at 2,048
+tokens, at parity with llama.cpp's tensor path; the previously planned
+K-blocked matmul was measured unnecessary — the simdgroup kernels were
+compute-bound, not traffic-bound). Remaining: long-context prefill
+attention (the dominant cost above ~8K tokens now that projections are
+fast), quantized tensor-matmul variants, server prefill chunk tuning, a
+token-budget scheduler, and 4-bit KV, each behind its own CPU-vs-GPU gate.
+Prompt-lookup and draft-model speculative decoding plus generated-token
+logprobs are already delivered.</p>
 <h2>Phase 0 — Specify the model</h2>
 <ul>
 <li>Pin <code>Qwen/Qwen3-4B-Base</code> and its exact revision.</li>

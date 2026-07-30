@@ -3,6 +3,59 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## v0.0.6 — 2026-07-30
+
+### Metal 4 tensor-ops prefill: BF16 2.80× — the instruction-class gap is closed
+- **BF16 prefill @2048 tokens: 1,312 → 3,682 tok/s (2.80×)** on the M5 Max,
+  via a `mpp::tensor_ops` (neural-accelerator) matmul path for BF16 layer
+  projections. Same-session interleaved A/B with `KIPP_METAL_TENSOR_DISABLE`
+  toggling the class: 348-token prefill 2.41× (1,031 → 2,489), 12,800-token
+  1.40× (attention now dominates long context), **decode identical** (the
+  tensor path never touches decode) and the **Q8_0 control equal in both
+  states** (quant fingerprints bit-frozen: 7421c99f0af71365,
+  0709c0eb78978e61). This is at parity with llama.cpp's own tensor path —
+  the ~2.9× instruction-class deficit v0.0.5 documented is gone.
+- **The kernel departs from llama.cpp's design where measurement said to.**
+  A 64-row × 128-token threadgroup runs matmul2d over device tensors whose
+  extents clip every ragged edge — but **no operand is staged**: llama.cpp's
+  staged-weight shape measured 0.96–2.9× vs Kipp's simdgroup kernels while
+  the no-stage shape reaches 4.9–6.2× (45–65 TFLOP/s, rotation-immune), the
+  sixth loss for explicit threadgroup staging on this GPU. Activations are
+  consumed as **FP32 straight from the round's working buffer** (matmul2d
+  takes float sources): ~12–18% slower per GEMM than bf16 inputs, but it
+  deletes the entire `kipp_bf16_stage` pass (four dispatches per layer,
+  ~90 ms per 2,048-token prefill) and one activation rounding step — a net
+  ~+10% end-to-end and strictly better numerics.
+- **Numerically tighter than the class it replaces**, not merely in-gate:
+  pooled-vs-oracle NMSE 5.12e-07 (simdgroup: 2.09e-06), matrix-vs-vector
+  2.78e-06 (simdgroup: 1.52e-05), identical argmax throughout. matmul2d
+  output measured **bitwise invariant to the dispatch token count and
+  bitwise deterministic across runs**, which is what lets the wholesale
+  class swap keep the paged/pooled bitwise placement gates valid (they now
+  cover the tensor path). Per-class tripwires recorded: tensor
+  `--prefill-metal` fingerprint 794f1799c6a7326a / pooled 5.12341885e-07;
+  the frozen simdgroup values (49e2ada96bce2804 / 2.08738076e-06) stay
+  verifiable via `KIPP_METAL_TENSOR_DISABLE=1`.
+- **Gated like everything else, plus tripwires for a path CI cannot run.**
+  Three-rung runtime compile ladder: the tensor rung runs only behind an
+  env kill switch, the Metal 4 GPU family check, an M5/M6/A19/A20 device
+  allow-list (`KIPP_METAL_TENSOR_ENABLE=1` overrides), and a probe-pipeline
+  compile; any failure demotes cleanly to the simdgroup rungs.
+  `KIPP_METAL_REQUIRE_TENSOR=1` turns a silent fallback into a load failure
+  (it caught a real kernel bug during development), bench.py refuses
+  degraded-build numbers under that env, CI asserts the affirmative
+  "tensor path disabled (<reason>)" line on its non-M5 runners, and the
+  geometry probe grew tensor-tile slots. The operator suite gained an
+  exact-integer tensor matmul comparison at tolerance 0.0 on a deliberately
+  ragged 72×133 shape (integer FP32 accumulation is order-independent, so a
+  wrong matmul2d descriptor cannot hide inside a tolerance).
+- **Scope and honesty:** BF16 projections only — quantized matmuls, the
+  LM head, and attention keep their existing kernels (quant tensor variants
+  and the now-dominant attention/elementwise residue are the next
+  campaigns; the server's 32-token prefill chunks also benefit, ~2× at
+  8-token rounds, but server chunk tuning remains future work). CUDA is
+  untouched and was not run.
+
 ## v0.0.5 — 2026-07-28
 
 ### The llama.cpp comparison was stale — corrected, and the loss stated plainly

@@ -69,4 +69,16 @@ jobs:
           KIPP_METAL_REQUIRE_MMA: "1"
         run: |
           make build/kipp_test_metal
-          build/kipp_test_metal --metal-operators
+          build/kipp_test_metal --metal-operators 2> metal-operators.log \
+            && status=0 || status=$?
+          cat metal-operators.log >&2
+          exit $status
+      # The Metal 4 tensor path can only be ON for M5-class devices, which no
+      # hosted runner is — so CI cannot execute (or even compile) that source.
+      # Assert the OFF state affirmatively instead of assuming it: the engine
+      # must say why the tensor path is disabled, or this check fails. The
+      # enabled path is gated on developer hardware with
+      # KIPP_METAL_REQUIRE_TENSOR=1 before every release.
+      - name: Tensor path is affirmatively disabled on this runner
+        run: |
+          grep -q "kipp-metal: tensor path disabled (" metal-operators.log

@@ -71,21 +71,24 @@ record results from a fallback build. Current reference numbers
 (Qwen3-4B, Metal, greedy; every value traces to a committed
 <code>bench/results/*.json</code>):</p>
 <ul>
-<li>Decode tok/s (64 tokens, median of 5, 2026-07-28 session): BF16 <strong>61.2</strong>,
-Q8_0 <strong>97.4</strong>, affine4 <strong>128.8</strong>. Session-to-session drift on this machine
-is a few percent in either direction (the previous campaign read 59.8 /
-94.3 / 127.9); the controlled back-to-back A/Bs measure decode unchanged
-through every kernel change, and each campaign is re-run in one session so
+<li>Decode tok/s (64 tokens, median of 5, 2026-07-30 session): BF16 <strong>59.7</strong>,
+Q8_0 <strong>94.4</strong>, affine4 <strong>127.9</strong>. Session-to-session drift on this machine
+is a few percent in either direction (previous campaigns read 61.2 / 97.4 /
+128.8 and 59.8 / 94.3 / 127.9); the controlled back-to-back A/Bs measure
+decode unchanged through every kernel change — including the tensor path,
+which decode never takes — and each campaign is re-run in one session so
 its numbers stay comparable with each other.</li>
 <li>Wikitext-2 perplexity (full test set, 2,048-token windows): BF16
 <strong>7.731</strong>, Q8_0 <strong>7.733</strong> (+0.02%), affine4 <strong>8.171</strong> (+5.7%) — Q8_0 is
 effectively lossless; affine4 is Q4-class.</li>
-<li>Prefill tok/s (348-token / 2,048-token prompt, 2026-07-28): BF16
-<strong>1034 / 1312</strong>, Q8_0 <strong>1065 / 1213</strong>, affine4 <strong>1080 / 1214</strong> — the
-quantized schemes gained 10–12% at 2,048 tokens from the shared-dequant
-rotation (&quot;What the matmuls are actually bound by&quot;, below); BF16 is
-unchanged. The quantized kernels dequantize each 32-weight block once per
-64-token tile, so quantized prefill stays near BF16 parity.</li>
+<li>Prefill tok/s (348-token / 2,048-token prompt, 2026-07-30): BF16
+<strong>2500 / 3679</strong> on the Metal 4 tensor path (&quot;The tensor-ops path&quot; below;
+2.4–2.8× the 1034 / 1312 the simdgroup kernels reach, which stay the
+shipped path on pre-M5 devices), Q8_0 <strong>1065 / 1213</strong>, affine4
+<strong>1080 / 1214</strong> on the simdgroup kernels (quantized projections gained
+10–12% at 2,048 tokens from the v0.0.5 shared-dequant rotation; their
+tensor variants are future work). The quantized kernels dequantize each
+32-weight block once per 64-token tile.</li>
 <li>Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
 12,800-token prompt after the split-K long-context path (<code>ctx-*.json</code>).</li>
 <li>Model-size sweep (BF16 decode): 0.6B <strong>269</strong>, 4B <strong>60.7</strong>, 8B <strong>33.5</strong>
@@ -413,7 +416,101 @@ Forced onto the same simdgroup-matrix instruction class Kipp uses
 <p>What follows from this: matching llama.cpp's default BF16/Q8_0 prefill on M5
 requires an <code>mpp::tensor_ops</code> matmul path, not further simdgroup tuning —
 that is the next roadmap item, behind the same runtime-probe-and-fall-back
-ladder and oracle gates as the simdgroup kernels.</p>
+ladder and oracle gates as the simdgroup kernels. <em>(Delivered in v0.0.6 —
+next section.)</em></p>
+<h3>The tensor-ops path: BF16 prefill 2.80×, and where llama.cpp's design was wrong for this engine (2026-07-30)</h3>
+<p>v0.0.6 ships the <code>mpp::tensor_ops</code> (M5 neural-accelerator) matmul path for
+BF16 layer projections, and it closes the instruction-class gap the previous
+section documented:</p>
+<table>
+<thead>
+<tr>
+<th>Qwen3-4B BF16, M5 Max, same-session interleaved A/B</th>
+<th>simdgroup (<code>KIPP_METAL_TENSOR_DISABLE=1</code>)</th>
+<th>tensor (default on M5-class)</th>
+<th>ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prefill @348</td>
+<td>1,031.4</td>
+<td><strong>2,489.3</strong></td>
+<td>2.41×</td>
+</tr>
+<tr>
+<td>Prefill @2,048</td>
+<td>1,312.5 (MAD 1.2)</td>
+<td><strong>3,682.1</strong> (MAD 0.28)</td>
+<td><strong>2.80×</strong></td>
+</tr>
+<tr>
+<td>Prefill @12,800</td>
+<td>691.8</td>
+<td><strong>968.7</strong></td>
+<td>1.40×</td>
+</tr>
+<tr>
+<td>Decode</td>
+<td>67.6</td>
+<td>68.1</td>
+<td>identical</td>
+</tr>
+<tr>
+<td>Q8_0 control @2,048</td>
+<td>equal</td>
+<td>equal</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>The committed records (<code>4b-bf16-*.json</code>, 2026-07-30 session) read
+3,679 / 2,500 at 2,048 / 348 tokens. That is parity with llama.cpp's own
+tensor path (its cool-session 3,788 from the 2026-07-28 record; its quant
+rows are unchanged — Kipp's quantized schemes still run the simdgroup
+kernels, bit-frozen by fingerprint in both env states). The 12,800-token
+ratio falling to 1.40× says what the next campaign is: with projections
+~5× faster, <strong>long-context prefill attention is now the dominant cost</strong>.</p>
+<p>Three design findings, two of them against the llama.cpp blueprint this
+port started from:</p>
+<ul>
+<li><strong>Do not stage the weight tile.</strong> llama.cpp's tensor kernel stages a
+64×32 weight tile through threadgroup memory (it must — its quant types
+dequantize there). Measured on Kipp's shapes, that staged design reaches
+only 0.96–2.9× the simdgroup kernels, while feeding both operands as
+plain device tensors reaches <strong>4.9–6.2× (45–65 TFLOP/s)</strong>, rotation-immune
+at 111–128 GB/s of weight streaming. This is the sixth consecutive loss
+for explicit threadgroup staging on this GPU; for pure BF16 the tensor
+units stream device memory faster than any hand-staging scheme.</li>
+<li><strong>Consume FP32 activations directly.</strong> <code>matmul2d</code> accepts float sources,
+so the tensor path reads the round's FP32 working buffer instead of the
+staged-BF16 copy the simdgroup kernel needs. Float activations cost
+~12–18% per GEMM, but they delete the entire <code>kipp_bf16_stage</code> pass
+(four dispatches per layer, ~90 ms per 2,048-token prefill) plus one
+activation rounding step — a net win end-to-end and strictly better
+numerics: pooled-vs-oracle NMSE <strong>5.12e-07</strong> against the simdgroup path's
+2.09e-06, matrix-vs-vector 2.78e-06 against 1.52e-05.</li>
+<li><strong>matmul2d is bitwise stable where it matters.</strong> Its output measured
+bitwise invariant to the dispatch token count (26/32/96/512) and bitwise
+deterministic across repeated runs. That is what allows a wholesale
+kernel-class swap at the same ≥8-token threshold: the paged/pooled
+bitwise placement gates keep comparing a single class — and now cover the
+tensor path on M5-class hardware.</li>
+</ul>
+<p>Because CI runners cannot run (or even compile) this path, it carries more
+tripwires than any other kernel class: a runtime compile-and-probe ladder
+behind a device allow-list, <code>KIPP_METAL_REQUIRE_TENSOR=1</code> turning silent
+fallback into a load failure (it caught a real kernel bug during
+development), a bench harness that refuses degraded-build numbers, an
+affirmative &quot;tensor path disabled (reason)&quot; line asserted by CI, tensor
+slots in the shader geometry probe, and an exact-integer operator test at
+tolerance 0.0 on a ragged 72×133 shape — integer FP32 accumulation is
+order-independent, so a wrong <code>matmul2d</code> descriptor cannot hide inside a
+tolerance. Per-kernel-class tripwires (M5 Max): tensor <code>--prefill-metal</code>
+fingerprint <strong>794f1799c6a7326a</strong> / pooled NMSE <strong>5.12341885e-07</strong>; the
+frozen simdgroup values (<strong>49e2ada96bce2804</strong> / <strong>2.08738076e-06</strong>) remain
+verifiable with <code>KIPP_METAL_TENSOR_DISABLE=1</code>, and both must be checked on
+their own path.</p>
 <h2>Optimized Metal kernels on Apple M5 (v0.0.1)</h2>
 <p>Measured on 2026-07-13 with Kipp v0.0.1's batched Metal path: one serial compute
 encoder per command buffer, up to 32 prefill tokens per batch,

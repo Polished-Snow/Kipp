@@ -10,16 +10,16 @@
     "warmup_runs": 1
   },
   "decode_tokens_per_second": {
-    "maximum": 86.36883812320515,
-    "median": 86.25522922327167,
-    "median_absolute_deviation": 0.09197139049301484,
-    "minimum": 84.45856779383664
+    "maximum": 85.52490912978405,
+    "median": 84.03008276963153,
+    "median_absolute_deviation": 1.4792624208543117,
+    "minimum": 79.98480288745138
   },
   "engine": {
     "backend": "metal",
     "binary": "build/kipp-metal",
     "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
-    "commit": "ae50bb3af689603bc6393731e839f3b4395e9b83",
+    "commit": "411c2028a49ed05abdcfaad33303a814e5dbc16d",
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "dirty": true
   },
@@ -39,52 +39,52 @@
     "sha256": "e81b9066347d9e3ab1c22058ac7de5792a6a78f41ce408d187421b620de0bc96"
   },
   "peak_resident_bytes": {
-    "maximum": 41762816.0,
-    "median": 41697280.0,
-    "median_absolute_deviation": 65536.0,
-    "minimum": 41615360.0
+    "maximum": 41943040.0,
+    "median": 41844736.0,
+    "median_absolute_deviation": 32768.0,
+    "minimum": 41811968.0
   },
   "prefill_tokens_per_second": {
-    "maximum": 1213.9209706625886,
-    "median": 1213.149402192199,
-    "median_absolute_deviation": 0.2537255202576034,
-    "minimum": 1212.6214471760663
+    "maximum": 1209.5704902599455,
+    "median": 1202.102270259356,
+    "median_absolute_deviation": 7.468220000589554,
+    "minimum": 1184.5462979457839
   },
   "runs": [
     {
-      "decode_seconds": 0.094721,
-      "decode_tokens_per_second": 84.45856779383664,
-      "peak_resident_bytes": 41615360,
-      "prefill_seconds": 1.687815,
-      "prefill_tokens_per_second": 1213.4031277124566
+      "decode_seconds": 0.100019,
+      "decode_tokens_per_second": 79.98480288745138,
+      "peak_resident_bytes": 41811968,
+      "prefill_seconds": 1.728932,
+      "prefill_tokens_per_second": 1184.5462979457839
     },
     {
-      "decode_seconds": 0.092748,
-      "decode_tokens_per_second": 86.25522922327167,
-      "peak_resident_bytes": 41631744,
-      "prefill_seconds": 1.688463,
-      "prefill_tokens_per_second": 1212.9374466600689
+      "decode_seconds": 0.09691,
+      "decode_tokens_per_second": 82.55082034877722,
+      "peak_resident_bytes": 41828352,
+      "prefill_seconds": 1.703682,
+      "prefill_tokens_per_second": 1202.102270259356
     },
     {
-      "decode_seconds": 0.092626,
-      "decode_tokens_per_second": 86.36883812320515,
-      "peak_resident_bytes": 41697280,
-      "prefill_seconds": 1.687095,
-      "prefill_tokens_per_second": 1213.9209706625886
+      "decode_seconds": 0.09354,
+      "decode_tokens_per_second": 85.52490912978405,
+      "peak_resident_bytes": 41844736,
+      "prefill_seconds": 1.693163,
+      "prefill_tokens_per_second": 1209.5704902599455
     },
     {
-      "decode_seconds": 0.092847,
-      "decode_tokens_per_second": 86.16325783277865,
-      "peak_resident_bytes": 41762816,
-      "prefill_seconds": 1.688168,
-      "prefill_tokens_per_second": 1213.149402192199
+      "decode_seconds": 0.095204,
+      "decode_tokens_per_second": 84.03008276963153,
+      "peak_resident_bytes": 41893888,
+      "prefill_seconds": 1.726757,
+      "prefill_tokens_per_second": 1186.0383366043977
     },
     {
-      "decode_seconds": 0.092737,
-      "decode_tokens_per_second": 86.2654603879789,
-      "peak_resident_bytes": 41730048,
-      "prefill_seconds": 1.688903,
-      "prefill_tokens_per_second": 1212.6214471760663
+      "decode_seconds": 0.094081,
+      "decode_tokens_per_second": 85.03310976711558,
+      "peak_resident_bytes": 41943040,
+      "prefill_seconds": 1.702264,
+      "prefill_tokens_per_second": 1203.1036313991249
     }
   ]
 }
