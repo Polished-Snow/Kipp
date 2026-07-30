@@ -67,6 +67,21 @@
 #define KIPP_METAL_MM_QUANT_TOKEN_TILE 64u
 #define KIPP_METAL_MM_QUANT_ROWS_PER_GROUP 32u
 #define KIPP_METAL_MM_ROWS_PER_GROUP 128u
+/* Output-tile geometry of the Metal 4 tensor-ops projection kernel; mirrors
+ * KIPP_MM_TENSOR_* in metal/kipp_kernels.metal. Note the dispatch grid is
+ * transposed relative to the simdgroup kernels: x advances tokens, y rows. */
+#define KIPP_METAL_MM_TENSOR_TOKEN_TILE 128u
+#define KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP 64u
+/* Metal 4 GPU family. The named MTLGPUFamily constant needs a newer SDK than
+ * this project requires, so the raw value is declared here the way llama.cpp
+ * declares it (ggml-metal-device.m). */
+enum { KIPP_METAL_GPU_FAMILY_METAL4 = 5002 };
+
+/* Which optional kernel classes the runtime compile produced. */
+typedef struct {
+    BOOL matrix; /* bfloat simdgroup-matrix kernels */
+    BOOL tensor; /* Metal 4 mpp::tensor_ops kernels */
+} kipp_metal_kernel_caps;
 
 typedef struct {
     uint32_t rows;
@@ -157,6 +172,7 @@ typedef struct {
 @property(nonatomic) const kipp_model_view *view;
 @property(nonatomic) kipp_model_config config;
 @property(nonatomic) BOOL matrixKernelAvailable;
+@property(nonatomic) BOOL tensorKernelAvailable;
 @property(nonatomic, strong) id<MTLBuffer> batchLogits;
 @property(nonatomic, strong) KippMetalSession *oracleSession;
 /* Shared KV slab for pooled sessions (kv_pool_blocks > 0). */
@@ -1212,28 +1228,108 @@ static int metal_verify_mm_geometry(
     return 0;
 }
 
+/*
+ * Whether the Metal 4 tensor-ops kernels should even be attempted on this
+ * device. Order mirrors llama.cpp's gating: env kill switch, GPU family,
+ * then a device-name allow-list — llama.cpp measured the tensor path ~5%
+ * slower on M2 Ultra and a wash on M4-class chips, so only the generations
+ * with the wider neural accelerators enable it by default
+ * (KIPP_METAL_TENSOR_ENABLE=1 overrides the list for experiments). CI's
+ * macos runners are deliberately excluded by the list: the tensor source
+ * only compiles where the runtime toolchain has Metal 4, so CI covers the
+ * disabled path and this machine's gates cover the enabled one. When the
+ * gate declines, outReason names the first check that failed.
+ */
+static BOOL metal_tensor_gate(id<MTLDevice> device, const char **outReason) {
+    const char *disable = getenv("KIPP_METAL_TENSOR_DISABLE");
+    if (disable != NULL && disable[0] == '1') {
+        *outReason = "KIPP_METAL_TENSOR_DISABLE is set";
+        return NO;
+    }
+    if (![device supportsFamily:(MTLGPUFamily)KIPP_METAL_GPU_FAMILY_METAL4]) {
+        *outReason = "device lacks the Metal 4 GPU family";
+        return NO;
+    }
+    const char *enable = getenv("KIPP_METAL_TENSOR_ENABLE");
+    if (enable == NULL || enable[0] != '1') {
+        static NSString *const allowed[] = {@"M5", @"M6", @"A19", @"A20"};
+        BOOL listed = NO;
+        for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
+            if ([device.name containsString:allowed[i]]) {
+                listed = YES;
+                break;
+            }
+        }
+        if (!listed) {
+            *outReason = "device generation is not on the allow-list";
+            return NO;
+        }
+    }
+    *outReason = NULL;
+    return YES;
+}
+
 static int metal_compile_pipelines(
     id<MTLDevice> device, uint32_t embeddingLength, uint32_t queryHeadCount,
     id<MTLLibrary> *outLibrary,
     NSDictionary<NSString *, id<MTLComputePipelineState>> **outPipelines,
-    BOOL *outMatrixKernelAvailable, kipp_error *error) {
+    kipp_metal_kernel_caps *outCaps, kipp_error *error) {
     NSError *libraryError = nil;
     NSString *source = [NSString
         stringWithUTF8String:(const char *)kipp_metal_source];
-    /* The batched-prefill matrix kernel needs bfloat simdgroup matrices;
-     * on devices without them the library compiles without that kernel
-     * and prefill stays on the vector path. */
+    /* Three-rung compile ladder. The batched-prefill matrix kernels need
+     * bfloat simdgroup matrices and the tensor kernels need Metal 4; each
+     * rung that fails falls to the next, and on devices with neither the
+     * library compiles without those kernels and prefill stays on the
+     * vector path. */
     BOOL matrixKernel = YES;
-    MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
-    options.preprocessorMacros = @{@"KIPP_ENABLE_BF16_MMA" : @1};
-    id<MTLLibrary> library = [device newLibraryWithSource:source
-                                                  options:options
-                                                    error:&libraryError];
+    BOOL tensorKernel = NO;
+    const char *tensorReason = NULL;
+    id<MTLLibrary> library = nil;
+    if (metal_tensor_gate(device, &tensorReason)) {
+        MTLCompileOptions *tensorOptions = [[MTLCompileOptions alloc] init];
+        tensorOptions.preprocessorMacros =
+            @{@"KIPP_ENABLE_BF16_MMA" : @1, @"KIPP_ENABLE_TENSOR_OPS" : @1};
+        library = [device newLibraryWithSource:source
+                                       options:tensorOptions
+                                         error:&libraryError];
+        if (library != nil) {
+            /* A device can advertise the family and still fail to build the
+             * op; probing the pipeline here keeps that failure a clean
+             * demotion instead of a hard error on the real kernel later. */
+            NSError *probeError = nil;
+            id<MTLFunction> probe =
+                [library newFunctionWithName:@"kipp_tensor_probe_bf16"];
+            id<MTLComputePipelineState> probeState =
+                probe == nil
+                    ? nil
+                    : [device newComputePipelineStateWithFunction:probe
+                                                            error:&probeError];
+            if (probeState == nil) {
+                library = nil;
+                libraryError = probeError;
+            }
+        }
+        if (library == nil) {
+            fprintf(stderr, "kipp-metal: tensor kernels unavailable: %s\n",
+                    libraryError.localizedDescription.UTF8String);
+            tensorReason = "the tensor kernels did not compile";
+        } else {
+            tensorKernel = YES;
+        }
+    }
+    if (library == nil) {
+        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+        options.preprocessorMacros = @{@"KIPP_ENABLE_BF16_MMA" : @1};
+        library = [device newLibraryWithSource:source
+                                       options:options
+                                         error:&libraryError];
+    }
     if (library == nil) {
         fprintf(stderr, "kipp-metal: matrix kernel unavailable: %s\n",
                 libraryError.localizedDescription.UTF8String);
         matrixKernel = NO;
-        options = [[MTLCompileOptions alloc] init];
+        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
         library = [device newLibraryWithSource:source
                                        options:options
                                          error:&libraryError];
@@ -1256,6 +1352,22 @@ static int metal_compile_pipelines(
                 "kernels did not compile: %s",
                 libraryError.localizedDescription.UTF8String);
         }
+    }
+    /* Same tripwire for the tensor path: it only runs on a handful of device
+     * generations, so a silent fallback would be invisible everywhere except
+     * exactly where it matters. The affirmative "disabled" line below is what
+     * CI asserts on runners where the path can never be on. */
+    if (!tensorKernel) {
+        const char *require = getenv("KIPP_METAL_REQUIRE_TENSOR");
+        if (require != NULL && require[0] == '1') {
+            return metal_fail(
+                error, KIPP_ERROR_UNSUPPORTED,
+                "KIPP_METAL_REQUIRE_TENSOR is set but the tensor kernels are "
+                "unavailable (%s)",
+                tensorReason != NULL ? tensorReason : "unknown reason");
+        }
+        fprintf(stderr, "kipp-metal: tensor path disabled (%s)\n",
+                tensorReason != NULL ? tensorReason : "unknown reason");
     }
     /* The matvec kernel is specialized twice through function constant 0:
      * a one-token variant for decode and a KIPP_METAL_TOKEN_TILE variant
@@ -1349,7 +1461,8 @@ static int metal_compile_pipelines(
     }
     *outLibrary = library;
     *outPipelines = pipelines;
-    *outMatrixKernelAvailable = matrixKernel;
+    outCaps->matrix = matrixKernel;
+    outCaps->tensor = tensorKernel;
     return 0;
 }
 
@@ -1382,10 +1495,10 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
 
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
-        BOOL matrixKernel = NO;
+        kipp_metal_kernel_caps caps = {NO, NO};
         if (metal_compile_pipelines(device, view->config.embedding_length,
                                     view->config.attention_head_count,
-                                    &library, &pipelines, &matrixKernel,
+                                    &library, &pipelines, &caps,
                                     error) != 0) {
             return -1;
         }
@@ -1407,7 +1520,8 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
         model.pipelines = pipelines;
         model.view = view;
         model.config = view->config;
-        model.matrixKernelAvailable = matrixKernel;
+        model.matrixKernelAvailable = caps.matrix;
+        model.tensorKernelAvailable = caps.tensor;
         model.batchLogits = metal_new_shared_buffer(
             device, (NSUInteger)KIPP_METAL_LOGIT_ROWS * KIPP_VOCAB_SIZE *
                         sizeof(float));
@@ -1424,7 +1538,7 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
          * well as memory -- decode reads this buffer every step.
          */
         BOOL alwaysStreams =
-            !matrixKernel || view->config.kv_quant != KIPP_KV_QUANT_BF16;
+            !caps.matrix || view->config.kv_quant != KIPP_KV_QUANT_BF16;
         uint64_t perToken = metal_workspace_bytes_per_token(view->config);
         uint64_t perTokenPartials =
             (uint64_t)view->config.attention_head_count *
@@ -1794,12 +1908,13 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
         }
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
-        BOOL matrixKernel = NO;
+        kipp_metal_kernel_caps caps = {NO, NO};
         if (metal_compile_pipelines(device, KIPP_TEST_EMBED,
                                     KIPP_TEST_Q_HEADS, &library, &pipelines,
-                                    &matrixKernel, error) != 0) {
+                                    &caps, error) != 0) {
             return -1;
         }
+        BOOL matrixKernel = caps.matrix;
         id<MTLCommandQueue> queue = [device newCommandQueue];
 
         {
@@ -2664,13 +2779,13 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
         }
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
-        BOOL matrixKernel = NO;
+        kipp_metal_kernel_caps caps = {NO, NO};
         if (metal_compile_pipelines(device, KIPP_TEST_EMBED, KIPP_TEST_Q_HEADS,
-                                    &library, &pipelines, &matrixKernel,
+                                    &library, &pipelines, &caps,
                                     error) != 0) {
             return -1;
         }
-        if (!matrixKernel) {
+        if (!caps.matrix) {
             return metal_fail(error, KIPP_ERROR_UNSUPPORTED,
                               "the matmul bench requires the simdgroup-matrix "
                               "kernels");

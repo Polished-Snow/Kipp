@@ -1382,3 +1382,43 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
     }
 }
 #endif
+
+/*
+ * Metal 4 tensor-ops path (M5-class neural accelerators). Compiled only when
+ * the host's device gate passes (Metal 4 family, device allow-list, env
+ * switches) AND this block compiles and builds pipelines on the running
+ * toolchain — the includes below do not exist before Metal 4, so they live
+ * inside the guard. The host treats any failure here as "tensor path
+ * unavailable" and falls back to the simdgroup-matrix kernels above.
+ */
+#if defined(KIPP_ENABLE_TENSOR_OPS)
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+/*
+ * Smallest kernel that forces the toolchain to instantiate matmul2d, a
+ * cooperative destination tensor, and its store. Building this pipeline is
+ * the host's runtime probe: a device can advertise the Metal 4 family and
+ * still fail here (llama.cpp probes the same way), and a probe failure must
+ * demote the whole tensor path rather than surface later as a pipeline error
+ * on the real kernel.
+ */
+kernel void kipp_tensor_probe_bf16(device bfloat *a [[buffer(0)]],
+                                   device bfloat *b [[buffer(1)]],
+                                   device float *c [[buffer(2)]]) {
+    auto tA = tensor(a, dextents<int32_t, 2>(32, 16), array<int, 2>({1, 32}));
+    auto tB = tensor(b, dextents<int32_t, 2>(32, 16), array<int, 2>({1, 32}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            16, 16, 32, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA),
+                                                    float>();
+    auto mB = tB.slice(0, 0);
+    auto mA = tA.slice(0, 0);
+    mm.run(mB, mA, cT);
+    auto tC = tensor(c, dextents<int32_t, 2>(16, 16), array<int, 2>({1, 16}));
+    cT.store(tC.slice(0, 0));
+}
+#endif
