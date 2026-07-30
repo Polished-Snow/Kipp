@@ -1,5 +1,5 @@
 {
- "description": "llama.cpp head-to-head on identical hardware and the same pinned Qwen3-4B-Base HF revision, re-measured 2026-07-28: the 2026-07-22 record proved irreproducible (same command/binary/weights measure ~2x on both axes today; that session evidently ran in a degraded GPU-clock state) and is superseded by this file. llama.cpp converted independently from the same safetensors; measured with llama-bench on an otherwise idle machine, same session as the Kipp 4b-*.json records. Notes: llama-bench reports mean and stddev, Kipp reports median and MAD. decode_isolated is a decode-only run (-p 0 -n 256) after a cooldown, because the interleaved -p 2048 -n 256 run heats the GPU enough to depress its own decode readings (47-69 tok/s) - quote the isolated figures for decode. tensor_disabled re-runs the interleaved shape with GGML_METAL_TENSOR_DISABLE=1, forcing the simdgroup-matrix instruction class Kipp uses instead of the Metal 4 tensor API llama.cpp enables by default on M5-class devices. Q4_0 is llama.cpp's scale-only 4-bit gs32 format; Kipp's affine4_gs32 is scale+bias 4-bit gs32 - closest available match, not identical.",
+ "description": "llama.cpp head-to-head on identical hardware and the same pinned Qwen3-4B-Base HF revision, re-measured 2026-07-28: the 2026-07-22 record proved irreproducible (same command/binary/weights measure ~2x on both axes today; that session evidently ran in a degraded GPU-clock state) and is superseded by this file. llama.cpp converted independently from the same safetensors; measured with llama-bench on an otherwise idle machine, same session as the Kipp 4b-*.json records. Notes: llama-bench reports mean and stddev, Kipp reports median and MAD. decode_isolated is a decode-only run (-p 0 -n 256) after a cooldown, because the interleaved -p 2048 -n 256 run heats the GPU enough to depress its own decode readings (47-69 tok/s) - quote the isolated figures for decode. tensor_disabled re-runs the interleaved shape with GGML_METAL_TENSOR_DISABLE=1, forcing the simdgroup-matrix instruction class Kipp uses instead of the Metal 4 tensor API llama.cpp enables by default on M5-class devices. Q4_0 is llama.cpp's scale-only 4-bit gs32 format; Kipp's affine4_gs32 is scale+bias 4-bit gs32 - closest available match, not identical. Update 2026-07-30: the bf16 prefill entry was re-measured in the same session as the Kipp v0.0.6 tensor-path records (llama-bench -p 2048 -n 0 -r 5, cooled machine); all other entries retain the 2026-07-28 measurements (the llama.cpp binary is unchanged, and Kipp's quantized paths are bit-frozen by fingerprint across the release). A decode-only rerun in the 2026-07-30 session produced a thermally broken reading and was discarded; the 2026-07-28 isolated decode figures stand.",
  "llamacpp": {
   "repository": "https://github.com/ggml-org/llama.cpp",
   "commit": "178a6c44937154dc4c4eff0d166f4a044c4fceba",
@@ -16,10 +16,11 @@
  "results": {
   "bf16": {
    "prefill": {
-    "avg_tokens_per_second": 3788.334532,
-    "stddev": 250.126101,
+    "avg_tokens_per_second": 4102.459422,
+    "stddev": 5.850659,
     "n_prompt": 2048,
-    "n_gen": 0
+    "n_gen": 0,
+    "measured": "2026-07-30"
    },
    "decode": {
     "avg_tokens_per_second": 59.619231,

@@ -40,29 +40,29 @@ afternoon.
 
 Qwen3-4B on an Apple M5 Max, against llama.cpp on the **same host, the same
 weights, and the same session** — the honest comparison, losing rows included
-(re-measured 2026-07-28; an earlier table here compared against a degraded
-llama.cpp session and overstated Kipp — withdrawn and documented in the
-[benchmarks](https://polished-snow.github.io/Kipp/benchmarks.html)):
+(BF16 prefill re-measured 2026-07-30 alongside Kipp's tensor-path records;
+decode and quant rows from the 2026-07-28 session, unchanged since):
 
 | tokens/s | Kipp | llama.cpp | |
 |---|---|---|---|
-| **Decode**, BF16 | 61.2 | **63.1** | llama.cpp +3% |
-| **Decode**, Q8_0 | 97.4 | **100.5** | llama.cpp +3% |
-| **Decode**, 4-bit | 128.8 (affine4) | **149.6** (Q4_0) | llama.cpp **1.16×**\* |
-| **Prefill**, BF16 @2048 | 1,312 | **3,788** | llama.cpp **2.9×** |
-| **Prefill**, Q8_0 @2048 | 1,213 | **2,729** | llama.cpp **2.25×** |
-| **Prefill**, 4-bit @2048 | **1,214** (affine4) | 1,225 (Q4_0) | parity\* |
+| **Decode**, BF16 | 59.7 | **63.1** | llama.cpp +6% |
+| **Decode**, Q8_0 | 94.4 | **100.5** | llama.cpp +6% |
+| **Decode**, 4-bit | 127.9 (affine4) | **149.6** (Q4_0) | llama.cpp **1.17×**\* |
+| **Prefill**, BF16 @2048 | 3,679 | **4,102** | llama.cpp +12% |
+| **Prefill**, Q8_0 @2048 | 1,202 | **2,729** | llama.cpp **2.27×** |
+| **Prefill**, 4-bit @2048 | 1,210 (affine4) | 1,225 (Q4_0) | parity\* |
 
 \* affine4 (scale+bias, gs32) and Q4_0 (scale-only) are the closest available
 4-bit schemes, not identical ones — Q4_0 dequantizes more cheaply, affine4
 carries a bias term.
 
-The prefill gap has one specific cause: on M5, llama.cpp routes GEMM through
-the Metal 4 tensor API (the neural accelerators), an instruction class worth
-~2.3–3× on prefill and nothing on decode. Restricted to the same
-simdgroup-matrix class Kipp uses, llama.cpp's prefill measures 1,261 / 1,022 /
-608 on those three rows — Kipp leads its instruction class on every scheme,
-and a tensor-API path is the next roadmap item. Every number traces to a
+The BF16 prefill row is the v0.0.6 story: a gated Metal 4 tensor-ops matmul
+path (M5-class neural accelerators) took Kipp from 1,312 to 3,679 tok/s —
+**2.80× in one release** — closing what was a 2.9× llama.cpp lead to 12%,
+with decode untouched and the quantized schemes bit-identical. What remains
+of that 12% is Kipp's attention stack at prefill, which is the next campaign;
+quantized projections still run the simdgroup kernels (their tensor variants
+are future work, hence the Q8_0 prefill row). Every number traces to a
 committed file in [`bench/results/`](bench/results/), and the
 [measurement protocol](https://polished-snow.github.io/Kipp/benchmarks.html)
 explains why they are all same-session medians rather than best-of runs.
@@ -89,7 +89,7 @@ affine weights at **128 tok/s** decode.
 - **Registry, not runner** — every supported checkpoint is pinned to one
   revision in `src/kipp_checkpoints.h`; anything else is rejected at load.
 
-### What is in v0.0.5
+### What is in v0.0.6
 
 - **Backends:** scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
   validated on H100 for the current default checkpoints (14B/32B on A100).
