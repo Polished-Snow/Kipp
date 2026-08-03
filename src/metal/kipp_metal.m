@@ -3111,3 +3111,176 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
     }
     return 0;
 }
+
+/*
+ * Isolated prefill-attention micro-benchmark; a measurement instrument, not
+ * a correctness gate. Replays the engine's real chunked-prefill dispatch
+ * shape for kipp_flash_gqa_prefill over a synthetic paged BF16 cache at
+ * several context lengths, in two modes: eight rotating layer slices (so the
+ * system-level cache cannot keep one layer's KV resident, the way a real
+ * 36-layer pass behaves — results scale by 36/8) and a single reused slice
+ * (the cache-resident best case). Rotating ≈ reused means the kernel is
+ * issue/latency-bound and KV-traffic levers cannot help it; rotating ≫
+ * reused means it is genuinely DRAM-bound. Reported TFLOP/s counts only the
+ * useful causal Q·K^T and P·V work.
+ */
+int kipp_metal_run_fa_bench(kipp_error *error) {
+    enum {
+        FAB_ROUND = 512,
+        FAB_LAYERS = 8,
+        FAB_CAPACITY = 25600,
+        FAB_BLOCK = 32
+    };
+    static const uint32_t contexts[] = {2048, 6400, 12800, 25600};
+    metal_clear_error(error);
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (device == nil) {
+            return metal_fail(error, KIPP_ERROR_UNSUPPORTED,
+                              "no Metal device is available");
+        }
+        id<MTLLibrary> library = nil;
+        NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
+        kipp_metal_kernel_caps caps = {NO, NO};
+        if (metal_compile_pipelines(device, KIPP_TEST_EMBED, KIPP_TEST_Q_HEADS,
+                                    &library, &pipelines, &caps,
+                                    error) != 0) {
+            return -1;
+        }
+        if (!caps.matrix) {
+            return metal_fail(error, KIPP_ERROR_UNSUPPORTED,
+                              "the attention bench requires the "
+                              "simdgroup-matrix kernels");
+        }
+        id<MTLComputePipelineState> pipeline =
+            pipelines[@"kipp_flash_gqa_prefill"];
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        const size_t layerValues = (size_t)FAB_CAPACITY *
+                                   KIPP_ATTENTION_HEAD_COUNT_KV *
+                                   KIPP_ATTENTION_HEAD_DIM;
+        id<MTLBuffer> keyCache = metal_new_shared_buffer(
+            device, (size_t)FAB_LAYERS * layerValues * sizeof(uint16_t));
+        id<MTLBuffer> valueCache = metal_new_shared_buffer(
+            device, (size_t)FAB_LAYERS * layerValues * sizeof(uint16_t));
+        const size_t queryValues = (size_t)FAB_ROUND * KIPP_TEST_Q_HEADS *
+                                   KIPP_ATTENTION_HEAD_DIM;
+        id<MTLBuffer> query =
+            metal_new_shared_buffer(device, queryValues * sizeof(float));
+        id<MTLBuffer> output =
+            metal_new_shared_buffer(device, queryValues * sizeof(float));
+        id<MTLBuffer> blockTable = metal_new_shared_buffer(
+            device, (FAB_CAPACITY / FAB_BLOCK) * sizeof(uint32_t));
+        if (keyCache == nil || valueCache == nil || query == nil ||
+            output == nil || blockTable == nil) {
+            return metal_fail(error, KIPP_ERROR_MEMORY,
+                              "attention bench allocation failed");
+        }
+        /* Identity table: traffic-identical to a permutation, and the
+         * operator test owns table-resolution correctness. */
+        for (uint32_t block = 0; block < FAB_CAPACITY / FAB_BLOCK; ++block) {
+            ((uint32_t *)blockTable.contents)[block] = block;
+        }
+        uint16_t *keys = keyCache.contents;
+        uint16_t *values = valueCache.contents;
+        /* Fill one layer with the operator test's pattern and copy it into
+         * the rest; distinct buffers-by-offset defeat the cache by address
+         * regardless of content. */
+        for (size_t index = 0; index < layerValues; ++index) {
+            keys[index] = metal_test_float_to_bf16(
+                sinf((float)(index % 100003u) * 0.031f));
+            values[index] = metal_test_float_to_bf16(
+                cosf((float)(index % 100003u) * 0.017f));
+        }
+        for (uint32_t layer = 1; layer < FAB_LAYERS; ++layer) {
+            memcpy(keys + (size_t)layer * layerValues, keys,
+                   layerValues * sizeof(uint16_t));
+            memcpy(values + (size_t)layer * layerValues, values,
+                   layerValues * sizeof(uint16_t));
+        }
+        float *queryHost = query.contents;
+        for (size_t index = 0; index < queryValues; ++index) {
+            queryHost[index] = sinf((float)(index % 100003u) * 0.011f) * 0.5f;
+        }
+        for (size_t c = 0; c < sizeof(contexts) / sizeof(contexts[0]); ++c) {
+            uint32_t tokens = contexts[c];
+            uint32_t rounds = tokens / FAB_ROUND;
+            for (int rotate = 1; rotate >= 0; --rotate) {
+                double seconds = 0.0;
+                for (int pass = 0; pass < 2; ++pass) {
+                    id<MTLCommandBuffer> command = [queue commandBuffer];
+                    for (uint32_t round = 0; round < rounds; ++round) {
+                        for (uint32_t slice = 0; slice < FAB_LAYERS;
+                             ++slice) {
+                            metal_kv_params params = {
+                                rotate ? slice : 0u, round * FAB_ROUND,
+                                FAB_ROUND, FAB_CAPACITY, 0u};
+                            metal_dispatch_groups(
+                                command, pipeline, KIPP_TEST_Q_HEADS,
+                                (FAB_ROUND + KIPP_METAL_FA_QUERIES - 1u) /
+                                    KIPP_METAL_FA_QUERIES,
+                                32,
+                                ^(id<MTLComputeCommandEncoder> encoder) {
+                                  [encoder setBuffer:query
+                                              offset:0
+                                             atIndex:0];
+                                  [encoder setBuffer:keyCache
+                                              offset:0
+                                             atIndex:1];
+                                  [encoder setBuffer:valueCache
+                                              offset:0
+                                             atIndex:2];
+                                  [encoder setBuffer:output
+                                              offset:0
+                                             atIndex:3];
+                                  [encoder setBytes:&params
+                                             length:sizeof(params)
+                                            atIndex:4];
+                                  [encoder setBuffer:blockTable
+                                              offset:0
+                                             atIndex:5];
+                                  [encoder setBuffer:output
+                                              offset:0
+                                             atIndex:6];
+                                });
+                        }
+                    }
+                    if (metal_commit_and_wait(command, error) != 0) {
+                        return -1;
+                    }
+                    if (pass == 1) {
+                        seconds = command.GPUEndTime - command.GPUStartTime;
+                    }
+                }
+                /* Useful FLOPs across the replay: per round, each of the 512
+                 * queries attends start+index+1 positions; 2 matmuls x 2
+                 * FLOP x heads x dim each. */
+                double positions = 0.0;
+                for (uint32_t round = 0; round < rounds; ++round) {
+                    double start = (double)round * FAB_ROUND;
+                    positions += (double)FAB_ROUND * (start + FAB_ROUND / 2.0);
+                }
+                double flops = positions * 2.0 * 2.0 * KIPP_TEST_Q_HEADS *
+                               KIPP_ATTENTION_HEAD_DIM * FAB_LAYERS;
+                /* Nominal KV bytes: every (query-head, 8-query tile) streams
+                 * K+V for its KV head over the visible prefix. */
+                double tiles = 0.0;
+                for (uint32_t round = 0; round < rounds; ++round) {
+                    double start = (double)round * FAB_ROUND;
+                    tiles += (double)(FAB_ROUND / KIPP_METAL_FA_QUERIES) *
+                             (start + FAB_ROUND / 2.0);
+                }
+                double nominalBytes = tiles * KIPP_TEST_Q_HEADS * 2.0 *
+                                      KIPP_ATTENTION_HEAD_DIM * 2.0 *
+                                      FAB_LAYERS;
+                fprintf(stderr,
+                        "FABENCH n=%u mode=%s layers=%u s=%.4f "
+                        "model36_s=%.3f tflops=%.2f nominal_gbps=%.0f\n",
+                        tokens, rotate ? "rotate" : "reuse", FAB_LAYERS,
+                        seconds, seconds * 36.0 / FAB_LAYERS,
+                        flops / seconds / 1.0e12,
+                        nominalBytes / seconds / 1.0e9);
+            }
+        }
+    }
+    return 0;
+}

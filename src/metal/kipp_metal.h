@@ -18,6 +18,14 @@ int kipp_metal_run_operator_tests(kipp_error *error);
  * A measurement instrument, not a correctness gate.
  */
 int kipp_metal_run_mm_bench(kipp_error *error);
+
+/*
+ * Isolated prefill-attention micro-benchmark: replays the chunked-prefill
+ * dispatch shape over a synthetic paged cache at several context lengths,
+ * rotating vs reusing layer slices to separate DRAM-bound from
+ * issue/latency-bound behaviour. A measurement instrument, not a gate.
+ */
+int kipp_metal_run_fa_bench(kipp_error *error);
 const char *kipp_metal_device_name(void);
 
 /* Test hook: reverse a Metal backend session's KV page table before eval. */

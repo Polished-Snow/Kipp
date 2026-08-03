@@ -196,6 +196,36 @@ def run_once(
             "benchmark output is missing KIPP_METRIC on stderr\n"
             f"{stderr}"
         )
+    # Tripwire: benchmarks are meaningless on battery power or in Low Power
+    # Mode -- Apple silicon GPU clocks drop 2-3x, uniformly enough to look
+    # like a plausible measurement. A session in exactly that state produced
+    # the irreproducible 2026-07-22 llama.cpp comparison this repository had
+    # to retract. Refuse to record rather than trust the operator to notice.
+    if platform.system() == "Darwin" and os.environ.get(
+        "KIPP_BENCH_ALLOW_BATTERY"
+    ) != "1":
+        power = subprocess.run(
+            ["pmset", "-g", "batt"], capture_output=True, text=True
+        ).stdout
+        mode = subprocess.run(
+            ["pmset", "-g"], capture_output=True, text=True
+        ).stdout
+        on_battery = "Battery Power" in power
+        low_power = any(
+            line.strip().startswith("powermode")
+            and line.strip().split()[-1] == "1"
+            for line in mode.splitlines()
+        )
+        if on_battery or low_power:
+            raise RuntimeError(
+                "refusing to benchmark: "
+                + ("machine is on battery power" if on_battery else "")
+                + (" and " if on_battery and low_power else "")
+                + ("Low Power Mode is enabled" if low_power else "")
+                + ". Plug in and disable Low Power Mode, or set "
+                "KIPP_BENCH_ALLOW_BATTERY=1 to override (numbers will not "
+                "be steady-state)."
+            )
     # Tripwire: the Metal bridge falls back to vector kernels when the MMA
     # pipeline fails to compile, printing this warning. A silent fallback
     # once contaminated a whole benchmark campaign (2026-07-22, a reserved
