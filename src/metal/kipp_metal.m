@@ -45,6 +45,17 @@
  * (flat at 2,048 tokens, -7% at 12,800) -- the larger threadgroup allocation
  * costs more in resident threadgroups than the sharing recovers. */
 #define KIPP_METAL_FA_QUERIES 8u
+/* Panel-flash attention (tensor path): KV positions gathered per panel and
+ * the matmul2d tile carved from it; mirrors KIPP_FA_PANEL and the
+ * KIPP_FA_PANEL_*_TILE constants in the shader, pinned by the geometry
+ * probe at model open. */
+#define KIPP_METAL_FA_PANEL 1024u
+#define KIPP_METAL_FA_PANEL_TOKEN_TILE 128u
+#define KIPP_METAL_FA_PANEL_POS_TILE 64u
+/* Ceiling on the panel-flash scratch, separate from the activation budget
+ * (see the round-width derivation): ~108 MB on the 4B geometry at a
+ * 512-token round, clamped against the device working set like the base. */
+#define KIPP_METAL_FA_PANEL_BUDGET_BYTES (160u * 1024u * 1024u)
 /* Split-K decode (mirrors KIPP_KSPLIT_* in the MSL source). */
 #define KIPP_METAL_KSPLIT_MAX 8u
 #define KIPP_METAL_KSPLIT_CHUNK 1024u
@@ -116,6 +127,19 @@ typedef struct {
     uint32_t ksplit_cap;
 } metal_kv_params;
 
+/* Mirrors FaPanelParams in the MSL source (panel-flash attention). */
+typedef struct {
+    uint32_t layer;
+    uint32_t start_position;
+    uint32_t token_count;
+    uint32_t capacity;
+    uint32_t panel_base;
+    uint32_t panel_width;
+    uint32_t panel_width32;
+    uint32_t first_panel;
+    uint32_t last_panel;
+} metal_fa_panel_params;
+
 @class KippMetalModel;
 
 /*
@@ -139,6 +163,17 @@ typedef struct {
 @property(nonatomic, strong) id<MTLBuffer> gate;
 @property(nonatomic, strong) id<MTLBuffer> up;
 @property(nonatomic, strong) id<MTLBuffer> staging;
+/* Panel-flash attention scratch (tensor path with BF16 KV only; nil
+ * otherwise). Score/probability/output panels are head-major, the softmax
+ * state buffers hold one value per (head, workspace token). */
+@property(nonatomic, strong) id<MTLBuffer> faKeyPanel;
+@property(nonatomic, strong) id<MTLBuffer> faValuePanel;
+@property(nonatomic, strong) id<MTLBuffer> faScores;
+@property(nonatomic, strong) id<MTLBuffer> faProbs;
+@property(nonatomic, strong) id<MTLBuffer> faOutPanel;
+@property(nonatomic, strong) id<MTLBuffer> faMaxima;
+@property(nonatomic, strong) id<MTLBuffer> faDenominators;
+@property(nonatomic, strong) id<MTLBuffer> faCorrections;
 @end
 
 @implementation KippMetalWorkspace
@@ -371,6 +406,43 @@ static KippMetalWorkspace *metal_workspace_new(KippMetalModel *model,
         metal_fail(error, KIPP_ERROR_MEMORY,
                    "unable to allocate the Metal activation workspace");
         return nil;
+    }
+    if (model.tensorKernelAvailable &&
+        config.kv_quant == KIPP_KV_QUANT_BF16) {
+        NSUInteger heads = config.attention_head_count;
+        NSUInteger panelValues = (NSUInteger)KIPP_ATTENTION_HEAD_COUNT_KV *
+                                 KIPP_METAL_FA_PANEL *
+                                 KIPP_ATTENTION_HEAD_DIM;
+        NSUInteger scoreValues =
+            heads * tokenCapacity * KIPP_METAL_FA_PANEL;
+        NSUInteger stateValues = heads * tokenCapacity;
+        workspace.faKeyPanel = metal_new_shared_buffer(
+            model.device, panelValues * sizeof(uint16_t));
+        workspace.faValuePanel = metal_new_shared_buffer(
+            model.device, panelValues * sizeof(uint16_t));
+        workspace.faScores = metal_new_shared_buffer(
+            model.device, scoreValues * sizeof(float));
+        workspace.faProbs = metal_new_shared_buffer(
+            model.device, scoreValues * sizeof(uint16_t));
+        workspace.faOutPanel = metal_new_shared_buffer(
+            model.device, heads * tokenCapacity *
+                              KIPP_ATTENTION_HEAD_DIM * sizeof(float));
+        workspace.faMaxima = metal_new_shared_buffer(
+            model.device, stateValues * sizeof(float));
+        workspace.faDenominators = metal_new_shared_buffer(
+            model.device, stateValues * sizeof(float));
+        workspace.faCorrections = metal_new_shared_buffer(
+            model.device, stateValues * sizeof(float));
+        if (workspace.faKeyPanel == nil || workspace.faValuePanel == nil ||
+            workspace.faScores == nil || workspace.faProbs == nil ||
+            workspace.faOutPanel == nil || workspace.faMaxima == nil ||
+            workspace.faDenominators == nil ||
+            workspace.faCorrections == nil) {
+            metal_fail(error, KIPP_ERROR_MEMORY,
+                       "unable to allocate the panel-flash attention "
+                       "workspace");
+            return nil;
+        }
     }
     return workspace;
 }
@@ -725,6 +797,109 @@ static void metal_encode_kv_write(id<MTLComputeCommandEncoder> target,
 }
 
 /*
+ * Panel-flash attention for one part (tensor path, BF16 KV). Walks the
+ * visible KV range in KIPP_METAL_FA_PANEL-position panels; per panel the
+ * round's serial encoder orders gather -> Q K^T (matmul2d) -> panel softmax
+ * -> P V (matmul2d) -> accumulate. The block table is honored by the gather,
+ * so paged and pooled placement invariance is untouched, and the running
+ * softmax state lives in the workspace, so no zero pass is needed: the first
+ * panel initializes it.
+ */
+static void metal_encode_gqa_panels(id<MTLComputeCommandEncoder> target,
+                                    KippMetalModel *model,
+                                    KippMetalSession *kvSession,
+                                    id<MTLBuffer> query, id<MTLBuffer> output,
+                                    NSUInteger headStateOffset, uint32_t layer,
+                                    uint32_t startPosition,
+                                    uint32_t tokenCount) {
+    KippMetalWorkspace *workspace = model.workspace;
+    uint32_t heads = model.config.attention_head_count;
+    uint32_t kvLength = startPosition + tokenCount;
+    uint32_t panelCount =
+        (kvLength + KIPP_METAL_FA_PANEL - 1u) / KIPP_METAL_FA_PANEL;
+    for (uint32_t panel = 0; panel < panelCount; ++panel) {
+        uint32_t base = panel * KIPP_METAL_FA_PANEL;
+        uint32_t width = MIN(KIPP_METAL_FA_PANEL, kvLength - base);
+        metal_fa_panel_params params = {
+            layer,
+            startPosition,
+            tokenCount,
+            kvSession.slabPositions,
+            base,
+            width,
+            (width + 31u) & ~31u,
+            panel == 0u ? 1u : 0u,
+            panel + 1u == panelCount ? 1u : 0u,
+        };
+        metal_enc_threads(
+            target, metal_pipeline(model, @"kipp_fa_panel_gather"),
+            KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
+            params.panel_width32, ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:kvSession.keyCache offset:0 atIndex:0];
+              [encoder setBuffer:kvSession.valueCache offset:0 atIndex:1];
+              [encoder setBuffer:workspace.faKeyPanel offset:0 atIndex:2];
+              [encoder setBuffer:workspace.faValuePanel offset:0 atIndex:3];
+              [encoder setBytes:&params length:sizeof(params) atIndex:4];
+              [encoder setBuffer:kvSession.blockTable offset:0 atIndex:5];
+            });
+        metal_enc_groups_3d(
+            target, metal_pipeline(model, @"kipp_fa_panel_qk"),
+            (tokenCount + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
+                KIPP_METAL_FA_PANEL_TOKEN_TILE,
+            (width + KIPP_METAL_FA_PANEL_POS_TILE - 1u) /
+                KIPP_METAL_FA_PANEL_POS_TILE,
+            heads, KIPP_METAL_GROUP_THREADS,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:workspace.faKeyPanel offset:0 atIndex:0];
+              [encoder setBuffer:query offset:headStateOffset atIndex:1];
+              [encoder setBuffer:workspace.faScores offset:0 atIndex:2];
+              [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            });
+        metal_enc_groups_3d(
+            target, metal_pipeline(model, @"kipp_fa_panel_softmax"),
+            tokenCount, heads, 1, 32,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:workspace.faScores offset:0 atIndex:0];
+              [encoder setBuffer:workspace.faProbs offset:0 atIndex:1];
+              [encoder setBuffer:workspace.faMaxima offset:0 atIndex:2];
+              [encoder setBuffer:workspace.faDenominators
+                          offset:0
+                         atIndex:3];
+              [encoder setBuffer:workspace.faCorrections
+                          offset:0
+                         atIndex:4];
+              [encoder setBytes:&params length:sizeof(params) atIndex:5];
+            });
+        metal_enc_groups_3d(
+            target, metal_pipeline(model, @"kipp_fa_panel_pv"),
+            (tokenCount + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
+                KIPP_METAL_FA_PANEL_TOKEN_TILE,
+            KIPP_ATTENTION_HEAD_DIM / KIPP_METAL_FA_PANEL_POS_TILE, heads,
+            KIPP_METAL_GROUP_THREADS,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:workspace.faValuePanel offset:0 atIndex:0];
+              [encoder setBuffer:workspace.faProbs offset:0 atIndex:1];
+              [encoder setBuffer:workspace.faOutPanel offset:0 atIndex:2];
+              [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            });
+        metal_enc_threads(
+            target, metal_pipeline(model, @"kipp_fa_panel_accumulate"),
+            (NSUInteger)heads * KIPP_ATTENTION_HEAD_DIM, tokenCount,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:workspace.faOutPanel offset:0 atIndex:0];
+              [encoder setBuffer:output offset:headStateOffset atIndex:1];
+              [encoder setBuffer:workspace.faCorrections
+                          offset:0
+                         atIndex:2];
+              [encoder setBuffer:workspace.faDenominators
+                          offset:0
+                         atIndex:3];
+              [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            });
+    }
+}
+
+/*
  * Attention for one part. Batched prefill rounds take the simdgroup-matrix
  * kernel (one 8-query tile per threadgroup); decode and speculative-verify
  * rounds keep the split-K streaming kernel, whose per-token reduction order
@@ -756,6 +931,15 @@ static void metal_encode_gqa(id<MTLComputeCommandEncoder> target,
           [encoder setBuffer:model.gqaPartials offset:0 atIndex:6];
         };
     if (useMatrixAttention) {
+        /* Panel-flash on the tensor units where they exist; the simdgroup
+         * kernel below stays the path for every other device and for
+         * KIPP_METAL_TENSOR_DISABLE, so its fingerprints stay frozen. */
+        if (model.tensorKernelAvailable) {
+            metal_encode_gqa_panels(target, model, kvSession, query, output,
+                                    headStateOffset, layer, startPosition,
+                                    tokenCount);
+            return;
+        }
         metal_enc_groups(
             target, metal_pipeline(model, @"kipp_flash_gqa_prefill"),
             model.config.attention_head_count,
@@ -1229,7 +1413,7 @@ static int metal_verify_mm_geometry(
         return 0;
     }
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    id<MTLBuffer> values = metal_new_shared_buffer(device, 7 * sizeof(uint32_t));
+    id<MTLBuffer> values = metal_new_shared_buffer(device, 8 * sizeof(uint32_t));
     if (queue == nil || values == nil) {
         return metal_fail(error, KIPP_ERROR_MEMORY,
                           "unable to allocate the matmul geometry probe");
@@ -1268,6 +1452,13 @@ static int metal_verify_mm_geometry(
             "rows per threadgroup, host expects %u and %u",
             shader[5], shader[6], KIPP_METAL_MM_TENSOR_TOKEN_TILE,
             KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP);
+    }
+    if (tensorKernel && shader[7] != KIPP_METAL_FA_PANEL) {
+        return metal_fail(
+            error, KIPP_ERROR_UNSUPPORTED,
+            "attention panel geometry drifted: shader reports %u positions "
+            "per panel, host expects %u",
+            shader[7], KIPP_METAL_FA_PANEL);
     }
     return 0;
 }
@@ -1443,6 +1634,11 @@ static int metal_compile_pipelines(
     }
     if (tensorKernel) {
         tiles[@"kipp_matmul_bf16_tensor"] = @0;
+        tiles[@"kipp_fa_panel_gather"] = @0;
+        tiles[@"kipp_fa_panel_qk"] = @0;
+        tiles[@"kipp_fa_panel_softmax"] = @0;
+        tiles[@"kipp_fa_panel_pv"] = @0;
+        tiles[@"kipp_fa_panel_accumulate"] = @0;
     }
     NSMutableDictionary *pipelines =
         [NSMutableDictionary dictionaryWithCapacity:tiles.count];
@@ -1590,10 +1786,35 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
         uint64_t perTokenPartials =
             (uint64_t)view->config.attention_head_count *
             KIPP_METAL_KSPLIT_MAX * KIPP_METAL_KSPLIT_STRIDE * sizeof(float);
+        /* Panel-flash attention scratch scales with the round width too:
+         * per token, one KIPP_METAL_FA_PANEL-wide float score row, a bf16
+         * probability row, a head-dim output row, and three softmax state
+         * values per head; the gathered K/V panels are round-independent.
+         * It gets its own ceiling rather than eating the activation budget:
+         * folding it into the 192 MB base would halve the round on the 4B
+         * geometry, re-starving the K/V projections whose occupancy the wide
+         * round exists to feed. */
+        uint64_t perTokenPanels = 0;
+        uint64_t fixedPanels = 0;
+        uint64_t panelBudget = UINT64_MAX;
+        if (caps.tensor && !alwaysStreams) {
+            perTokenPanels =
+                (uint64_t)view->config.attention_head_count *
+                (KIPP_METAL_FA_PANEL * (sizeof(float) + sizeof(uint16_t)) +
+                 KIPP_ATTENTION_HEAD_DIM * sizeof(float) +
+                 3u * sizeof(float));
+            fixedPanels = 2ull * KIPP_ATTENTION_HEAD_COUNT_KV *
+                          KIPP_METAL_FA_PANEL * KIPP_ATTENTION_HEAD_DIM *
+                          sizeof(uint16_t);
+            panelBudget = KIPP_METAL_FA_PANEL_BUDGET_BYTES;
+        }
         uint64_t budget = KIPP_METAL_WORKSPACE_BUDGET_BYTES;
         uint64_t deviceBudget = (uint64_t)device.recommendedMaxWorkingSetSize / 32u;
         if (deviceBudget != 0 && deviceBudget < budget) {
             budget = deviceBudget;
+        }
+        if (deviceBudget != 0 && deviceBudget < panelBudget) {
+            panelBudget = deviceBudget;
         }
         uint32_t prefillTokens = KIPP_METAL_PREFILL_TOKENS;
         while (prefillTokens > KIPP_METAL_PREFILL_TOKENS_MIN) {
@@ -1601,7 +1822,9 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
                 alwaysStreams ? prefillTokens : KIPP_METAL_PREFILL_TOKENS_MIN;
             if ((uint64_t)prefillTokens * perToken +
                     partialTokens * perTokenPartials <=
-                budget) {
+                    budget &&
+                (uint64_t)prefillTokens * perTokenPanels + fixedPanels <=
+                    panelBudget) {
                 break;
             }
             prefillTokens /= 2u;
@@ -2872,6 +3095,247 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                     "matrix prefill attention diverges from the streaming "
                     "kernel over %d tokens (nmse=%g)",
                     FA_TOKENS, nmse);
+            }
+        }
+
+        /*
+         * Panel-flash attention against the streaming kernel. The query tile
+         * starts deep enough into the cache that the visible KV range spans
+         * two panels, so the cross-panel online-rescale and accumulate path
+         * runs, not just the single-panel store; the width of the second
+         * panel is deliberately ragged (not a multiple of 32) so the padded
+         * K-loop iterations are covered too. The block table is a real
+         * permutation, as above. The streaming side pins ksplit_cap to 1 so
+         * it needs no partial-merge pass.
+         */
+        if (pipelines[@"kipp_fa_panel_qk"] != nil) {
+            enum {
+                PF_TOKENS = 21,
+                PF_START = 1500,
+                PF_CAPACITY = 1536,
+                PF_BLOCK_TOKENS = 32
+            };
+            const uint32_t kvLength = PF_START + PF_TOKENS;
+            const size_t kvValues = (size_t)PF_CAPACITY *
+                                    KIPP_ATTENTION_HEAD_COUNT_KV *
+                                    KIPP_ATTENTION_HEAD_DIM;
+            const size_t queryValues = (size_t)PF_TOKENS * KIPP_TEST_Q_HEADS *
+                                       KIPP_ATTENTION_HEAD_DIM;
+            const size_t panelValues = (size_t)KIPP_ATTENTION_HEAD_COUNT_KV *
+                                       KIPP_METAL_FA_PANEL *
+                                       KIPP_ATTENTION_HEAD_DIM;
+            const size_t scoreValues = (size_t)KIPP_TEST_Q_HEADS * PF_TOKENS *
+                                       KIPP_METAL_FA_PANEL;
+            const size_t stateValues = (size_t)KIPP_TEST_Q_HEADS * PF_TOKENS;
+            id<MTLBuffer> keyCache =
+                metal_new_shared_buffer(device, kvValues * sizeof(uint16_t));
+            id<MTLBuffer> valueCache =
+                metal_new_shared_buffer(device, kvValues * sizeof(uint16_t));
+            id<MTLBuffer> queryBuffer =
+                metal_new_shared_buffer(device, queryValues * sizeof(float));
+            id<MTLBuffer> panelOut =
+                metal_new_shared_buffer(device, queryValues * sizeof(float));
+            id<MTLBuffer> streamOut =
+                metal_new_shared_buffer(device, queryValues * sizeof(float));
+            id<MTLBuffer> partials = metal_new_shared_buffer(
+                device, (size_t)KIPP_TEST_Q_HEADS * KIPP_METAL_KSPLIT_MAX *
+                            PF_TOKENS * KIPP_METAL_KSPLIT_STRIDE *
+                            sizeof(float));
+            id<MTLBuffer> blockTable = metal_new_shared_buffer(
+                device, (PF_CAPACITY / PF_BLOCK_TOKENS) * sizeof(uint32_t));
+            id<MTLBuffer> keyPanel = metal_new_shared_buffer(
+                device, panelValues * sizeof(uint16_t));
+            id<MTLBuffer> valuePanel = metal_new_shared_buffer(
+                device, panelValues * sizeof(uint16_t));
+            id<MTLBuffer> scores =
+                metal_new_shared_buffer(device, scoreValues * sizeof(float));
+            id<MTLBuffer> probs = metal_new_shared_buffer(
+                device, scoreValues * sizeof(uint16_t));
+            id<MTLBuffer> outPanel = metal_new_shared_buffer(
+                device, (size_t)KIPP_TEST_Q_HEADS * PF_TOKENS *
+                            KIPP_ATTENTION_HEAD_DIM * sizeof(float));
+            id<MTLBuffer> maxima =
+                metal_new_shared_buffer(device, stateValues * sizeof(float));
+            id<MTLBuffer> denominators =
+                metal_new_shared_buffer(device, stateValues * sizeof(float));
+            id<MTLBuffer> corrections =
+                metal_new_shared_buffer(device, stateValues * sizeof(float));
+            if (keyCache == nil || valueCache == nil || queryBuffer == nil ||
+                panelOut == nil || streamOut == nil || partials == nil ||
+                blockTable == nil || keyPanel == nil || valuePanel == nil ||
+                scores == nil || probs == nil || outPanel == nil ||
+                maxima == nil || denominators == nil || corrections == nil) {
+                return metal_fail(error, KIPP_ERROR_MEMORY,
+                                  "unable to allocate panel-attention test "
+                                  "buffers");
+            }
+            uint32_t blockCount = PF_CAPACITY / PF_BLOCK_TOKENS;
+            for (uint32_t block = 0; block < blockCount; ++block) {
+                ((uint32_t *)blockTable.contents)[block] =
+                    blockCount - 1u - block;
+            }
+            /* Values carry a DC component on purpose. Attention output is a
+             * probability-weighted average of values; over 1,500 zero-mean
+             * positions the average cancels toward |v|/sqrt(N) while the
+             * bf16 probability rounding both matrix-class kernels share
+             * stays absolute, so a zero-mean fill amplifies the
+             * representational floor into the 1e-3 range and the comparison
+             * measures cancellation, not correctness (a CPU simulation of
+             * the exact rounding class reproduces 8e-4 on zero-mean data).
+             * With the offset, outputs sit near 0.5 and the floor drops
+             * back to ~1e-8, far under the fault-detection bar. */
+            uint16_t *keyValues = keyCache.contents;
+            uint16_t *valueValues = valueCache.contents;
+            for (size_t index = 0; index < kvValues; ++index) {
+                keyValues[index] =
+                    metal_test_float_to_bf16(sinf((float)index * 0.031f));
+                valueValues[index] = metal_test_float_to_bf16(
+                    0.5f * cosf((float)index * 0.017f) + 0.5f);
+            }
+            float *queryValuesHost = queryBuffer.contents;
+            for (size_t index = 0; index < queryValues; ++index) {
+                queryValuesHost[index] = sinf((float)index * 0.011f) * 0.5f;
+            }
+            /* Streaming reference over the same cache. */
+            metal_kv_params streamParams = {0, PF_START, PF_TOKENS,
+                                            PF_CAPACITY, 1};
+            id<MTLCommandBuffer> streamCommand = [queue commandBuffer];
+            metal_enc_groups_3d_command(
+                streamCommand, pipelines[@"kipp_flash_gqa"],
+                KIPP_TEST_Q_HEADS, 1, PF_TOKENS, KIPP_METAL_GQA_THREADS,
+                ^(id<MTLComputeCommandEncoder> encoder) {
+                  [encoder setBuffer:queryBuffer offset:0 atIndex:0];
+                  [encoder setBuffer:keyCache offset:0 atIndex:1];
+                  [encoder setBuffer:valueCache offset:0 atIndex:2];
+                  [encoder setBuffer:streamOut offset:0 atIndex:3];
+                  [encoder setBytes:&streamParams
+                             length:sizeof(streamParams)
+                            atIndex:4];
+                  [encoder setBuffer:blockTable offset:0 atIndex:5];
+                  [encoder setBuffer:partials offset:0 atIndex:6];
+                });
+            if (metal_commit_and_wait(streamCommand, error) != 0) {
+                return -1;
+            }
+            /* Panel sequence, mirroring metal_encode_gqa_panels' geometry on
+             * one serial encoder. */
+            uint32_t panelCount =
+                (kvLength + KIPP_METAL_FA_PANEL - 1u) / KIPP_METAL_FA_PANEL;
+            id<MTLCommandBuffer> panelCommand = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> panelEncoder =
+                [panelCommand computeCommandEncoder];
+            for (uint32_t panel = 0; panel < panelCount; ++panel) {
+                uint32_t base = panel * KIPP_METAL_FA_PANEL;
+                uint32_t width = MIN(KIPP_METAL_FA_PANEL, kvLength - base);
+                metal_fa_panel_params panelParams = {
+                    0,
+                    PF_START,
+                    PF_TOKENS,
+                    PF_CAPACITY,
+                    base,
+                    width,
+                    (width + 31u) & ~31u,
+                    panel == 0u ? 1u : 0u,
+                    panel + 1u == panelCount ? 1u : 0u,
+                };
+                metal_enc_threads(
+                    panelEncoder, pipelines[@"kipp_fa_panel_gather"],
+                    KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
+                    panelParams.panel_width32,
+                    ^(id<MTLComputeCommandEncoder> encoder) {
+                      [encoder setBuffer:keyCache offset:0 atIndex:0];
+                      [encoder setBuffer:valueCache offset:0 atIndex:1];
+                      [encoder setBuffer:keyPanel offset:0 atIndex:2];
+                      [encoder setBuffer:valuePanel offset:0 atIndex:3];
+                      [encoder setBytes:&panelParams
+                                 length:sizeof(panelParams)
+                                atIndex:4];
+                      [encoder setBuffer:blockTable offset:0 atIndex:5];
+                    });
+                metal_enc_groups_3d(
+                    panelEncoder, pipelines[@"kipp_fa_panel_qk"],
+                    (PF_TOKENS + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
+                        KIPP_METAL_FA_PANEL_TOKEN_TILE,
+                    (width + KIPP_METAL_FA_PANEL_POS_TILE - 1u) /
+                        KIPP_METAL_FA_PANEL_POS_TILE,
+                    KIPP_TEST_Q_HEADS, KIPP_METAL_GROUP_THREADS,
+                    ^(id<MTLComputeCommandEncoder> encoder) {
+                      [encoder setBuffer:keyPanel offset:0 atIndex:0];
+                      [encoder setBuffer:queryBuffer offset:0 atIndex:1];
+                      [encoder setBuffer:scores offset:0 atIndex:2];
+                      [encoder setBytes:&panelParams
+                                 length:sizeof(panelParams)
+                                atIndex:3];
+                    });
+                metal_enc_groups_3d(
+                    panelEncoder, pipelines[@"kipp_fa_panel_softmax"],
+                    PF_TOKENS, KIPP_TEST_Q_HEADS, 1, 32,
+                    ^(id<MTLComputeCommandEncoder> encoder) {
+                      [encoder setBuffer:scores offset:0 atIndex:0];
+                      [encoder setBuffer:probs offset:0 atIndex:1];
+                      [encoder setBuffer:maxima offset:0 atIndex:2];
+                      [encoder setBuffer:denominators offset:0 atIndex:3];
+                      [encoder setBuffer:corrections offset:0 atIndex:4];
+                      [encoder setBytes:&panelParams
+                                 length:sizeof(panelParams)
+                                atIndex:5];
+                    });
+                metal_enc_groups_3d(
+                    panelEncoder, pipelines[@"kipp_fa_panel_pv"],
+                    (PF_TOKENS + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
+                        KIPP_METAL_FA_PANEL_TOKEN_TILE,
+                    KIPP_ATTENTION_HEAD_DIM / KIPP_METAL_FA_PANEL_POS_TILE,
+                    KIPP_TEST_Q_HEADS, KIPP_METAL_GROUP_THREADS,
+                    ^(id<MTLComputeCommandEncoder> encoder) {
+                      [encoder setBuffer:valuePanel offset:0 atIndex:0];
+                      [encoder setBuffer:probs offset:0 atIndex:1];
+                      [encoder setBuffer:outPanel offset:0 atIndex:2];
+                      [encoder setBytes:&panelParams
+                                 length:sizeof(panelParams)
+                                atIndex:3];
+                    });
+                metal_enc_threads(
+                    panelEncoder,
+                    pipelines[@"kipp_fa_panel_accumulate"],
+                    (NSUInteger)KIPP_TEST_Q_HEADS * KIPP_ATTENTION_HEAD_DIM,
+                    PF_TOKENS, ^(id<MTLComputeCommandEncoder> encoder) {
+                      [encoder setBuffer:outPanel offset:0 atIndex:0];
+                      [encoder setBuffer:panelOut offset:0 atIndex:1];
+                      [encoder setBuffer:corrections offset:0 atIndex:2];
+                      [encoder setBuffer:denominators offset:0 atIndex:3];
+                      [encoder setBytes:&panelParams
+                                 length:sizeof(panelParams)
+                                atIndex:4];
+                    });
+            }
+            [panelEncoder endEncoding];
+            if (metal_commit_and_wait(panelCommand, error) != 0) {
+                return -1;
+            }
+            const float *panelValuesOut = panelOut.contents;
+            const float *streamValues = streamOut.contents;
+            double numerator = 0.0;
+            double denominator = 0.0;
+            for (size_t index = 0; index < queryValues; ++index) {
+                double difference = (double)panelValuesOut[index] -
+                                    (double)streamValues[index];
+                numerator += difference * difference;
+                denominator +=
+                    (double)streamValues[index] * (double)streamValues[index];
+            }
+            double nmse =
+                denominator > 0.0 ? numerator / denominator : numerator;
+            /* Same bar as the simdgroup matrix kernel above: the streaming
+             * side reads FP32 queries while both panel GEMMs consume bf16
+             * K/V and bf16 probabilities, so ~2e-6 is the representational
+             * floor and 1e-5 leaves room without admitting a masking or
+             * rescale fault. */
+            if (!(nmse <= 1.0e-5)) {
+                return metal_fail(
+                    error, KIPP_ERROR_INTERNAL,
+                    "panel-flash attention diverges from the streaming "
+                    "kernel over %d tokens at position %d (nmse=%g)",
+                    PF_TOKENS, PF_START, nmse);
             }
         }
     }

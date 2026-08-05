@@ -794,6 +794,13 @@ constant uint KIPP_MM_QUANT_TOKEN_TILE =
 constant uint KIPP_MM_TENSOR_ROWS = 64;
 constant uint KIPP_MM_TENSOR_TOKEN_TILE = 128;
 constant uint KIPP_MM_TENSOR_K_CHUNK = 32;
+/* Panel-flash attention (tensor path): KV positions gathered per panel, and
+ * the matmul2d tile it is carved into. The panel width is a probe-measured
+ * sweet spot: both attention GEMMs run 20+ TFLOP/s at 1,024 positions, and
+ * the float score panel stays inside the workspace budget. */
+constant uint KIPP_FA_PANEL = 1024;
+constant uint KIPP_FA_PANEL_TOKEN_TILE = 128;
+constant uint KIPP_FA_PANEL_POS_TILE = 64;
 #endif
 
 /*
@@ -821,9 +828,11 @@ kernel void kipp_mm_geometry(device uint *values [[buffer(0)]],
 #if defined(KIPP_ENABLE_TENSOR_OPS)
     values[5] = KIPP_MM_TENSOR_TOKEN_TILE;
     values[6] = KIPP_MM_TENSOR_ROWS;
+    values[7] = KIPP_FA_PANEL;
 #else
     values[5] = 0;
     values[6] = 0;
+    values[7] = 0;
 #endif
 }
 
@@ -1492,6 +1501,254 @@ kernel void kipp_matmul_bf16_tensor(
     }
     auto outputSlice = tD.slice(row_base, token_base);
     accumulator.store(outputSlice);
+}
+
+/*
+ * Panel-flash attention: batched-prefill GQA on the tensor pipeline.
+ *
+ * The streaming and simdgroup FA kernels walk the paged KV cache in 32-position
+ * tiles; on M5-class devices that leaves the accelerators ~6x idle (the
+ * simdgroup kernel measures ~3 TFLOP/s effective, matmul2d at panel shapes
+ * 20+). This path instead gathers each KV panel (KIPP_FA_PANEL positions,
+ * block table honored, so placement invariance is preserved) into contiguous
+ * scratch, runs Q K^T as one matmul2d per head, materializes the softmax at
+ * panel granularity with the same online-rescale expressions the streaming
+ * kernel uses, and accumulates P V through a second matmul2d. Probabilities
+ * are bf16 exactly as in the streaming kernel; queries stay FP32 (the same
+ * choice the tensor projection kernel made). Five kernels per panel, ordered
+ * by the round's serial encoder:
+ *   gather -> qk -> softmax -> pv -> accumulate.
+ *
+ * Ragged edges: matmul2d clips M/N by tensor extents, but not the K loop, so
+ * the panel width is padded to a multiple of 32 (panel_width32) and the pad
+ * region is zero: the gather writes zero K/V there and the softmax writes
+ * zero probabilities, so padded K-iterations contribute exact zeros.
+ */
+struct FaPanelParams {
+    uint layer;
+    uint start_position; /* absolute position of the part's first query */
+    uint token_count;    /* queries in this part */
+    uint capacity;       /* KV slab positions (kipp_kv_slot layer stride) */
+    uint panel_base;     /* first KV position this panel covers */
+    uint panel_width;    /* true positions in the panel, <= KIPP_FA_PANEL */
+    uint panel_width32;  /* panel_width rounded up to a multiple of 32 */
+    uint first_panel;    /* 1: initialize the running softmax state */
+    uint last_panel;     /* 1: divide by the softmax denominator on store */
+};
+
+/* One thread per (kv_head x dim, position): x = kv_head * 128 + dim over
+ * KIPP_KV_VALUES_PER_TOKEN, y = position within the panel. Reads are
+ * coalesced across x; K lands [head][position][dim] for Q K^T and V lands
+ * transposed [head][dim][position] for P V, which is the layout matmul2d
+ * wants on each side. Padded positions store zero without reading. */
+kernel void kipp_fa_panel_gather(
+        device const ushort *key_cache [[buffer(0)]],
+        device const ushort *value_cache [[buffer(1)]],
+        device bfloat *key_panel [[buffer(2)]],
+        device bfloat *value_panel [[buffer(3)]],
+        constant FaPanelParams &params [[buffer(4)]],
+        device const uint *block_table [[buffer(5)]],
+        uint2 tid [[thread_position_in_grid]]) {
+    uint pos = tid.y;
+    uint kv_head = tid.x / KIPP_HEAD_DIM;
+    uint dim = tid.x % KIPP_HEAD_DIM;
+    bfloat key_value = bfloat(0.0f);
+    bfloat value_value = bfloat(0.0f);
+    if (pos < params.panel_width) {
+        /* kipp_kv_slot, inlined: FaPanelParams carries the same layer and
+         * capacity fields but is not a KvParams. */
+        uint position = params.panel_base + pos;
+        uint physical =
+            block_table[position >> 5u] * 32u + (position & 31u);
+        ulong slot = ulong(params.layer) * params.capacity + ulong(physical);
+        ulong source = slot * KIPP_KV_VALUES_PER_TOKEN + tid.x;
+        key_value = ((device const bfloat *)key_cache)[source];
+        value_value = ((device const bfloat *)value_cache)[source];
+    }
+    key_panel[(ulong(kv_head) * KIPP_FA_PANEL + pos) * KIPP_HEAD_DIM + dim] =
+        key_value;
+    value_panel[(ulong(kv_head) * KIPP_HEAD_DIM + dim) * KIPP_FA_PANEL +
+                pos] = value_value;
+}
+
+/* Scores = Q K^T for one head's query tile against one panel: the raw dot
+ * products land in the float score panel; the softmax kernel applies the
+ * 1/sqrt(head_dim) scale exactly where the streaming kernel does. */
+kernel void kipp_fa_panel_qk(
+        device bfloat *key_panel [[buffer(0)]],
+        device float *query [[buffer(1)]],
+        device float *scores [[buffer(2)]],
+        constant FaPanelParams &params [[buffer(3)]],
+        uint3 group_id [[threadgroup_position_in_grid]]) {
+    const int tokens = (int)params.token_count;
+    const int width = (int)params.panel_width;
+    const uint head = group_id.z;
+    const uint kv_head = head / (KIPP_Q_HEADS / KIPP_KV_HEADS);
+    const int token_base = (int)(group_id.x * KIPP_FA_PANEL_TOKEN_TILE);
+    const int pos_base = (int)(group_id.y * KIPP_FA_PANEL_POS_TILE);
+    if (token_base >= tokens || pos_base >= width) {
+        return;
+    }
+    device bfloat *keys =
+        key_panel + ulong(kv_head) * KIPP_FA_PANEL * KIPP_HEAD_DIM;
+    device float *head_query = query + head * KIPP_HEAD_DIM;
+    device float *head_scores =
+        scores + ulong(head) * (ulong)tokens * KIPP_FA_PANEL;
+    auto tA = tensor(keys, dextents<int32_t, 2>((int)KIPP_HEAD_DIM, width),
+                     array<int, 2>({1, (int)KIPP_HEAD_DIM}));
+    auto tB = tensor(head_query, dextents<int32_t, 2>((int)KIPP_HEAD_DIM,
+                                                      tokens),
+                     array<int, 2>({1, (int)(KIPP_Q_HEADS * KIPP_HEAD_DIM)}));
+    auto tD = tensor(head_scores, dextents<int32_t, 2>(width, tokens),
+                     array<int, 2>({1, (int)KIPP_FA_PANEL}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            (int)KIPP_FA_PANEL_TOKEN_TILE, (int)KIPP_FA_PANEL_POS_TILE,
+            (int)KIPP_MM_TENSOR_K_CHUNK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto accumulator =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA),
+                                              float>();
+    for (int chunk = 0; chunk < (int)KIPP_HEAD_DIM;
+         chunk += (int)KIPP_MM_TENSOR_K_CHUNK) {
+        auto keySlice = tA.slice(chunk, pos_base);
+        auto querySlice = tB.slice(chunk, token_base);
+        mm.run(querySlice, keySlice, accumulator);
+    }
+    auto outputSlice = tD.slice(pos_base, token_base);
+    accumulator.store(outputSlice);
+}
+
+/* Panel-granular online softmax: one simdgroup per (query row, head). The
+ * merge expressions (merged / correction / denominator update) are the
+ * streaming kernel's own, so the numerics class stays familiar; the
+ * probabilities are bf16 exactly as there. Masked and padded columns write
+ * zero, which the P V matmul turns into exact zero contributions. */
+kernel void kipp_fa_panel_softmax(
+        device float *scores [[buffer(0)]],
+        device bfloat *probs [[buffer(1)]],
+        device float *maxima [[buffer(2)]],
+        device float *denominators [[buffer(3)]],
+        device float *corrections [[buffer(4)]],
+        constant FaPanelParams &params [[buffer(5)]],
+        uint2 group_id [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    uint row = group_id.x;
+    uint head = group_id.y;
+    uint query_position = params.start_position + row;
+    const float scale = rsqrt(float(KIPP_HEAD_DIM));
+    ulong panel_row = ulong(head) * params.token_count + row;
+    device float *row_scores = scores + panel_row * KIPP_FA_PANEL;
+    device bfloat *row_probs = probs + panel_row * KIPP_FA_PANEL;
+    float row_max = KIPP_FLT_LOWEST;
+    for (uint column = lane; column < params.panel_width; column += 32u) {
+        if (params.panel_base + column <= query_position) {
+            row_max = max(row_max, row_scores[column] * scale);
+        }
+    }
+    row_max = simd_max(row_max);
+    float previous =
+        params.first_panel != 0u ? KIPP_FLT_LOWEST : maxima[panel_row];
+    float merged = max(previous, row_max);
+    float correction = merged == previous ? 1.0f : exp(previous - merged);
+    float sum = 0.0f;
+    for (uint column = lane; column < params.panel_width32; column += 32u) {
+        float weight = 0.0f;
+        if (column < params.panel_width &&
+            params.panel_base + column <= query_position) {
+            weight = exp(row_scores[column] * scale - merged);
+        }
+        row_probs[column] = bfloat(weight);
+        sum += weight;
+    }
+    sum = simd_sum(sum);
+    if (lane == 0u) {
+        float base =
+            params.first_panel != 0u ? 0.0f : denominators[panel_row];
+        maxima[panel_row] = merged;
+        denominators[panel_row] = base * correction + sum;
+        corrections[panel_row] = correction;
+    }
+}
+
+/* O_panel = P V for one head's query tile: bf16 probabilities against the
+ * transposed value panel, K-loop over the padded panel width. */
+kernel void kipp_fa_panel_pv(
+        device bfloat *value_panel [[buffer(0)]],
+        device bfloat *probs [[buffer(1)]],
+        device float *out_panel [[buffer(2)]],
+        constant FaPanelParams &params [[buffer(3)]],
+        uint3 group_id [[threadgroup_position_in_grid]]) {
+    const int tokens = (int)params.token_count;
+    const int width32 = (int)params.panel_width32;
+    const uint head = group_id.z;
+    const uint kv_head = head / (KIPP_Q_HEADS / KIPP_KV_HEADS);
+    const int token_base = (int)(group_id.x * KIPP_FA_PANEL_TOKEN_TILE);
+    const int dim_base = (int)(group_id.y * KIPP_FA_PANEL_POS_TILE);
+    if (token_base >= tokens) {
+        return;
+    }
+    device bfloat *values =
+        value_panel + ulong(kv_head) * KIPP_HEAD_DIM * KIPP_FA_PANEL;
+    device bfloat *head_probs =
+        probs + ulong(head) * (ulong)tokens * KIPP_FA_PANEL;
+    device float *head_out =
+        out_panel + ulong(head) * (ulong)tokens * KIPP_HEAD_DIM;
+    auto tA = tensor(values, dextents<int32_t, 2>(width32, (int)KIPP_HEAD_DIM),
+                     array<int, 2>({1, (int)KIPP_FA_PANEL}));
+    auto tB = tensor(head_probs, dextents<int32_t, 2>(width32, tokens),
+                     array<int, 2>({1, (int)KIPP_FA_PANEL}));
+    auto tD = tensor(head_out, dextents<int32_t, 2>((int)KIPP_HEAD_DIM,
+                                                    tokens),
+                     array<int, 2>({1, (int)KIPP_HEAD_DIM}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            (int)KIPP_FA_PANEL_TOKEN_TILE, (int)KIPP_FA_PANEL_POS_TILE,
+            (int)KIPP_MM_TENSOR_K_CHUNK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto accumulator =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA),
+                                              float>();
+    for (int chunk = 0; chunk < width32;
+         chunk += (int)KIPP_MM_TENSOR_K_CHUNK) {
+        auto valueSlice = tA.slice(chunk, dim_base);
+        auto probSlice = tB.slice(chunk, token_base);
+        mm.run(probSlice, valueSlice, accumulator);
+    }
+    auto outputSlice = tD.slice(dim_base, token_base);
+    accumulator.store(outputSlice);
+}
+
+/* Fold one panel's P V into the running attention output: rescale the
+ * running value by this panel's correction, add the panel, and on the last
+ * panel divide by the softmax denominator. One thread per output element;
+ * the first panel overwrites, so the workspace needs no zero pass. */
+kernel void kipp_fa_panel_accumulate(
+        device const float *out_panel [[buffer(0)]],
+        device float *attention [[buffer(1)]],
+        device const float *corrections [[buffer(2)]],
+        device const float *denominators [[buffer(3)]],
+        constant FaPanelParams &params [[buffer(4)]],
+        uint2 tid [[thread_position_in_grid]]) {
+    uint token = tid.y;
+    uint head = tid.x / KIPP_HEAD_DIM;
+    uint dim = tid.x % KIPP_HEAD_DIM;
+    ulong panel_row = ulong(head) * params.token_count + token;
+    float value =
+        out_panel[(ulong(head) * params.token_count + token) *
+                      KIPP_HEAD_DIM + dim];
+    ulong index =
+        ulong(token) * KIPP_Q_HEADS * KIPP_HEAD_DIM + tid.x;
+    float accumulated =
+        params.first_panel != 0u
+            ? value
+            : attention[index] * corrections[panel_row] + value;
+    if (params.last_panel != 0u) {
+        accumulated /= denominators[panel_row];
+    }
+    attention[index] = accumulated;
 }
 
 kernel void kipp_tensor_probe_bf16(device bfloat *a [[buffer(0)]],
