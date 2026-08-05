@@ -226,6 +226,24 @@ def run_once(
                 "KIPP_BENCH_ALLOW_BATTERY=1 to override (numbers will not "
                 "be steady-state)."
             )
+        # Same failure mode, third disguise: an underpowered USB-C adapter.
+        # On a 65 W charger with a low battery, the SoC silently power-limits
+        # the GPU -- no thermal warning, no Low Power Mode flag, and every
+        # reading lands uniformly ~40% low (observed 2026-08-05: committed
+        # 3,679 tok/s measuring 2,319 with all other guards green). The M5
+        # Max sustains full GPU clocks only on its 140 W class adapter.
+        adapter = subprocess.run(
+            ["pmset", "-g", "ac"], capture_output=True, text=True
+        ).stdout
+        watt_match = re.search(r"Wattage\s*=\s*(\d+)W", adapter)
+        if watt_match is not None and int(watt_match.group(1)) < 90:
+            raise RuntimeError(
+                f"refusing to benchmark: the connected power adapter is "
+                f"only {watt_match.group(1)} W and the GPU will be silently "
+                "power-limited. Connect the 140 W adapter, or set "
+                "KIPP_BENCH_ALLOW_BATTERY=1 to override (numbers will not "
+                "be steady-state)."
+            )
     # Tripwire: the Metal bridge falls back to vector kernels when the MMA
     # pipeline fails to compile, printing this warning. A silent fallback
     # once contaminated a whole benchmark campaign (2026-07-22, a reserved
