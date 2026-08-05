@@ -1315,6 +1315,7 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
          * owns query row r, each lane owns eight score columns, and quad
          * shuffles reduce the row maximum and exp-sum, so no lane idles
          * and the serial exp work per lane drops from 32 columns to 8. */
+        bool identity_rescale;
         {
             uint row = lane / 4u;
             uint sub = lane % 4u;
@@ -1336,6 +1337,9 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
             float merged = max(previous, row_max);
             float correction =
                 merged == previous ? 1.0f : exp(previous - merged);
+            /* Each quad holds its row's correction on all four lanes, so one
+             * vote across the simdgroup covers all eight rows. */
+            identity_rescale = simd_all(correction == 1.0f);
             float sum = 0.0f;
             for (uint index = 0; index < KIPP_FA_KV_TILE / 4u; ++index) {
                 uint column = sub * (KIPP_FA_KV_TILE / 4u) + index;
@@ -1359,16 +1363,24 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         /* Rescale the running output by diag(correction), then accumulate
-         * P V for this tile. */
-        simdgroup_float8x8 diag;
-        simdgroup_load(diag, rescale, 8);
+         * P V for this tile. When no row's maximum moved, every correction
+         * is exactly 1.0 and the diagonal is an exact identity (off-diagonals
+         * are 0.0), so multiplying by it is bitwise a no-op — skip the 16
+         * diagonal MMAs outright; the running maxima stabilize quickly, so
+         * this is the common case. */
         simdgroup_bfloat8x8 p_frag[KIPP_FA_KV_TILE / 8];
         for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
             simdgroup_load(p_frag[column], &probs[column * 8u],
                            KIPP_FA_SCORE_STRIDE);
         }
+        if (!identity_rescale) {
+            simdgroup_float8x8 diag;
+            simdgroup_load(diag, rescale, 8);
+            for (uint frag = 0; frag < KIPP_HEAD_DIM / 8; ++frag) {
+                simdgroup_multiply(out_acc[frag], diag, out_acc[frag]);
+            }
+        }
         for (uint frag = 0; frag < KIPP_HEAD_DIM / 8; ++frag) {
-            simdgroup_multiply(out_acc[frag], diag, out_acc[frag]);
             for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
                 simdgroup_bfloat8x8 v_frag;
                 simdgroup_load(v_frag,
