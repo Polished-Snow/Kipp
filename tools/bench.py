@@ -24,6 +24,7 @@ from _provenance import (  # noqa: E402
     engine_metadata,
     hardware_metadata,
     model_metadata,
+    require_steady_power,
 )
 
 METRIC_PATTERN = re.compile(
@@ -187,6 +188,12 @@ def run_once(
         command += ["--kv-quant", kv_quant]
     if requested_backend == "cuda" and nvidia_smi is None:
         nvidia_smi = shutil.which("nvidia-smi")
+    # Refuse before spending the run: battery, Low Power Mode, and
+    # underpowered adapters all silently power-limit the GPU (see
+    # _provenance.require_steady_power). Checking after the subprocess would
+    # still burn the measurement and, on a power state that flips mid-session,
+    # could pass a check for a run that executed while limited.
+    require_steady_power()
     _, stderr, peak_resident_bytes, peak_device_bytes = run_process(
         command, requested_backend, nvidia_smi
     )
@@ -196,54 +203,6 @@ def run_once(
             "benchmark output is missing KIPP_METRIC on stderr\n"
             f"{stderr}"
         )
-    # Tripwire: benchmarks are meaningless on battery power or in Low Power
-    # Mode -- Apple silicon GPU clocks drop 2-3x, uniformly enough to look
-    # like a plausible measurement. A session in exactly that state produced
-    # the irreproducible 2026-07-22 llama.cpp comparison this repository had
-    # to retract. Refuse to record rather than trust the operator to notice.
-    if platform.system() == "Darwin" and os.environ.get(
-        "KIPP_BENCH_ALLOW_BATTERY"
-    ) != "1":
-        power = subprocess.run(
-            ["pmset", "-g", "batt"], capture_output=True, text=True
-        ).stdout
-        mode = subprocess.run(
-            ["pmset", "-g"], capture_output=True, text=True
-        ).stdout
-        on_battery = "Battery Power" in power
-        low_power = any(
-            line.strip().startswith("powermode")
-            and line.strip().split()[-1] == "1"
-            for line in mode.splitlines()
-        )
-        if on_battery or low_power:
-            raise RuntimeError(
-                "refusing to benchmark: "
-                + ("machine is on battery power" if on_battery else "")
-                + (" and " if on_battery and low_power else "")
-                + ("Low Power Mode is enabled" if low_power else "")
-                + ". Plug in and disable Low Power Mode, or set "
-                "KIPP_BENCH_ALLOW_BATTERY=1 to override (numbers will not "
-                "be steady-state)."
-            )
-        # Same failure mode, third disguise: an underpowered USB-C adapter.
-        # On a 65 W charger with a low battery, the SoC silently power-limits
-        # the GPU -- no thermal warning, no Low Power Mode flag, and every
-        # reading lands uniformly ~40% low (observed 2026-08-05: committed
-        # 3,679 tok/s measuring 2,319 with all other guards green). The M5
-        # Max sustains full GPU clocks only on its 140 W class adapter.
-        adapter = subprocess.run(
-            ["pmset", "-g", "ac"], capture_output=True, text=True
-        ).stdout
-        watt_match = re.search(r"Wattage\s*=\s*(\d+)W", adapter)
-        if watt_match is not None and int(watt_match.group(1)) < 90:
-            raise RuntimeError(
-                f"refusing to benchmark: the connected power adapter is "
-                f"only {watt_match.group(1)} W and the GPU will be silently "
-                "power-limited. Connect the 140 W adapter, or set "
-                "KIPP_BENCH_ALLOW_BATTERY=1 to override (numbers will not "
-                "be steady-state)."
-            )
     # Tripwire: the Metal bridge falls back to vector kernels when the MMA
     # pipeline fails to compile, printing this warning. A silent fallback
     # once contaminated a whole benchmark campaign (2026-07-22, a reserved

@@ -86,6 +86,9 @@ def main():
                          "does not apply, so a single 'draft' mode is measured "
                          "into --output.")
     args = ap.parse_args()
+    # Refuse to record on battery, Low Power Mode, or an underpowered
+    # adapter -- all silently power-limit the GPU (shared with tools/bench.py).
+    _provenance.require_steady_power()
 
     if args.draft_model is not None:
         modes = ["draft"]

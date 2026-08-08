@@ -104,6 +104,9 @@ def main():
     ap.add_argument("--models", nargs="*", default=DEFAULT_MODELS)
     ap.add_argument("--output", default="bench/results/ppl-4b.json")
     args = ap.parse_args()
+    # Refuse to record on battery, Low Power Mode, or an underpowered
+    # adapter -- all silently power-limit the GPU (shared with tools/bench.py).
+    _provenance.require_steady_power()
 
     root = pathlib.Path(__file__).resolve().parents[1]
     binary = resolve(root, args.binary)

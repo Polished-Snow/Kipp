@@ -94,6 +94,9 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--output", default="bench/results/server-batch.json")
     args = ap.parse_args()
+    # Refuse to record on battery, Low Power Mode, or an underpowered
+    # adapter -- all silently power-limit the GPU (shared with tools/bench.py).
+    _provenance.require_steady_power()
 
     server = subprocess.Popen(
         [args.binary, "--backend", args.backend, "--model", args.model,

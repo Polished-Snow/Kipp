@@ -829,10 +829,18 @@ kernel void kipp_mm_geometry(device uint *values [[buffer(0)]],
     values[5] = KIPP_MM_TENSOR_TOKEN_TILE;
     values[6] = KIPP_MM_TENSOR_ROWS;
     values[7] = KIPP_FA_PANEL;
+    /* Panel-flash matmul2d tile. The host derives the qk/pv dispatch grids
+     * from its KIPP_METAL_FA_PANEL_*_TILE mirrors while the kernels offset by
+     * these shader-side constants; a one-sided edit under-covers the grid and
+     * silently drops whole score/output tiles, so pin both here too. */
+    values[8] = KIPP_FA_PANEL_TOKEN_TILE;
+    values[9] = KIPP_FA_PANEL_POS_TILE;
 #else
     values[5] = 0;
     values[6] = 0;
     values[7] = 0;
+    values[8] = 0;
+    values[9] = 0;
 #endif
 }
 
@@ -1374,9 +1382,16 @@ kipp_flash_gqa_prefill(device const float *query [[buffer(0)]],
         /* Rescale the running output by diag(correction), then accumulate
          * P V for this tile. When no row's maximum moved, every correction
          * is exactly 1.0 and the diagonal is an exact identity (off-diagonals
-         * are 0.0), so multiplying by it is bitwise a no-op — skip the 16
-         * diagonal MMAs outright; the running maxima stabilize quickly, so
-         * this is the common case. */
+         * are 0.0), so multiplying by it is a bitwise no-op for every finite
+         * out_acc — skip the 16 diagonal MMAs outright; the running maxima
+         * stabilize quickly, so this is the common case. (The skip and the
+         * multiply differ only if out_acc holds a non-finite value: the
+         * identity multiply would compute 0.0*(+/-Inf) = NaN in the
+         * off-diagonal terms, while the skip leaves Inf intact. out_acc is a
+         * bounded weighted sum of finite bf16 values with weights in (0, 1],
+         * so it cannot reach that state for any valid model — the frozen
+         * fingerprints, recorded against the pre-skip kernel, reprint
+         * unchanged.) */
         simdgroup_bfloat8x8 p_frag[KIPP_FA_KV_TILE / 8];
         for (uint column = 0; column < KIPP_FA_KV_TILE / 8; ++column) {
             simdgroup_load(p_frag[column], &probs[column * 8u],

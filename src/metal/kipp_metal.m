@@ -1413,7 +1413,8 @@ static int metal_verify_mm_geometry(
         return 0;
     }
     id<MTLCommandQueue> queue = [device newCommandQueue];
-    id<MTLBuffer> values = metal_new_shared_buffer(device, 8 * sizeof(uint32_t));
+    id<MTLBuffer> values =
+        metal_new_shared_buffer(device, 10 * sizeof(uint32_t));
     if (queue == nil || values == nil) {
         return metal_fail(error, KIPP_ERROR_MEMORY,
                           "unable to allocate the matmul geometry probe");
@@ -1453,12 +1454,17 @@ static int metal_verify_mm_geometry(
             shader[5], shader[6], KIPP_METAL_MM_TENSOR_TOKEN_TILE,
             KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP);
     }
-    if (tensorKernel && shader[7] != KIPP_METAL_FA_PANEL) {
+    if (tensorKernel &&
+        (shader[7] != KIPP_METAL_FA_PANEL ||
+         shader[8] != KIPP_METAL_FA_PANEL_TOKEN_TILE ||
+         shader[9] != KIPP_METAL_FA_PANEL_POS_TILE)) {
         return metal_fail(
             error, KIPP_ERROR_UNSUPPORTED,
             "attention panel geometry drifted: shader reports %u positions "
-            "per panel, host expects %u",
-            shader[7], KIPP_METAL_FA_PANEL);
+            "per panel and %u/%u token/position tile, host expects %u and "
+            "%u/%u",
+            shader[7], shader[8], shader[9], KIPP_METAL_FA_PANEL,
+            KIPP_METAL_FA_PANEL_TOKEN_TILE, KIPP_METAL_FA_PANEL_POS_TILE);
     }
     return 0;
 }
@@ -1809,22 +1815,26 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
             panelBudget = KIPP_METAL_FA_PANEL_BUDGET_BYTES;
         }
         uint64_t budget = KIPP_METAL_WORKSPACE_BUDGET_BYTES;
+        /* The two software ceilings (base activation + panel scratch) are
+         * independent on purpose so the panels do not shrink the round on a
+         * roomy device. The device working-set cap, though, bounds the TOTAL
+         * resident scratch -- clamping each ceiling to it separately would let
+         * base + panels reach twice the cap on a small tensor-capable device,
+         * so it is applied to the sum in the loop instead. */
         uint64_t deviceBudget = (uint64_t)device.recommendedMaxWorkingSetSize / 32u;
-        if (deviceBudget != 0 && deviceBudget < budget) {
-            budget = deviceBudget;
-        }
-        if (deviceBudget != 0 && deviceBudget < panelBudget) {
-            panelBudget = deviceBudget;
-        }
         uint32_t prefillTokens = KIPP_METAL_PREFILL_TOKENS;
         while (prefillTokens > KIPP_METAL_PREFILL_TOKENS_MIN) {
             uint64_t partialTokens =
                 alwaysStreams ? prefillTokens : KIPP_METAL_PREFILL_TOKENS_MIN;
-            if ((uint64_t)prefillTokens * perToken +
-                    partialTokens * perTokenPartials <=
-                    budget &&
-                (uint64_t)prefillTokens * perTokenPanels + fixedPanels <=
-                    panelBudget) {
+            uint64_t baseBytes = (uint64_t)prefillTokens * perToken +
+                                 partialTokens * perTokenPartials;
+            uint64_t panelBytes =
+                (uint64_t)prefillTokens * perTokenPanels + fixedPanels;
+            BOOL baseOk = baseBytes <= budget;
+            BOOL panelOk = panelBytes <= panelBudget;
+            BOOL deviceOk =
+                deviceBudget == 0 || baseBytes + panelBytes <= deviceBudget;
+            if (baseOk && panelOk && deviceOk) {
                 break;
             }
             prefillTokens /= 2u;
@@ -3109,10 +3119,18 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
          * it needs no partial-merge pass.
          */
         if (pipelines[@"kipp_fa_panel_qk"] != nil) {
+            /* PF_TOKENS exceeds KIPP_METAL_FA_PANEL_TOKEN_TILE (128) and is
+             * not a multiple of it, so the qk/pv grids dispatch two token
+             * tiles and the second (token_base=128) tile is ragged -- that
+             * exercises the token_base>0 slice arithmetic every real
+             * 512-token round uses, which a sub-128 token count never
+             * reaches. PF_START puts all queries past the first panel so the
+             * cross-panel rescale runs, and kvLength's second panel is ragged
+             * (625 positions) to cover the padded K-loop. */
             enum {
-                PF_TOKENS = 21,
+                PF_TOKENS = 149,
                 PF_START = 1500,
-                PF_CAPACITY = 1536,
+                PF_CAPACITY = 1664,
                 PF_BLOCK_TOKENS = 32
             };
             const uint32_t kvLength = PF_START + PF_TOKENS;
@@ -3666,8 +3684,13 @@ int kipp_metal_run_fa_bench(kipp_error *error) {
             queryHost[index] = sinf((float)(index % 100003u) * 0.011f) * 0.5f;
         }
         for (size_t c = 0; c < sizeof(contexts) / sizeof(contexts[0]); ++c) {
-            uint32_t tokens = contexts[c];
-            uint32_t rounds = tokens / FAB_ROUND;
+            /* Round the requested context down to whole rounds and report the
+             * count actually dispatched: a context that is not a multiple of
+             * FAB_ROUND (e.g. 6400 -> 12 rounds = 6144) would otherwise label
+             * the row with more tokens than the replay ran, exactly the
+             * benchmark-provenance error this repo's protocol exists to catch. */
+            uint32_t rounds = contexts[c] / FAB_ROUND;
+            uint32_t tokens = rounds * FAB_ROUND;
             for (int rotate = 1; rotate >= 0; --rotate) {
                 double seconds = 0.0;
                 for (int pass = 0; pass < 2; ++pass) {
@@ -3702,9 +3725,6 @@ int kipp_metal_run_fa_bench(kipp_error *error) {
                                   [encoder setBuffer:blockTable
                                               offset:0
                                              atIndex:5];
-                                  [encoder setBuffer:output
-                                              offset:0
-                                             atIndex:6];
                                 });
                         }
                     }

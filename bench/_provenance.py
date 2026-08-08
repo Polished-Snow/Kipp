@@ -11,11 +11,13 @@ the result dirty as before.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import platform
 import re
 import shutil
 import subprocess
+import sys
 
 BUILD_FLAGS = "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
 
@@ -146,6 +148,68 @@ def cuda_hardware_metadata(nvidia_smi: str) -> dict[str, object]:
         "gpu_driver": "; ".join(dict.fromkeys(driver_versions)),
         "nvcc_version": nvcc_lines[-1] if nvcc_lines else "unknown",
     }
+
+
+def require_steady_power() -> None:
+    """Refuse to benchmark in a state that silently power-limits the GPU.
+
+    Apple silicon drops GPU clocks 2-3x on battery, in Low Power Mode, or on
+    an underpowered USB-C adapter -- uniformly enough to look like a plausible
+    measurement. Three disguises of one failure produced the retracted
+    2026-07-22 llama.cpp record and the 40%-low 65 W-adapter readings on
+    2026-08-05. Every recorder calls this so no bench/ script can record in
+    that state; KIPP_BENCH_ALLOW_BATTERY=1 overrides for deliberate off-power
+    runs. Non-Darwin platforms return immediately.
+    """
+    if platform.system() != "Darwin":
+        return
+    if os.environ.get("KIPP_BENCH_ALLOW_BATTERY") == "1":
+        return
+    battery = command_text(["pmset", "-g", "batt"])
+    settings = command_text(["pmset", "-g"])
+    on_battery = "Battery Power" in battery
+    # Monterey and earlier spell the key "lowpowermode"; Ventura+ "powermode".
+    low_power = any(
+        line.strip().split()[0] in ("powermode", "lowpowermode")
+        and line.strip().split()[-1] == "1"
+        for line in settings.splitlines()
+        if line.strip()
+    )
+    if on_battery or low_power:
+        raise RuntimeError(
+            "refusing to benchmark: "
+            + ("machine is on battery power" if on_battery else "")
+            + (" and " if on_battery and low_power else "")
+            + ("Low Power Mode is enabled" if low_power else "")
+            + ". Plug in and disable Low Power Mode, or set "
+            "KIPP_BENCH_ALLOW_BATTERY=1 to override (numbers will not be "
+            "steady-state)."
+        )
+    # An underpowered adapter power-limits the GPU with every flag above green.
+    # The M5 Max sustains full clocks only on its 140 W class adapter. Refuse
+    # on a parsed sub-90 W reading; on a laptop whose adapter reports no
+    # wattage we cannot confirm adequate power, so warn rather than trust it
+    # (desktops report no adapter at all and must not be blocked).
+    adapter = command_text(["pmset", "-g", "ac"])
+    watt_match = re.search(r"Wattage\s*=\s*(\d+)W", adapter)
+    is_laptop = "InternalBattery" in battery
+    if watt_match is not None:
+        if int(watt_match.group(1)) < 90:
+            raise RuntimeError(
+                f"refusing to benchmark: the connected power adapter is only "
+                f"{watt_match.group(1)} W and the GPU will be silently "
+                "power-limited. Connect the 140 W adapter, or set "
+                "KIPP_BENCH_ALLOW_BATTERY=1 to override (numbers will not be "
+                "steady-state)."
+            )
+    elif is_laptop:
+        print(
+            "warning: could not read adapter wattage from `pmset -g ac`; "
+            "confirm this is the 140 W adapter (a weak adapter silently "
+            "power-limits the GPU ~40%).",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def hardware_metadata(
