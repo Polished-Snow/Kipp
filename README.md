@@ -40,9 +40,9 @@ afternoon.
 
 Qwen3-4B on an Apple M5 Max, against llama.cpp on the **same host, the same
 weights, and the same session** — the honest comparison, losing rows included
-(BF16 prefill @2048 and @12800 re-measured 2026-08-08 alongside the
-panel-flash attention path; decode and quant rows from the 2026-07-28
-session, unchanged since):
+(BF16 prefill re-measured 2026-08-08 with panel-flash attention; Kipp quant
+prefill re-measured 2026-08-09 on the tensor path; decode rows from the
+2026-07-28 session, unchanged since — see the ‡ note on the quant rows):
 
 | tokens/s | Kipp | llama.cpp | |
 |---|---|---|---|
@@ -51,8 +51,8 @@ session, unchanged since):
 | **Decode**, 4-bit | 127.9 (affine4) | **149.6** (Q4_0) | llama.cpp **1.17×**\* |
 | **Prefill**, BF16 @2048 | **4,443** | 4,100 | Kipp +8% |
 | **Prefill**, BF16 @12800 | **2,410** | 1,561 | Kipp **1.54×**† |
-| **Prefill**, Q8_0 @2048 | 1,202 | **2,729** | llama.cpp **2.27×** |
-| **Prefill**, 4-bit @2048 | 1,210 (affine4) | 1,225 (Q4_0) | parity\* |
+| **Prefill**, Q8_0 @2048 | **2,882** | 2,729‡ | +2.31× vs Kipp's own simdgroup‡ |
+| **Prefill**, 4-bit @2048 | **2,868** (affine4) | 1,225‡ (Q4_0) | +2.29× vs Kipp's own simdgroup‡ |
 
 \* affine4 (scale+bias, gs32) and Q4_0 (scale-only) are the closest available
 4-bit schemes, not identical ones — Q4_0 dequantizes more cheaply, affine4
@@ -61,6 +61,15 @@ carries a bias term.
 † The 12,800-token row is a cool-start median (idle-GPU cooldown before each
 run, both engines): the M5 laptop chassis cannot hold steady state under
 sustained long-context prefill. See [BENCHMARKS](docs/BENCHMARKS.md).
+
+‡ v0.0.8 moved the quantized projections to the Metal 4 tensor path — a
+**2.3× Kipp-internal prefill gain** at 2,048 tokens (Q8_0 1,247 → 2,882,
+affine4 1,250 → 2,868, same-session vs the simdgroup kernel each replaces,
+MAD ≤0.3%). A stable llama.cpp quant head-to-head is not available: on this
+laptop chassis llama-bench's quantized prefill swings ~2× across thermal
+states (Q8_0 `-p 2048` measured 2.1k–4.4k tok/s in one session, lacking a
+steady-state protocol), so the llama figures shown are the last clean-session
+reference, not a same-session comparison.
 
 The BF16 prefill @12800 row is the v0.0.7 story. At 2,048 tokens prefill is
 projection-bound and v0.0.6's tensor-ops matmul already carried it, but as
@@ -71,9 +80,11 @@ units — `matmul2d` over gathered KV panels instead of a simdgroup reduction �
 lifting it to 20–25 TFLOP/s: **+37% over the kernel it replaces at 12,800
 tokens** (+26% at 6,400, +11% at 2,048), decode untouched, quantized schemes
 bit-identical. llama.cpp's own flash-attention is still simdgroup-only even on
-M5, which is why Kipp now leads it 1.54× at long context. Quantized
-projections still run the simdgroup kernels (their tensor variants are future
-work, hence the Q8_0 prefill row). Every number traces to a committed file in
+M5, which is why Kipp now leads it 1.54× at long context. v0.0.8 then moved
+the **quantized projections** onto the same tensor units — Q8_0 and affine4
+prefill both jump 2.3× (dequantize each weight block into a threadgroup tile,
+then `matmul2d`), so BF16, Q8_0, and 4-bit now all run the neural
+accelerators. Every number traces to a committed file in
 [`bench/results/`](bench/results/), and the
 [measurement protocol](https://polished-snow.github.io/Kipp/benchmarks.html)
 explains why they are all same-session medians rather than best-of runs.
@@ -100,16 +111,17 @@ affine weights at **128 tok/s** decode.
 - **Registry, not runner** — every supported checkpoint is pinned to one
   revision in `src/kipp_checkpoints.h`; anything else is rejected at load.
 
-### What is in v0.0.7
+### What is in v0.0.8
 
 - **Backends:** scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
   validated on H100 for the current default checkpoints (14B/32B on A100).
-- **Attention:** panel-flash prefill attention on the Metal 4 tensor units —
-  `matmul2d` over gathered KV panels — for long-context prefill (+37% at
-  12,800 tokens); decode and the quantized-projection paths still run the
-  simdgroup kernels.
-- **Weights:** BF16 with the Metal 4 tensor-ops matmul path, near-lossless
-  Q8_0, and Q4-class affine 4-bit projections.
+- **Prefill on the tensor units:** BF16, Q8_0, and affine4 projections all
+  run the Metal 4 `matmul2d` path (quant kernels dequantize each weight block
+  into a threadgroup tile first — v0.0.8, Q8_0/affine4 prefill 2.3×), plus
+  panel-flash attention over gathered KV panels for long context (v0.0.7,
+  +37% at 12,800 tokens). Decode still runs the simdgroup/matvec kernels.
+- **Weights:** BF16, near-lossless Q8_0, and Q4-class affine 4-bit
+  projections — all three on the tensor-ops matmul path for prefill.
 - **KV cache:** paged 32-position blocks, cross-request prefix sharing, and an
   opt-in Q8_0 KV cache (~1.9× smaller; a memory feature, not a speed one).
 - **Serving:** OpenAI Completions and Chat Completions, SSE, 32-way batched

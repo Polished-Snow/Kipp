@@ -5,21 +5,21 @@
     "decode_tokens": 8,
     "kv_quant": "bf16",
     "measured_runs": 5,
-    "prompt": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word",
+    "prompt": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
     "sampling": "greedy",
     "warmup_runs": 1
   },
   "decode_tokens_per_second": {
-    "maximum": 91.52270907218853,
-    "median": 91.24399785576604,
-    "median_absolute_deviation": 0.21384008094514684,
-    "minimum": 89.18915905771654
+    "maximum": 91.50700600514726,
+    "median": 91.39410279551711,
+    "median_absolute_deviation": 0.11290320963014722,
+    "minimum": 90.0424324963139
   },
   "engine": {
     "backend": "metal",
     "binary": "build/kipp-metal",
     "build_flags": "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror",
-    "commit": "411c2028a49ed05abdcfaad33303a814e5dbc16d",
+    "commit": "e27ed1d70e25873fc9618bd50e63dfe62b3b5bd4",
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "dirty": true
   },
@@ -39,52 +39,52 @@
     "sha256": "e81b9066347d9e3ab1c22058ac7de5792a6a78f41ce408d187421b620de0bc96"
   },
   "peak_resident_bytes": {
-    "maximum": 41861120.0,
-    "median": 41795584.0,
-    "median_absolute_deviation": 49152.0,
-    "minimum": 41730048.0
+    "maximum": 42827776.0,
+    "median": 42532864.0,
+    "median_absolute_deviation": 32768.0,
+    "minimum": 42418176.0
   },
   "prefill_tokens_per_second": {
-    "maximum": 1067.3307835986836,
-    "median": 1065.6474340985865,
-    "median_absolute_deviation": 1.6833495000971652,
-    "minimum": 1054.2851419594945
+    "maximum": 1996.0874034284955,
+    "median": 1940.1330376940132,
+    "median_absolute_deviation": 34.27362806720703,
+    "minimum": 1876.6288015761188
   },
   "runs": [
     {
-      "decode_seconds": 0.087792,
-      "decode_tokens_per_second": 91.12447603426281,
-      "peak_resident_bytes": 41844736,
-      "prefill_seconds": 0.283572,
-      "prefill_tokens_per_second": 1057.9323769624646
+      "decode_seconds": 0.08743,
+      "decode_tokens_per_second": 91.50177284684891,
+      "peak_resident_bytes": 42418176,
+      "prefill_seconds": 0.150795,
+      "prefill_tokens_per_second": 1996.0874034284955
     },
     {
-      "decode_seconds": 0.089697,
-      "decode_tokens_per_second": 89.18915905771654,
-      "peak_resident_bytes": 41861120,
-      "prefill_seconds": 0.284553,
-      "prefill_tokens_per_second": 1054.2851419594945
+      "decode_seconds": 0.087806,
+      "decode_tokens_per_second": 91.10994692845593,
+      "peak_resident_bytes": 42827776,
+      "prefill_seconds": 0.157934,
+      "prefill_tokens_per_second": 1905.8594096268062
     },
     {
-      "decode_seconds": 0.087677,
-      "decode_tokens_per_second": 91.24399785576604,
-      "peak_resident_bytes": 41730048,
-      "prefill_seconds": 0.281075,
-      "prefill_tokens_per_second": 1067.3307835986836
+      "decode_seconds": 0.087533,
+      "decode_tokens_per_second": 91.39410279551711,
+      "peak_resident_bytes": 42532864,
+      "prefill_seconds": 0.160394,
+      "prefill_tokens_per_second": 1876.6288015761188
     },
     {
-      "decode_seconds": 0.087472,
-      "decode_tokens_per_second": 91.45783793671119,
-      "peak_resident_bytes": 41795584,
-      "prefill_seconds": 0.281519,
-      "prefill_tokens_per_second": 1065.6474340985865
+      "decode_seconds": 0.088847,
+      "decode_tokens_per_second": 90.0424324963139,
+      "peak_resident_bytes": 42549248,
+      "prefill_seconds": 0.155144,
+      "prefill_tokens_per_second": 1940.1330376940132
     },
     {
-      "decode_seconds": 0.08741,
-      "decode_tokens_per_second": 91.52270907218853,
-      "peak_resident_bytes": 41779200,
-      "prefill_seconds": 0.28129,
-      "prefill_tokens_per_second": 1066.5149845355327
+      "decode_seconds": 0.087425,
+      "decode_tokens_per_second": 91.50700600514726,
+      "peak_resident_bytes": 42500096,
+      "prefill_seconds": 0.153403,
+      "prefill_tokens_per_second": 1962.151978774861
     }
   ]
 }

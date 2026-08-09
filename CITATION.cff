@@ -26,5 +26,5 @@ keywords:
   - paged attention
   - speculative decoding
 license: MIT
-version: 0.0.7
-date-released: "2026-08-08"
+version: 0.0.8
+date-released: "2026-08-09"

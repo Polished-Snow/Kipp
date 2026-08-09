@@ -3,6 +3,43 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## v0.0.8 — 2026-08-09
+
+### Quantized projections on the Metal 4 tensor pipeline
+- **Q8_0 and affine4 weight projections now run on `mpp::tensor_ops`** on
+  M5-class devices — the last prefill path still on the simdgroup kernels.
+  Each K-block is dequantized into a threadgroup bf16 tile, then fed to
+  `matmul2d` (the BF16 kernel needs no dequant, so it stages nothing; the
+  quant kernels reuse the simdgroup cooperative dequant prologue). Same
+  output tile geometry, transposed grid, and geometry probe as the BF16
+  tensor path. Decode is untouched (matvec; prefill-only change).
+- **Q8_0 prefill @2,048: 1,247 → 2,875 tok/s (2.31×)**; affine4 1,250 →
+  2,857 (2.29×) — same-session A/B against the simdgroup kernels each
+  replaces, on an M5 Max, steady-state (MAD ≤0.3%). Committed records
+  (tensor path): q8_0 2,882 @2k / 1,940 @348, affine4 2,868 / 1,960.
+- **Why it works:** the same neural-accelerator instruction class that gave
+  BF16 projections 2.8× in v0.0.6. A Phase-0 spike first confirmed
+  `matmul2d` accepts a threadgroup-address-space weight operand on M5
+  (bitwise-exact); `kipp_tensor_probe_bf16` was extended to exercise it so a
+  device that can't build it demotes cleanly rather than hard-failing.
+- **Gated like the BF16 tensor path.** Selection is a pure function of token
+  count (quant-tensor at ≥ one token tile, simdgroup below), so the
+  paged/pooled bitwise gates stay single-class; Q8_0 KV and non-M5 /
+  `KIPP_METAL_TENSOR_DISABLE` keep the simdgroup kernels, whose fingerprints
+  are frozen (7421c99f0af71365 / 0709c0eb78978e61). Tensor-state quant
+  fingerprints re-baseline (q8_0 33b605f4f5a05243, affine4 0953f2975a2692d5;
+  nmse vs CPU oracle 9.2e-07 / 2.2e-06). New tolerance-0 quant-tensor
+  operator test; bf16 + pooled reprint unchanged — the change is isolated.
+- **No llama.cpp head-to-head this release:** llama-bench's quantized
+  prefill is thermally unstable on this laptop chassis (measured 2.1k–4.4k
+  tok/s across thermal states in one session; it has no steady-state
+  protocol), so a fair same-session comparison could not be taken. The
+  result above is Kipp-internal, steady-state, and same-session.
+
+### Validation
+- Gated on Apple M5 Max (CPU + Metal); operator suite 38/0, all per-class
+  fingerprints reprint. CUDA was not revalidated this release.
+
 ## v0.0.7 — 2026-08-08
 
 ### Panel-flash attention on the Metal 4 tensor pipeline: long-context prefill +37%
