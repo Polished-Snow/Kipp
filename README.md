@@ -40,15 +40,17 @@ afternoon.
 
 Qwen3-4B on an Apple M5 Max, against llama.cpp on the **same host, the same
 weights, and the same session** — the honest comparison, losing rows included
-(BF16 prefill re-measured 2026-07-30 alongside Kipp's tensor-path records;
-decode and quant rows from the 2026-07-28 session, unchanged since):
+(BF16 prefill @2048 and @12800 re-measured 2026-08-08 alongside the
+panel-flash attention path; decode and quant rows from the 2026-07-28
+session, unchanged since):
 
 | tokens/s | Kipp | llama.cpp | |
 |---|---|---|---|
 | **Decode**, BF16 | 59.7 | **63.1** | llama.cpp +6% |
 | **Decode**, Q8_0 | 94.4 | **100.5** | llama.cpp +6% |
 | **Decode**, 4-bit | 127.9 (affine4) | **149.6** (Q4_0) | llama.cpp **1.17×**\* |
-| **Prefill**, BF16 @2048 | 3,679 | **4,102** | llama.cpp +12% |
+| **Prefill**, BF16 @2048 | **4,443** | 4,100 | Kipp +8% |
+| **Prefill**, BF16 @12800 | **2,410** | 1,561 | Kipp **1.54×**† |
 | **Prefill**, Q8_0 @2048 | 1,202 | **2,729** | llama.cpp **2.27×** |
 | **Prefill**, 4-bit @2048 | 1,210 (affine4) | 1,225 (Q4_0) | parity\* |
 
@@ -56,14 +58,23 @@ decode and quant rows from the 2026-07-28 session, unchanged since):
 4-bit schemes, not identical ones — Q4_0 dequantizes more cheaply, affine4
 carries a bias term.
 
-The BF16 prefill row is the v0.0.6 story: a gated Metal 4 tensor-ops matmul
-path (M5-class neural accelerators) took Kipp from 1,312 to 3,679 tok/s —
-**2.80× in one release** — closing what was a 2.9× llama.cpp lead to 12%,
-with decode untouched and the quantized schemes bit-identical. What remains
-of that 12% is Kipp's attention stack at prefill, which is the next campaign;
-quantized projections still run the simdgroup kernels (their tensor variants
-are future work, hence the Q8_0 prefill row). Every number traces to a
-committed file in [`bench/results/`](bench/results/), and the
+† The 12,800-token row is a cool-start median (idle-GPU cooldown before each
+run, both engines): the M5 laptop chassis cannot hold steady state under
+sustained long-context prefill. See [BENCHMARKS](docs/BENCHMARKS.md).
+
+The BF16 prefill @12800 row is the v0.0.7 story. At 2,048 tokens prefill is
+projection-bound and v0.0.6's tensor-ops matmul already carried it, but as
+context grows attention takes over: at 12,800 tokens the simdgroup
+flash-attention kernel was ~85% of the prefill wall, running at only ~3
+TFLOP/s effective. Panel-flash moves that inner work onto the Metal 4 tensor
+units — `matmul2d` over gathered KV panels instead of a simdgroup reduction —
+lifting it to 20–25 TFLOP/s: **+37% over the kernel it replaces at 12,800
+tokens** (+26% at 6,400, +11% at 2,048), decode untouched, quantized schemes
+bit-identical. llama.cpp's own flash-attention is still simdgroup-only even on
+M5, which is why Kipp now leads it 1.54× at long context. Quantized
+projections still run the simdgroup kernels (their tensor variants are future
+work, hence the Q8_0 prefill row). Every number traces to a committed file in
+[`bench/results/`](bench/results/), and the
 [measurement protocol](https://polished-snow.github.io/Kipp/benchmarks.html)
 explains why they are all same-session medians rather than best-of runs.
 
@@ -89,11 +100,16 @@ affine weights at **128 tok/s** decode.
 - **Registry, not runner** — every supported checkpoint is pinned to one
   revision in `src/kipp_checkpoints.h`; anything else is rejected at load.
 
-### What is in v0.0.6
+### What is in v0.0.7
 
 - **Backends:** scalar CPU oracle, Metal on Apple M5-class hardware, and CUDA
   validated on H100 for the current default checkpoints (14B/32B on A100).
-- **Weights:** BF16, near-lossless Q8_0, and Q4-class affine 4-bit projections.
+- **Attention:** panel-flash prefill attention on the Metal 4 tensor units —
+  `matmul2d` over gathered KV panels — for long-context prefill (+37% at
+  12,800 tokens); decode and the quantized-projection paths still run the
+  simdgroup kernels.
+- **Weights:** BF16 with the Metal 4 tensor-ops matmul path, near-lossless
+  Q8_0, and Q4-class affine 4-bit projections.
 - **KV cache:** paged 32-position blocks, cross-request prefix sharing, and an
   opt-in Q8_0 KV cache (~1.9× smaller; a memory feature, not a speed one).
 - **Serving:** OpenAI Completions and Chat Completions, SSE, 32-way batched

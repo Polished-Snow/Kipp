@@ -30,6 +30,22 @@
 <p>This sequence is binding unless <code>ARCHITECTURE.md</code> is explicitly revised.
 Correctness gates every phase. Status notes summarize delivered work and
 link measured claims back to the benchmark records.</p>
+<p><strong>Status (v0.0.7):</strong> Long-context prefill attention — the lever v0.0.6
+named as next — now runs on the Metal 4 tensor units. Batched-prefill GQA
+is processed one 1,024-KV-position panel at a time (block-table gather →
+Q·Kᵀ <code>matmul2d</code> → panel-granular online softmax → P·V <code>matmul2d</code> →
+cross-panel rescale), and the win tracks attention's growing share of the
+wall: <strong>+37% at a 12,800-token prefill, +26% at 6,400, +11% at 2,048</strong>
+(same-session A/B vs the simdgroup flash-attention kernel it replaces,
+cool-start matched on an M5 Max), with decode untouched. At 12,800 tokens
+Kipp reaches 2,410 tok/s against llama.cpp's 1,561 (<strong>1.54×</strong>) — llama.cpp's
+flash-attention is simdgroup-only even on M5, so it stays on the slow
+attention class at long context. It ships behind dual-state gating
+(tensor-state + BF16 KV) with tensor fingerprints re-baselined tighter on
+every scheme; the simdgroup attention class stays frozen for non-M5
+devices, <code>KIPP_METAL_TENSOR_DISABLE</code>, and Q8_0 KV. Remaining after this
+release: quantized tensor-matmul variants, server prefill chunk tuning, a
+small-part panel-threshold, CUDA revalidation, and 4-bit KV.</p>
 <p><strong>Status (v0.0.6):</strong> The instruction-class gap v0.0.5 documented is closed.
 A gated Metal 4 <code>mpp::tensor_ops</code> matmul path now runs BF16 layer
 projections on M5-class devices: <strong>prefill 1,312 → 3,682 tok/s (2.80×) at a
@@ -147,9 +163,10 @@ and placement invariance. The <strong>Metal 4 <code>mpp::tensor_ops</code> matmu
 delivered for BF16 projections on M5-class devices (prefill 2.80× at 2,048
 tokens, at parity with llama.cpp's tensor path; the previously planned
 K-blocked matmul was measured unnecessary — the simdgroup kernels were
-compute-bound, not traffic-bound). Remaining: long-context prefill
-attention (the dominant cost above ~8K tokens now that projections are
-fast), quantized tensor-matmul variants, server prefill chunk tuning, a
+compute-bound, not traffic-bound), and <strong>panel-flash attention</strong> puts
+long-context prefill GQA on the same tensor units (v0.0.7: +37% at 12,800
+tokens, leading llama.cpp 1.54× there). Remaining: quantized tensor-matmul
+variants, server prefill chunk tuning, a small-part panel-threshold, a
 token-budget scheduler, and 4-bit KV, each behind its own CPU-vs-GPU gate.
 Prompt-lookup and draft-model speculative decoding plus generated-token
 logprobs are already delivered.</p>

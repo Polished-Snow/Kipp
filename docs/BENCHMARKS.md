@@ -60,14 +60,17 @@ record results from a fallback build. Current reference numbers
 - Wikitext-2 perplexity (full test set, 2,048-token windows): BF16
   **7.731**, Q8_0 **7.733** (+0.02%), affine4 **8.171** (+5.7%) — Q8_0 is
   effectively lossless; affine4 is Q4-class.
-- Prefill tok/s (348-token / 2,048-token prompt, 2026-07-30): BF16
-  **2500 / 3679** on the Metal 4 tensor path ("The tensor-ops path" below;
-  2.4–2.8× the 1034 / 1312 the simdgroup kernels reach, which stay the
-  shipped path on pre-M5 devices), Q8_0 **1065 / 1213**, affine4
-  **1080 / 1214** on the simdgroup kernels (quantized projections gained
-  10–12% at 2,048 tokens from the v0.0.5 shared-dequant rotation; their
-  tensor variants are future work). The quantized kernels dequantize each
-  32-weight block once per 64-token tile.
+- Prefill tok/s, BF16, Metal 4 tensor path with panel-flash attention
+  (348 / 2,048 / 12,800-token prompt, 2026-08-08): **2601 / 4443 / 2410**
+  ("Panel-flash attention" below). The 12,800 figure is a cool-start
+  median (the chassis cannot sustain long-context prefill); the 2,048
+  figure sits above the 2026-07-30 3,679 mostly from cooler ambient, so
+  the panel-flash gain is isolated in the same-session A/B (+37% at 12,800,
+  +11% at 2,048) rather than read off the absolute. Quantized prefill
+  (2026-07-30, unchanged — the quant paths are bit-frozen this release):
+  Q8_0 **1065 / 1213**, affine4 **1080 / 1214** on the simdgroup kernels
+  (their tensor variants are future work). The quantized kernels dequantize
+  each 32-weight block once per 64-token tile.
 - Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
   12,800-token prompt after the split-K long-context path (`ctx-*.json`).
 - Model-size sweep (BF16 decode): 0.6B **269**, 4B **60.7**, 8B **33.5**
@@ -372,6 +375,98 @@ fingerprint **794f1799c6a7326a** / pooled NMSE **5.12341885e-07**; the
 frozen simdgroup values (**49e2ada96bce2804** / **2.08738076e-06**) remain
 verifiable with `KIPP_METAL_TENSOR_DISABLE=1`, and both must be checked on
 their own path.
+
+### Panel-flash attention: prefill GQA on the tensor units, and the ~6× headroom it converts (2026-08-08)
+
+v0.0.7 moves batched-prefill grouped-query attention off the simdgroup
+flash-attention kernel and onto the M5 `mpp::tensor_ops` matmul path the
+previous campaign built for projections, attacking the long-context cost
+that section named. The win grows with context, tracking attention's share
+of the wall:
+
+| Qwen3-4B BF16, M5 Max, same-session A/B, cool-start matched | simdgroup (`KIPP_METAL_TENSOR_DISABLE=1`) | panel-flash (default on M5-class) | ratio |
+|---|---|---|---|
+| Prefill @2,048 | 4,069 | **4,530** | 1.11× |
+| Prefill @6,400 | 2,740 | **3,451** | 1.26× |
+| Prefill @12,800 | 1,754 | **2,410** | **1.37×** |
+| Decode | 60.6 | 60.7 | 1.00× |
+| Q8_0-KV control | equal | equal | streaming, unchanged |
+
+Per 1,024-KV-position panel: a gather copies the round-visible KV range
+through the block table into contiguous K + transposed-V panels; Q·Kᵀ runs
+as one `matmul2d` per head into a float score panel; a panel-granular
+online softmax reuses the streaming kernel's exact merge expressions (bf16
+probabilities, float denominators); P·V runs as a second `matmul2d`; an
+accumulate kernel folds each panel into the running output with the
+cross-panel rescale. It is tensor-state + BF16-KV only — the simdgroup
+flash-attention kernel stays the path for every other device, for
+`KIPP_METAL_TENSOR_DISABLE`, and for Q8_0 KV, so its fingerprints stay
+frozen. The committed records (`4b-bf16-prefill2k.json`,
+`4b-bf16-prefill12k8.json`) read 4,443 tok/s at 2,048 tokens (sustained)
+and 2,410 at 12,800 (cool-start); same-session, llama.cpp reads 4,100 and
+1,561, so Kipp leads it 1.54× at 12,800 — llama.cpp's flash-attention is
+simdgroup-only even on M5. CUDA was not revalidated this campaign.
+
+A measurement note that shapes everything below: the M5 laptop chassis
+**cannot hold steady state under sustained long-context prefill**. bf16
+@2,048 tensor holds ~4,450 tok/s across a dozen back-to-back runs (MAD
+0.66%), but @12,800 the same kernel decays run-over-run as the chassis
+heat-soaks (2,304 → 1,098 within one session). This is thermal, not power
+(battery 100%, adapter steady). So the long-context A/B is measured
+**cool-start matched** — an idle-GPU cooldown before every run, both arms
+interleaved — which samples both kernels at the same thermal state and
+gives a fair, reproducible cold-prompt ratio. Absolute long-context
+numbers are cold-prompt medians, labelled as such.
+
+Why attention was worth its own kernel-class swap: at a 12,800-token
+prefill the attention FLOPs are 2·2·(N²/2)·32 heads·128 dim·36 layers ≈
+**48.3 TFLOP** — about half the projection FLOPs and growing linearly with
+context. A two-point quadratic fit T(N)=aN+bN² across both kernel classes
+agrees within 11% and attributes **~85% of the 12.8k wall to attention**.
+The simdgroup FA kernel ran ~3 TFLOP/s effective (`--fa-bench-metal`) while
+`matmul2d` at attention panel shapes sustains 20–25 TFLOP/s (probe E4) —
+the ~6× headroom panel-flash exists to convert.
+
+Design findings, several of them kill records:
+
+- **Panels, not per-32-block matmul2d.** The tensor units need
+  panel-scale operands, so attention is tiled at 1,024 KV positions rather
+  than the projection tile. The gather's compulsory traffic is ≈ 23 GB per
+  full 12.8k prefill ≈ 0.1 s — cheap against the 48.3 TFLOP it feeds.
+- **The panel width is workspace-bounded, and that boundary is real.**
+  `matmul2d` P·V at panel width 4,096 collapses to **6.5 TFLOP/s** (256
+  threadgroups, occupancy) versus 19.5–25.3 at ≤2,048; the workspace budget
+  already bounds the panel at 1,024, on the fast side of the cliff.
+- **KV-head sharing across simdgroups lost −7.3%.** Dividing nominal KV
+  traffic by 4 would have won ~4× if attention were traffic-bound; it did
+  not, so prefill attention is **issue-bound, not traffic-bound** — which
+  is why moving it to the tensor units, not to a cleverer memory schedule,
+  is the win.
+- **Round-width for attention is inert.** Total KV position-reads = N²/2
+  regardless of how a round partitions them.
+- **Two ~5%-ceiling levers deliberately skipped.** Wider-KV-tile and
+  `staged_out`-deletion each cap at ~5% and were not worth re-baselining
+  two kernel classes once panel-flash landed.
+- **matmul2d truncates f32 sources to ~bf16 internally** (~2.5e-3 abs err
+  on 128-dim dot products, measured) — below the softmax's own rounding, so
+  fine for attention scores.
+- **The zero-mean-V test-data trap, and why the operator test carries a DC
+  offset.** Attention output is a probability-weighted average, so over
+  1,500 zero-mean positions the reference cancels toward |v|/√N while the
+  bf16-probability rounding both matrix-class kernels share stays absolute;
+  a CPU simulation of the exact rounding class measured **8e-4 NMSE on
+  zero-mean data with provably-correct algebra, and 3e-9 with a DC
+  offset** — so the panel operator test carries the offset.
+
+Per-kernel-class tripwires (M5 Max): tensor-state `--prefill-metal` bf16
+fingerprint **721ea327c1facaed** / NMSE **7.46e-07**, pooled NMSE
+**6.05480037e-07**; quant tensor-state q8_0 **0c251632a7a38a3d**, affine4
+**52161133c69d0d76**; the frozen simdgroup values
+(**49e2ada96bce2804** / **2.08738076e-06**) remain recoverable with
+`KIPP_METAL_TENSOR_DISABLE=1`, and both classes must be checked on their
+own path. Every tensor-state value is **tighter** than the class it
+replaced, and paged placement invariance is bitwise through the panel
+gather.
 
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 

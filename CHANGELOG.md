@@ -3,6 +3,56 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## v0.0.7 — 2026-08-08
+
+### Panel-flash attention on the Metal 4 tensor pipeline: long-context prefill +37%
+- **Batched-prefill GQA attention now runs on `mpp::tensor_ops`** on
+  M5-class devices, closing the residue v0.0.6 named as dominant above ~8K
+  tokens. Attention is processed one 1,024-KV-position panel at a time:
+  gather (block-table honored) → Q·Kᵀ `matmul2d` per head → panel-granular
+  online softmax reusing the streaming kernel's merge expressions (bf16
+  probabilities) → P·V `matmul2d` → cross-panel rescale/accumulate. Decode
+  is untouched — the change is prefill-only.
+- **Long-context prefill gets faster the longer the context** (same-session
+  A/B vs the simdgroup flash-attention kernel it replaces, cool-start
+  matched on an M5 Max): **+37% at 12,800 tokens** (2,410 vs 1,754 tok/s),
+  +26% at 6,400, +11% at 2,048 — the win tracks attention's share of the
+  wall, which grows linearly with context. Decode unchanged (+0.1%).
+- **Kipp now leads llama.cpp at long context.** Same-session, Kipp
+  panel-flash reaches 2,410 tok/s at a 12,800-token prefill against
+  llama.cpp's 1,561 (**1.54×**); at 2,048 tokens Kipp's 4,443 edges
+  llama.cpp's 4,100. llama.cpp's flash-attention is simdgroup-only even on
+  M5, so it stays on the slow attention class at long context.
+- **Why it works:** attention is ~85% of the 12.8k prefill wall (~48.3
+  TFLOP at 12,800 tokens and growing linearly), and the simdgroup
+  flash-attention kernel ran only ~3 TFLOP/s effective at these panel
+  shapes versus `matmul2d`'s 20–25 TFLOP/s. Moving the class onto the
+  tensor units converts the largest remaining prefill cost to the fast path.
+- **Gated like the projection path, and re-baselined tighter.** The tensor
+  attention rung runs only behind the tensor-state check and BF16 KV; the
+  simdgroup FA kernel stays frozen for other devices, for
+  `KIPP_METAL_TENSOR_DISABLE`, and for Q8_0 KV. Tensor fingerprints were
+  re-baselined tighter on every scheme (bf16 721ea327c1facaed / 7.46e-07,
+  q8_0 0c251632a7a38a3d, affine4 52161133c69d0d76, pooled 6.05e-07);
+  `KIPP_METAL_TENSOR_DISABLE` reprints the frozen simdgroup values
+  (49e2ada96bce2804 / 2.08738076e-06). Paged placement invariance is
+  bitwise through the new gather, and the geometry probe was extended to
+  pin the panel tile constants. The engine and its operator test share one
+  panel-encode routine, so their dispatch geometry cannot drift.
+- **Also in this release:** a bitwise skip-identity-rescale in the
+  simdgroup FA kernel (no numeric change); a new `--fa-bench-metal`
+  attention instrument; and `bench.py` / `_provenance` now refuse to record
+  on battery, in Low Power Mode, or behind a sub-90 W adapter — three
+  disguises of the same silent GPU power-limiting.
+
+### Validation
+- Gated on Apple M5 Max (CPU + Metal); operator suite 38/0, all
+  per-kernel-class fingerprints reprint. CUDA was not revalidated this
+  release. The 12,800-token figures are cool-start medians: the laptop
+  chassis cannot hold steady state under sustained long-context prefill,
+  so both Kipp and llama.cpp are measured with an idle-GPU cooldown before
+  each run (see `docs/BENCHMARKS.md`).
+
 ## v0.0.6 — 2026-07-30
 
 ### Metal 4 tensor-ops prefill: BF16 2.80× — the instruction-class gap is closed
