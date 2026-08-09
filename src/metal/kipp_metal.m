@@ -805,15 +805,56 @@ static void metal_encode_kv_write(id<MTLComputeCommandEncoder> target,
  * softmax state lives in the workspace, so no zero pass is needed: the first
  * panel initializes it.
  */
-static void metal_encode_gqa_panels(id<MTLComputeCommandEncoder> target,
-                                    KippMetalModel *model,
-                                    KippMetalSession *kvSession,
-                                    id<MTLBuffer> query, id<MTLBuffer> output,
-                                    NSUInteger headStateOffset, uint32_t layer,
-                                    uint32_t startPosition,
-                                    uint32_t tokenCount) {
-    KippMetalWorkspace *workspace = model.workspace;
-    uint32_t heads = model.config.attention_head_count;
+/* Pre-resolved pipeline states for the five panel-flash kernels. The
+ * operator test resolves these from a local dictionary during model-open
+ * self-probe (before any KippMetalModel exists), so the shared encoder below
+ * takes states rather than (model, name). */
+typedef struct {
+    id<MTLComputePipelineState> gather;
+    id<MTLComputePipelineState> qk;
+    id<MTLComputePipelineState> softmax;
+    id<MTLComputePipelineState> pv;
+    id<MTLComputePipelineState> accumulate;
+} metal_fa_panel_pipelines;
+
+/* Every buffer the panel sequence binds. faKeyPanel..faCorrections are the
+ * per-panel scratch; query/output carry queryOffset/outputOffset (the engine
+ * passes a per-head offset, the test passes 0). */
+typedef struct {
+    id<MTLBuffer> keyCache;
+    id<MTLBuffer> valueCache;
+    id<MTLBuffer> blockTable;
+    id<MTLBuffer> keyPanel;
+    id<MTLBuffer> valuePanel;
+    id<MTLBuffer> scores;
+    id<MTLBuffer> probs;
+    id<MTLBuffer> outPanel;
+    id<MTLBuffer> maxima;
+    id<MTLBuffer> denominators;
+    id<MTLBuffer> corrections;
+    id<MTLBuffer> query;
+    id<MTLBuffer> output;
+    NSUInteger queryOffset;
+    NSUInteger outputOffset;
+} metal_fa_panel_buffers;
+
+/*
+ * Encode the panel-flash attention sequence for one part onto a serial
+ * encoder. Shared verbatim by the engine (metal_encode_gqa_panels) and the
+ * operator test so their dispatch geometry, buffer bindings, and dispatch
+ * order cannot drift apart -- the geometry lives in exactly one place. Per
+ * KIPP_METAL_FA_PANEL-position panel the encoder orders gather -> Q K^T
+ * (matmul2d) -> panel softmax -> P V (matmul2d) -> accumulate; the block
+ * table is honored by the gather, so paged/pooled placement invariance is
+ * untouched, and the running softmax state persists across panels (the first
+ * panel initializes it, so no zero pass is needed).
+ */
+static void metal_encode_fa_panels(id<MTLComputeCommandEncoder> encoder,
+                                   const metal_fa_panel_pipelines *pipes,
+                                   const metal_fa_panel_buffers *bufs,
+                                   uint32_t heads, uint32_t layer,
+                                   uint32_t startPosition, uint32_t tokenCount,
+                                   uint32_t capacity) {
     uint32_t kvLength = startPosition + tokenCount;
     uint32_t panelCount =
         (kvLength + KIPP_METAL_FA_PANEL - 1u) / KIPP_METAL_FA_PANEL;
@@ -824,7 +865,7 @@ static void metal_encode_gqa_panels(id<MTLComputeCommandEncoder> target,
             layer,
             startPosition,
             tokenCount,
-            kvSession.slabPositions,
+            capacity,
             base,
             width,
             (width + 31u) & ~31u,
@@ -832,71 +873,98 @@ static void metal_encode_gqa_panels(id<MTLComputeCommandEncoder> target,
             panel + 1u == panelCount ? 1u : 0u,
         };
         metal_enc_threads(
-            target, metal_pipeline(model, @"kipp_fa_panel_gather"),
+            encoder, pipes->gather,
             KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-            params.panel_width32, ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:kvSession.keyCache offset:0 atIndex:0];
-              [encoder setBuffer:kvSession.valueCache offset:0 atIndex:1];
-              [encoder setBuffer:workspace.faKeyPanel offset:0 atIndex:2];
-              [encoder setBuffer:workspace.faValuePanel offset:0 atIndex:3];
-              [encoder setBytes:&params length:sizeof(params) atIndex:4];
-              [encoder setBuffer:kvSession.blockTable offset:0 atIndex:5];
+            params.panel_width32, ^(id<MTLComputeCommandEncoder> e) {
+              [e setBuffer:bufs->keyCache offset:0 atIndex:0];
+              [e setBuffer:bufs->valueCache offset:0 atIndex:1];
+              [e setBuffer:bufs->keyPanel offset:0 atIndex:2];
+              [e setBuffer:bufs->valuePanel offset:0 atIndex:3];
+              [e setBytes:&params length:sizeof(params) atIndex:4];
+              [e setBuffer:bufs->blockTable offset:0 atIndex:5];
             });
         metal_enc_groups_3d(
-            target, metal_pipeline(model, @"kipp_fa_panel_qk"),
+            encoder, pipes->qk,
             (tokenCount + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
                 KIPP_METAL_FA_PANEL_TOKEN_TILE,
             (width + KIPP_METAL_FA_PANEL_POS_TILE - 1u) /
                 KIPP_METAL_FA_PANEL_POS_TILE,
             heads, KIPP_METAL_GROUP_THREADS,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:workspace.faKeyPanel offset:0 atIndex:0];
-              [encoder setBuffer:query offset:headStateOffset atIndex:1];
-              [encoder setBuffer:workspace.faScores offset:0 atIndex:2];
-              [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            ^(id<MTLComputeCommandEncoder> e) {
+              [e setBuffer:bufs->keyPanel offset:0 atIndex:0];
+              [e setBuffer:bufs->query offset:bufs->queryOffset atIndex:1];
+              [e setBuffer:bufs->scores offset:0 atIndex:2];
+              [e setBytes:&params length:sizeof(params) atIndex:3];
             });
         metal_enc_groups_3d(
-            target, metal_pipeline(model, @"kipp_fa_panel_softmax"),
-            tokenCount, heads, 1, 32,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:workspace.faScores offset:0 atIndex:0];
-              [encoder setBuffer:workspace.faProbs offset:0 atIndex:1];
-              [encoder setBuffer:workspace.faMaxima offset:0 atIndex:2];
-              [encoder setBuffer:workspace.faDenominators
-                          offset:0
-                         atIndex:3];
-              [encoder setBuffer:workspace.faCorrections
-                          offset:0
-                         atIndex:4];
-              [encoder setBytes:&params length:sizeof(params) atIndex:5];
+            encoder, pipes->softmax, tokenCount, heads, 1, 32,
+            ^(id<MTLComputeCommandEncoder> e) {
+              [e setBuffer:bufs->scores offset:0 atIndex:0];
+              [e setBuffer:bufs->probs offset:0 atIndex:1];
+              [e setBuffer:bufs->maxima offset:0 atIndex:2];
+              [e setBuffer:bufs->denominators offset:0 atIndex:3];
+              [e setBuffer:bufs->corrections offset:0 atIndex:4];
+              [e setBytes:&params length:sizeof(params) atIndex:5];
             });
         metal_enc_groups_3d(
-            target, metal_pipeline(model, @"kipp_fa_panel_pv"),
+            encoder, pipes->pv,
             (tokenCount + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
                 KIPP_METAL_FA_PANEL_TOKEN_TILE,
             KIPP_ATTENTION_HEAD_DIM / KIPP_METAL_FA_PANEL_POS_TILE, heads,
-            KIPP_METAL_GROUP_THREADS,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:workspace.faValuePanel offset:0 atIndex:0];
-              [encoder setBuffer:workspace.faProbs offset:0 atIndex:1];
-              [encoder setBuffer:workspace.faOutPanel offset:0 atIndex:2];
-              [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            KIPP_METAL_GROUP_THREADS, ^(id<MTLComputeCommandEncoder> e) {
+              [e setBuffer:bufs->valuePanel offset:0 atIndex:0];
+              [e setBuffer:bufs->probs offset:0 atIndex:1];
+              [e setBuffer:bufs->outPanel offset:0 atIndex:2];
+              [e setBytes:&params length:sizeof(params) atIndex:3];
             });
         metal_enc_threads(
-            target, metal_pipeline(model, @"kipp_fa_panel_accumulate"),
+            encoder, pipes->accumulate,
             (NSUInteger)heads * KIPP_ATTENTION_HEAD_DIM, tokenCount,
-            ^(id<MTLComputeCommandEncoder> encoder) {
-              [encoder setBuffer:workspace.faOutPanel offset:0 atIndex:0];
-              [encoder setBuffer:output offset:headStateOffset atIndex:1];
-              [encoder setBuffer:workspace.faCorrections
-                          offset:0
-                         atIndex:2];
-              [encoder setBuffer:workspace.faDenominators
-                          offset:0
-                         atIndex:3];
-              [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            ^(id<MTLComputeCommandEncoder> e) {
+              [e setBuffer:bufs->outPanel offset:0 atIndex:0];
+              [e setBuffer:bufs->output offset:bufs->outputOffset atIndex:1];
+              [e setBuffer:bufs->corrections offset:0 atIndex:2];
+              [e setBuffer:bufs->denominators offset:0 atIndex:3];
+              [e setBytes:&params length:sizeof(params) atIndex:4];
             });
     }
+}
+
+static void metal_encode_gqa_panels(id<MTLComputeCommandEncoder> target,
+                                    KippMetalModel *model,
+                                    KippMetalSession *kvSession,
+                                    id<MTLBuffer> query, id<MTLBuffer> output,
+                                    NSUInteger headStateOffset, uint32_t layer,
+                                    uint32_t startPosition,
+                                    uint32_t tokenCount) {
+    KippMetalWorkspace *workspace = model.workspace;
+    metal_fa_panel_pipelines pipes = {
+        metal_pipeline(model, @"kipp_fa_panel_gather"),
+        metal_pipeline(model, @"kipp_fa_panel_qk"),
+        metal_pipeline(model, @"kipp_fa_panel_softmax"),
+        metal_pipeline(model, @"kipp_fa_panel_pv"),
+        metal_pipeline(model, @"kipp_fa_panel_accumulate"),
+    };
+    metal_fa_panel_buffers bufs = {
+        .keyCache = kvSession.keyCache,
+        .valueCache = kvSession.valueCache,
+        .blockTable = kvSession.blockTable,
+        .keyPanel = workspace.faKeyPanel,
+        .valuePanel = workspace.faValuePanel,
+        .scores = workspace.faScores,
+        .probs = workspace.faProbs,
+        .outPanel = workspace.faOutPanel,
+        .maxima = workspace.faMaxima,
+        .denominators = workspace.faDenominators,
+        .corrections = workspace.faCorrections,
+        .query = query,
+        .output = output,
+        .queryOffset = headStateOffset,
+        .outputOffset = headStateOffset,
+    };
+    metal_encode_fa_panels(target, &pipes, &bufs,
+                           model.config.attention_head_count, layer,
+                           startPosition, tokenCount, kvSession.slabPositions);
 }
 
 /*
@@ -3125,15 +3193,14 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
              * exercises the token_base>0 slice arithmetic every real
              * 512-token round uses, which a sub-128 token count never
              * reaches. PF_START puts all queries past the first panel so the
-             * cross-panel rescale runs, and kvLength's second panel is ragged
-             * (625 positions) to cover the padded K-loop. */
+             * cross-panel rescale runs, and the second panel is ragged
+             * (497 positions) to cover the padded K-loop. */
             enum {
                 PF_TOKENS = 149,
                 PF_START = 1500,
                 PF_CAPACITY = 1664,
                 PF_BLOCK_TOKENS = 32
             };
-            const uint32_t kvLength = PF_START + PF_TOKENS;
             const size_t kvValues = (size_t)PF_CAPACITY *
                                     KIPP_ATTENTION_HEAD_COUNT_KV *
                                     KIPP_ATTENTION_HEAD_DIM;
@@ -3235,97 +3302,38 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             if (metal_commit_and_wait(streamCommand, error) != 0) {
                 return -1;
             }
-            /* Panel sequence, mirroring metal_encode_gqa_panels' geometry on
-             * one serial encoder. */
-            uint32_t panelCount =
-                (kvLength + KIPP_METAL_FA_PANEL - 1u) / KIPP_METAL_FA_PANEL;
+            /* Panel sequence through the SAME shared encoder the engine
+             * uses, so the test cannot drift from the shipped geometry. */
+            metal_fa_panel_pipelines panelPipes = {
+                pipelines[@"kipp_fa_panel_gather"],
+                pipelines[@"kipp_fa_panel_qk"],
+                pipelines[@"kipp_fa_panel_softmax"],
+                pipelines[@"kipp_fa_panel_pv"],
+                pipelines[@"kipp_fa_panel_accumulate"],
+            };
+            metal_fa_panel_buffers panelBufs = {
+                .keyCache = keyCache,
+                .valueCache = valueCache,
+                .blockTable = blockTable,
+                .keyPanel = keyPanel,
+                .valuePanel = valuePanel,
+                .scores = scores,
+                .probs = probs,
+                .outPanel = outPanel,
+                .maxima = maxima,
+                .denominators = denominators,
+                .corrections = corrections,
+                .query = queryBuffer,
+                .output = panelOut,
+                .queryOffset = 0,
+                .outputOffset = 0,
+            };
             id<MTLCommandBuffer> panelCommand = [queue commandBuffer];
             id<MTLComputeCommandEncoder> panelEncoder =
                 [panelCommand computeCommandEncoder];
-            for (uint32_t panel = 0; panel < panelCount; ++panel) {
-                uint32_t base = panel * KIPP_METAL_FA_PANEL;
-                uint32_t width = MIN(KIPP_METAL_FA_PANEL, kvLength - base);
-                metal_fa_panel_params panelParams = {
-                    0,
-                    PF_START,
-                    PF_TOKENS,
-                    PF_CAPACITY,
-                    base,
-                    width,
-                    (width + 31u) & ~31u,
-                    panel == 0u ? 1u : 0u,
-                    panel + 1u == panelCount ? 1u : 0u,
-                };
-                metal_enc_threads(
-                    panelEncoder, pipelines[@"kipp_fa_panel_gather"],
-                    KIPP_ATTENTION_HEAD_COUNT_KV * KIPP_ATTENTION_HEAD_DIM,
-                    panelParams.panel_width32,
-                    ^(id<MTLComputeCommandEncoder> encoder) {
-                      [encoder setBuffer:keyCache offset:0 atIndex:0];
-                      [encoder setBuffer:valueCache offset:0 atIndex:1];
-                      [encoder setBuffer:keyPanel offset:0 atIndex:2];
-                      [encoder setBuffer:valuePanel offset:0 atIndex:3];
-                      [encoder setBytes:&panelParams
-                                 length:sizeof(panelParams)
-                                atIndex:4];
-                      [encoder setBuffer:blockTable offset:0 atIndex:5];
-                    });
-                metal_enc_groups_3d(
-                    panelEncoder, pipelines[@"kipp_fa_panel_qk"],
-                    (PF_TOKENS + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
-                        KIPP_METAL_FA_PANEL_TOKEN_TILE,
-                    (width + KIPP_METAL_FA_PANEL_POS_TILE - 1u) /
-                        KIPP_METAL_FA_PANEL_POS_TILE,
-                    KIPP_TEST_Q_HEADS, KIPP_METAL_GROUP_THREADS,
-                    ^(id<MTLComputeCommandEncoder> encoder) {
-                      [encoder setBuffer:keyPanel offset:0 atIndex:0];
-                      [encoder setBuffer:queryBuffer offset:0 atIndex:1];
-                      [encoder setBuffer:scores offset:0 atIndex:2];
-                      [encoder setBytes:&panelParams
-                                 length:sizeof(panelParams)
-                                atIndex:3];
-                    });
-                metal_enc_groups_3d(
-                    panelEncoder, pipelines[@"kipp_fa_panel_softmax"],
-                    PF_TOKENS, KIPP_TEST_Q_HEADS, 1, 32,
-                    ^(id<MTLComputeCommandEncoder> encoder) {
-                      [encoder setBuffer:scores offset:0 atIndex:0];
-                      [encoder setBuffer:probs offset:0 atIndex:1];
-                      [encoder setBuffer:maxima offset:0 atIndex:2];
-                      [encoder setBuffer:denominators offset:0 atIndex:3];
-                      [encoder setBuffer:corrections offset:0 atIndex:4];
-                      [encoder setBytes:&panelParams
-                                 length:sizeof(panelParams)
-                                atIndex:5];
-                    });
-                metal_enc_groups_3d(
-                    panelEncoder, pipelines[@"kipp_fa_panel_pv"],
-                    (PF_TOKENS + KIPP_METAL_FA_PANEL_TOKEN_TILE - 1u) /
-                        KIPP_METAL_FA_PANEL_TOKEN_TILE,
-                    KIPP_ATTENTION_HEAD_DIM / KIPP_METAL_FA_PANEL_POS_TILE,
-                    KIPP_TEST_Q_HEADS, KIPP_METAL_GROUP_THREADS,
-                    ^(id<MTLComputeCommandEncoder> encoder) {
-                      [encoder setBuffer:valuePanel offset:0 atIndex:0];
-                      [encoder setBuffer:probs offset:0 atIndex:1];
-                      [encoder setBuffer:outPanel offset:0 atIndex:2];
-                      [encoder setBytes:&panelParams
-                                 length:sizeof(panelParams)
-                                atIndex:3];
-                    });
-                metal_enc_threads(
-                    panelEncoder,
-                    pipelines[@"kipp_fa_panel_accumulate"],
-                    (NSUInteger)KIPP_TEST_Q_HEADS * KIPP_ATTENTION_HEAD_DIM,
-                    PF_TOKENS, ^(id<MTLComputeCommandEncoder> encoder) {
-                      [encoder setBuffer:outPanel offset:0 atIndex:0];
-                      [encoder setBuffer:panelOut offset:0 atIndex:1];
-                      [encoder setBuffer:corrections offset:0 atIndex:2];
-                      [encoder setBuffer:denominators offset:0 atIndex:3];
-                      [encoder setBytes:&panelParams
-                                 length:sizeof(panelParams)
-                                atIndex:4];
-                    });
-            }
+            metal_encode_fa_panels(panelEncoder, &panelPipes, &panelBufs,
+                                   KIPP_TEST_Q_HEADS, 0, PF_START, PF_TOKENS,
+                                   PF_CAPACITY);
             [panelEncoder endEncoding];
             if (metal_commit_and_wait(panelCommand, error) != 0) {
                 return -1;
