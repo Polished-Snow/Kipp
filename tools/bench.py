@@ -24,6 +24,7 @@ from _provenance import (  # noqa: E402
     engine_metadata,
     hardware_metadata,
     model_metadata,
+    require_steady_power,
 )
 
 METRIC_PATTERN = re.compile(
@@ -187,6 +188,12 @@ def run_once(
         command += ["--kv-quant", kv_quant]
     if requested_backend == "cuda" and nvidia_smi is None:
         nvidia_smi = shutil.which("nvidia-smi")
+    # Refuse before spending the run: battery, Low Power Mode, and
+    # underpowered adapters all silently power-limit the GPU (see
+    # _provenance.require_steady_power). Checking after the subprocess would
+    # still burn the measurement and, on a power state that flips mid-session,
+    # could pass a check for a run that executed while limited.
+    require_steady_power()
     _, stderr, peak_resident_bytes, peak_device_bytes = run_process(
         command, requested_backend, nvidia_smi
     )

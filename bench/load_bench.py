@@ -147,6 +147,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--output", default="bench/results/load.json")
     args = ap.parse_args()
+    # Refuse to record on battery, Low Power Mode, or an underpowered
+    # adapter -- all silently power-limit the GPU (shared with tools/bench.py).
+    _provenance.require_steady_power()
 
     rng = random.Random(args.seed)
     server = subprocess.Popen(

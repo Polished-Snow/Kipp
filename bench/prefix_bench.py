@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--words", type=int, default=1600)
     ap.add_argument("--output", default="bench/results/prefix-reuse.json")
     args = ap.parse_args()
+    # Refuse to record on battery, Low Power Mode, or an underpowered
+    # adapter -- all silently power-limit the GPU (shared with tools/bench.py).
+    _provenance.require_steady_power()
 
     prompt = " ".join(f"item{i}" for i in range(args.words))
     server = subprocess.Popen(
