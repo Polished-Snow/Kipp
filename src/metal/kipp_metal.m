@@ -687,6 +687,41 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
             });
         return;
     }
+    /* Quantized projections on the same tensor path: the kernel dequantizes
+     * each weight block into a threadgroup bf16 tile, then matmul2d. Same
+     * transposed grid and tile geometry as the bf16 tensor kernel. Gated at a
+     * full token tile so the dequant prologue is amortized (below it the
+     * simdgroup quant kernels win); still a pure function of token count, and
+     * every --prefill-metal gate part (512/200/138 tokens) clears it. Q8_0 KV
+     * and non-M5 / TENSOR_DISABLE fall through to the simdgroup kernels via
+     * tensorKernelAvailable. */
+    if (model.tensorKernelAvailable &&
+        (weight->type == KIPP_TENSOR_Q8_0 ||
+         weight->type == KIPP_TENSOR_AFFINE4_GS32) &&
+        tokenCount >= KIPP_METAL_MM_TENSOR_TOKEN_TILE) {
+        (void)workspace;
+        metal_matvec_params params = {rows, columns, tokenCount};
+        NSUInteger tokenGroups =
+            (tokenCount + KIPP_METAL_MM_TENSOR_TOKEN_TILE - 1u) /
+            KIPP_METAL_MM_TENSOR_TOKEN_TILE;
+        NSUInteger rowGroups =
+            (rows + KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP - 1u) /
+            KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP;
+        NSString *quantName =
+            weight->type == KIPP_TENSOR_Q8_0 ? @"kipp_matmul_q8_0_tensor"
+                                             : @"kipp_matmul_affine4_tensor";
+        metal_enc_groups(
+            target, metal_pipeline(model, quantName), tokenGroups, rowGroups,
+            KIPP_METAL_GROUP_THREADS, ^(id<MTLComputeCommandEncoder> encoder) {
+              [encoder setBuffer:model.weights
+                          offset:metal_weight_offset(model, weight)
+                         atIndex:0];
+              [encoder setBuffer:input offset:0 atIndex:1];
+              [encoder setBuffer:output offset:0 atIndex:2];
+              [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            });
+        return;
+    }
     NSString *name = @"kipp_matmul_bf16";
     id<MTLBuffer> activations = workspace.staging;
     NSUInteger tokenTile = KIPP_METAL_MM_TOKEN_TILE;
@@ -1708,6 +1743,8 @@ static int metal_compile_pipelines(
     }
     if (tensorKernel) {
         tiles[@"kipp_matmul_bf16_tensor"] = @0;
+        tiles[@"kipp_matmul_q8_0_tensor"] = @0;
+        tiles[@"kipp_matmul_affine4_tensor"] = @0;
         tiles[@"kipp_fa_panel_gather"] = @0;
         tiles[@"kipp_fa_panel_qk"] = @0;
         tiles[@"kipp_fa_panel_softmax"] = @0;
@@ -2919,6 +2956,148 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             free(weightsHost);
             free(inputHost);
             free(expected);
+            if (status != 0) {
+                return -1;
+            }
+        }
+
+        if (caps.tensor) {
+            /* Quant tensor-path matmul against an exact-integer reference.
+             * The dequantized weights are bf16-exact (0.5*int8, 0.5*nibble-3.5)
+             * and the activations are small integers, so both matmul2d operands
+             * are bf16-representable and the result is exact despite matmul2d's
+             * internal f32->bf16 source truncation — tolerance 0.0. Ragged 72
+             * rows exercises the manual dequant row-guard (no production
+             * projection is non-64-aligned) and 133 tokens spans two 128-token
+             * tiles; columns stay 32-block-aligned. */
+            enum {
+                QT_ROWS = 72,
+                QT_COLS = 64,
+                QT_TOKENS = 133,
+                QT_BLOCKS = QT_COLS / 32,
+                QT_Q8_ROW_BYTES = QT_BLOCKS * 34,
+                QT_A4_ROW_BYTES = QT_BLOCKS * 20
+            };
+            uint8_t *q8Host = calloc(QT_ROWS, QT_Q8_ROW_BYTES);
+            uint8_t *a4Host = calloc(QT_ROWS, QT_A4_ROW_BYTES);
+            float *inputHost =
+                calloc((size_t)QT_TOKENS * QT_COLS, sizeof(*inputHost));
+            float *q8Expected =
+                calloc((size_t)QT_TOKENS * QT_ROWS, sizeof(*q8Expected));
+            float *a4Expected =
+                calloc((size_t)QT_TOKENS * QT_ROWS, sizeof(*a4Expected));
+            if (q8Host == NULL || a4Host == NULL || inputHost == NULL ||
+                q8Expected == NULL || a4Expected == NULL) {
+                free(q8Host);
+                free(a4Host);
+                free(inputHost);
+                free(q8Expected);
+                free(a4Expected);
+                return metal_fail(error, KIPP_ERROR_MEMORY,
+                                  "quant tensor matmul test allocation failed");
+            }
+            for (uint32_t t = 0; t < QT_TOKENS; ++t) {
+                for (uint32_t c = 0; c < QT_COLS; ++c) {
+                    inputHost[t * QT_COLS + c] = (float)((int)((t + c) % 5) - 2);
+                }
+            }
+            for (uint32_t r = 0; r < QT_ROWS; ++r) {
+                for (uint32_t b = 0; b < QT_BLOCKS; ++b) {
+                    uint8_t *blk = q8Host + r * QT_Q8_ROW_BYTES + b * 34;
+                    metal_test_store_fp16(blk, 0.5f);
+                    int8_t *qs = (int8_t *)(blk + 2);
+                    for (uint32_t j = 0; j < 32; ++j) {
+                        qs[j] = (int8_t)((int)((r + b + 3 * j) % 11) - 5);
+                    }
+                    uint8_t *grp = a4Host + r * QT_A4_ROW_BYTES + b * 20;
+                    for (uint32_t k = 0; k < 16; ++k) {
+                        uint8_t low = (uint8_t)((r + b + 2 * k) % 16);
+                        uint8_t high = (uint8_t)((r + 3 * b + 2 * k + 1) % 16);
+                        grp[k] = (uint8_t)(low | (high << 4));
+                    }
+                    metal_test_store_fp16(grp + 16, 0.5f);
+                    metal_test_store_fp16(grp + 18, -3.5f);
+                }
+            }
+            for (uint32_t t = 0; t < QT_TOKENS; ++t) {
+                for (uint32_t r = 0; r < QT_ROWS; ++r) {
+                    float q8Sum = 0.0f;
+                    float a4Sum = 0.0f;
+                    for (uint32_t c = 0; c < QT_COLS; ++c) {
+                        uint32_t b = c / 32;
+                        uint32_t j = c % 32;
+                        float activation = inputHost[t * QT_COLS + c];
+                        float q8Weight =
+                            0.5f * (float)((int)((r + b + 3 * j) % 11) - 5);
+                        uint32_t k = j / 2;
+                        float nibble =
+                            (j % 2 == 0)
+                                ? (float)((r + b + 2 * k) % 16)
+                                : (float)((r + 3 * b + 2 * k + 1) % 16);
+                        float a4Weight = 0.5f * nibble - 3.5f;
+                        q8Sum += q8Weight * activation;
+                        a4Sum += a4Weight * activation;
+                    }
+                    q8Expected[t * QT_ROWS + r] = q8Sum;
+                    a4Expected[t * QT_ROWS + r] = a4Sum;
+                }
+            }
+            id<MTLBuffer> inputBuffer = [device
+                newBufferWithBytes:inputHost
+                            length:(NSUInteger)QT_TOKENS * QT_COLS *
+                                   sizeof(float)
+                           options:MTLResourceStorageModeShared];
+            metal_matvec_params params = {QT_ROWS, QT_COLS, QT_TOKENS};
+            struct {
+                const char *label;
+                NSString *pipeline;
+                uint8_t *weights;
+                NSUInteger weightBytes;
+                float *expected;
+            } cases[2] = {
+                {"matmul_q8_0_tensor", @"kipp_matmul_q8_0_tensor", q8Host,
+                 (NSUInteger)QT_ROWS * QT_Q8_ROW_BYTES, q8Expected},
+                {"matmul_affine4_tensor", @"kipp_matmul_affine4_tensor", a4Host,
+                 (NSUInteger)QT_ROWS * QT_A4_ROW_BYTES, a4Expected},
+            };
+            int status = 0;
+            for (int index = 0; index < 2 && status == 0; ++index) {
+                id<MTLBuffer> weightBuffer = [device
+                    newBufferWithBytes:cases[index].weights
+                                length:cases[index].weightBytes
+                               options:MTLResourceStorageModeShared];
+                id<MTLBuffer> outputBuffer = metal_new_shared_buffer(
+                    device, (NSUInteger)QT_TOKENS * QT_ROWS * sizeof(float));
+                id<MTLCommandBuffer> command = [queue commandBuffer];
+                /* Transposed grid, matching the bf16 tensor path. */
+                metal_dispatch_groups(
+                    command, pipelines[cases[index].pipeline],
+                    (QT_TOKENS + KIPP_METAL_MM_TENSOR_TOKEN_TILE - 1u) /
+                        KIPP_METAL_MM_TENSOR_TOKEN_TILE,
+                    (QT_ROWS + KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP - 1u) /
+                        KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP,
+                    KIPP_METAL_GROUP_THREADS,
+                    ^(id<MTLComputeCommandEncoder> encoder) {
+                      [encoder setBuffer:weightBuffer offset:0 atIndex:0];
+                      [encoder setBuffer:inputBuffer offset:0 atIndex:1];
+                      [encoder setBuffer:outputBuffer offset:0 atIndex:2];
+                      [encoder setBytes:&params
+                                 length:sizeof(params)
+                                atIndex:3];
+                    });
+                status = metal_commit_and_wait(command, error);
+                if (status == 0) {
+                    status = metal_expect_near(
+                        cases[index].label, outputBuffer.contents,
+                        cases[index].expected, (size_t)QT_TOKENS * QT_ROWS,
+                        0.0f, error);
+                }
+            }
+            free(q8Host);
+            free(a4Host);
+            free(inputHost);
+            free(q8Expected);
+            free(a4Expected);
             if (status != 0) {
                 return -1;
             }

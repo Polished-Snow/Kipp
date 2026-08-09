@@ -1519,6 +1519,149 @@ kernel void kipp_matmul_bf16_tensor(
 }
 
 /*
+ * Quantized projections on the tensor pipeline. Unlike kipp_matmul_bf16_tensor
+ * (which feeds matmul2d bf16 weights straight from device memory), a quant
+ * weight must be dequantized first, so each K-block is expanded into a
+ * threadgroup bf16 tile and matmul2d reads its weight operand from there --
+ * the same fused dequant-then-tensor design llama.cpp uses to reach ~2.3x the
+ * simdgroup quant kernels on M5. The dequant math is identical to the
+ * simdgroup kernels (kipp_matmul_q8_0 / kipp_matmul_affine4); only the
+ * consumer changes from simdgroup_multiply_accumulate to matmul2d. The tile is
+ * KIPP_MM_TENSOR_ROWS x KIPP_MM_BLOCK bf16 (== the tensor K-chunk), so the
+ * output tile geometry, dispatch grid, and geometry probe are shared verbatim
+ * with the bf16 tensor path. Activations stay FP32-direct. Row edges are
+ * guarded on the dequant read (registry rows are 64-aligned, but a manual
+ * dequant must not read past the weight buffer); ragged token/row edges on the
+ * store are clipped by the output tensor extents, and columns % 32 == 0.
+ */
+kernel void kipp_matmul_q8_0_tensor(
+        device const uchar *weight [[buffer(0)]],
+        device float *input [[buffer(1)]],
+        device float *output [[buffer(2)]],
+        constant MatvecParams &params [[buffer(3)]],
+        uint2 group_id [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const int columns = (int)params.columns;
+    const int rows = (int)params.rows;
+    const int tokens = (int)params.token_count;
+    const uint row_base = group_id.y * KIPP_MM_TENSOR_ROWS;
+    const int token_base = (int)(group_id.x * KIPP_MM_TENSOR_TOKEN_TILE);
+    const uint blocks = params.columns / KIPP_MM_BLOCK;
+
+    threadgroup bfloat wtile[KIPP_MM_TENSOR_ROWS * KIPP_MM_BLOCK];
+
+    auto tB = tensor(input, dextents<int32_t, 2>(columns, tokens),
+                     array<int, 2>({1, columns}));
+    auto tD = tensor(output, dextents<int32_t, 2>(rows, tokens),
+                     array<int, 2>({1, rows}));
+    auto tW = tensor(wtile,
+                     dextents<int32_t, 2>((int)KIPP_MM_BLOCK,
+                                          (int)KIPP_MM_TENSOR_ROWS),
+                     array<int, 2>({1, (int)KIPP_MM_BLOCK}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            (int)KIPP_MM_TENSOR_TOKEN_TILE, (int)KIPP_MM_TENSOR_ROWS,
+            (int)KIPP_MM_TENSOR_K_CHUNK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto accumulator =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tW),
+                                              float>();
+
+    /* 128 threads expand a 64-row x 32-col block: 16 values per thread. */
+    for (uint block = 0; block < blocks; ++block) {
+        for (uint v = 0; v < 16u; ++v) {
+            uint lin = tid * 16u + v;
+            uint r = lin / KIPP_MM_BLOCK;
+            uint c = lin % KIPP_MM_BLOCK;
+            if (row_base + r < uint(rows)) {
+                device const uchar *blk =
+                    weight + (ulong(row_base + r) * blocks + block) *
+                                 ulong(KIPP_MM_Q8_BLOCK_BYTES);
+                float d = kipp_fp16_bytes(blk);
+                device const char *qs = (device const char *)(blk + 2);
+                wtile[r * KIPP_MM_BLOCK + c] = bfloat(d * float(qs[c]));
+            } else {
+                wtile[r * KIPP_MM_BLOCK + c] = bfloat(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto weightSlice = tW.slice(0, 0);
+        auto activationSlice =
+            tB.slice((int)(block * KIPP_MM_BLOCK), token_base);
+        mm.run(activationSlice, weightSlice, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    accumulator.store(tD.slice((int)row_base, token_base));
+}
+
+kernel void kipp_matmul_affine4_tensor(
+        device const uchar *weight [[buffer(0)]],
+        device float *input [[buffer(1)]],
+        device float *output [[buffer(2)]],
+        constant MatvecParams &params [[buffer(3)]],
+        uint2 group_id [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const int columns = (int)params.columns;
+    const int rows = (int)params.rows;
+    const int tokens = (int)params.token_count;
+    const uint row_base = group_id.y * KIPP_MM_TENSOR_ROWS;
+    const int token_base = (int)(group_id.x * KIPP_MM_TENSOR_TOKEN_TILE);
+    const uint groups = params.columns / KIPP_MM_BLOCK;
+
+    threadgroup bfloat wtile[KIPP_MM_TENSOR_ROWS * KIPP_MM_BLOCK];
+
+    auto tB = tensor(input, dextents<int32_t, 2>(columns, tokens),
+                     array<int, 2>({1, columns}));
+    auto tD = tensor(output, dextents<int32_t, 2>(rows, tokens),
+                     array<int, 2>({1, rows}));
+    auto tW = tensor(wtile,
+                     dextents<int32_t, 2>((int)KIPP_MM_BLOCK,
+                                          (int)KIPP_MM_TENSOR_ROWS),
+                     array<int, 2>({1, (int)KIPP_MM_BLOCK}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            (int)KIPP_MM_TENSOR_TOKEN_TILE, (int)KIPP_MM_TENSOR_ROWS,
+            (int)KIPP_MM_TENSOR_K_CHUNK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto accumulator =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tW),
+                                              float>();
+
+    /* Each thread expands 16 contiguous column values (8 packed nibble
+     * bytes) of one row's group: w = scale*q + bias. */
+    for (uint quant_group = 0; quant_group < groups; ++quant_group) {
+        for (uint v = 0; v < 16u; ++v) {
+            uint lin = tid * 16u + v;
+            uint r = lin / KIPP_MM_BLOCK;
+            uint c = lin % KIPP_MM_BLOCK;
+            bfloat value = bfloat(0.0f);
+            if (row_base + r < uint(rows)) {
+                device const uchar *grp =
+                    weight + (ulong(row_base + r) * groups + quant_group) *
+                                 ulong(KIPP_MM_A4_GROUP_BYTES);
+                float scale = kipp_fp16_bytes(grp + 16);
+                float bias = kipp_fp16_bytes(grp + 18);
+                uchar packed = grp[c / 2u];
+                uint nibble = (c & 1u) ? (packed >> 4) : (packed & 0x0fu);
+                value = bfloat(scale * float(nibble) + bias);
+            }
+            wtile[r * KIPP_MM_BLOCK + c] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto weightSlice = tW.slice(0, 0);
+        auto activationSlice =
+            tB.slice((int)(quant_group * KIPP_MM_BLOCK), token_base);
+        mm.run(activationSlice, weightSlice, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    accumulator.store(tD.slice((int)row_base, token_base));
+}
+
+/*
  * Panel-flash attention: batched-prefill GQA on the tensor pipeline.
  *
  * The streaming and simdgroup FA kernels walk the paged KV cache in 32-position
@@ -1781,6 +1924,20 @@ kernel void kipp_tensor_probe_bf16(device bfloat *a [[buffer(0)]],
     auto mB = tB.slice(0, 0);
     auto mA = tA.slice(0, 0);
     mm.run(mB, mA, cT);
+    /* Also exercise a THREADGROUP-address-space weight operand: the quant
+     * tensor kernels feed matmul2d a dequantized threadgroup tile rather than
+     * device memory. A device could build the device-source op above yet
+     * reject this one, so probing it here keeps that failure a clean demotion
+     * to the simdgroup path instead of a hard pipeline error on the real
+     * quant-tensor kernel. */
+    threadgroup bfloat tg[16 * 32];
+    for (uint i = 0; i < 16u * 32u; ++i) {
+        tg[i] = a[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto tT = tensor(tg, dextents<int32_t, 2>(32, 16), array<int, 2>({1, 32}));
+    auto tgW = tT.slice(0, 0);
+    mm.run(mB, tgW, cT);
     auto tC = tensor(c, dextents<int32_t, 2>(16, 16), array<int, 2>({1, 16}));
     cT.store(tC.slice(0, 0));
 }
