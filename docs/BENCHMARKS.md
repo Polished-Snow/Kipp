@@ -66,11 +66,13 @@ record results from a fallback build. Current reference numbers
   median (the chassis cannot sustain long-context prefill); the 2,048
   figure sits above the 2026-07-30 3,679 mostly from cooler ambient, so
   the panel-flash gain is isolated in the same-session A/B (+37% at 12,800,
-  +11% at 2,048) rather than read off the absolute. Quantized prefill
-  (2026-07-30, unchanged — the quant paths are bit-frozen this release):
-  Q8_0 **1065 / 1213**, affine4 **1080 / 1214** on the simdgroup kernels
-  (their tensor variants are future work). The quantized kernels dequantize
-  each 32-weight block once per 64-token tile.
+  +11% at 2,048) rather than read off the absolute. Quantized prefill,
+  Metal 4 tensor path (348 / 2,048-token prompt, 2026-08-09; "Quantized
+  projections on the tensor units" below): Q8_0 **1940 / 2882**, affine4
+  **1960 / 2868** — 2.3× the simdgroup kernels at 2,048 tokens (recoverable
+  with `KIPP_METAL_TENSOR_DISABLE=1`), which stay the shipped path on pre-M5
+  devices. The quantized kernels dequantize each 32-weight block once per
+  tile.
 - Context scaling (Q8_0): decode 98.4 → 44.7 tok/s from a 3- to a
   12,800-token prompt after the split-K long-context path (`ctx-*.json`).
 - Model-size sweep (BF16 decode): 0.6B **269**, 4B **60.7**, 8B **33.5**
@@ -467,6 +469,59 @@ fingerprint **721ea327c1facaed** / NMSE **7.46e-07**, pooled NMSE
 own path. Every tensor-state value is **tighter** than the class it
 replaced, and paged placement invariance is bitwise through the panel
 gather.
+
+### Quantized projections on the tensor units: Q8_0/affine4 prefill 2.3× (2026-08-09)
+
+v0.0.6 put BF16 projections on the Metal 4 `mpp::tensor_ops` path; v0.0.8
+does the same for the quantized schemes, the last prefill path still on the
+simdgroup kernels.
+
+| Qwen3-4B, M5 Max, same-session A/B (both tensor-state) | simdgroup (`KIPP_METAL_TENSOR_DISABLE=1`) | quant-tensor (default) | ratio |
+|---|---|---|---|
+| Q8_0 prefill @2,048 | 1,247 | **2,875** | **2.31×** |
+| affine4 prefill @2,048 | 1,250 | **2,857** | 2.29× |
+| decode (both schemes) | — | — | unchanged (matvec) |
+
+Committed steady-state records (tensor path): Q8_0 **2,882 / 1,940** at
+2,048 / 348 tokens, affine4 **2,868 / 1,960** (MAD ≤0.3% at 2,048).
+
+Unlike the BF16 tensor kernel — which feeds `matmul2d` bf16 weights straight
+from device memory and stages nothing — a quant weight must be dequantized
+first. `kipp_matmul_q8_0_tensor` and `kipp_matmul_affine4_tensor` reuse the
+simdgroup kernels' cooperative dequant prologue (`kipp_fp16_bytes`; Q8_0
+`d*q`, affine4 `scale*q+bias`) to expand each K-block into a threadgroup
+bf16 tile (64 rows × 32), then run one `matmul2d` per block. The output tile
+geometry (64 × 128, K-chunk 32), transposed grid, and geometry probe are
+shared verbatim with the BF16 tensor kernel — nothing else moved.
+
+Design notes:
+- **The threadgroup-source `matmul2d` was the one open risk, and it holds.**
+  Every prior tensor kernel feeds `matmul2d` from device memory; the quant
+  design feeds a dequantized *threadgroup* tile. A Phase-0 spike confirmed
+  M5's `matmul2d` accepts a threadgroup-address-space weight operand and
+  returns bitwise-exact results; `kipp_tensor_probe_bf16` was extended to
+  exercise it so a device that can't build it demotes cleanly to the
+  simdgroup path rather than hard-failing.
+- **Selection is a pure function of token count** (quant-tensor at ≥ one
+  token tile, simdgroup below), so the paged/pooled bitwise gates keep
+  comparing a single kernel class. Q8_0-KV and non-M5 / `TENSOR_DISABLE`
+  stay on the simdgroup kernels, whose fingerprints are frozen.
+- **Decode is untouched** — the tensor path is prefill-only.
+- **No llama.cpp head-to-head this release.** llama-bench's quantized
+  prefill is thermally unstable on this laptop chassis: in one session the
+  same Q8_0 `-p 2048` measured 2,102 tok/s back-to-back and 4,336 cold (a
+  2× swing; the latter implausibly above llama.cpp's own bf16 4,100),
+  because llama-bench has no steady-state protocol. A fair same-session
+  quant comparison could not be taken, so the result above is Kipp-internal
+  (tensor vs the simdgroup kernel it replaces), steady-state, same-session.
+
+Per-kernel-class tripwires (M5 Max): tensor-state `--prefill-metal` q8_0
+fingerprint **33b605f4f5a05243** (nmse vs CPU oracle 9.2e-07), affine4
+**0953f2975a2692d5** (2.2e-06); the frozen simdgroup values
+(**7421c99f0af71365** q8_0, **0709c0eb78978e61** affine4) remain recoverable
+with `KIPP_METAL_TENSOR_DISABLE=1`, and both classes must be checked on their
+own path. bf16 (721ea327c1facaed) and pooled (6.05480037e-07) reprint
+unchanged. CUDA was not revalidated this campaign.
 
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 

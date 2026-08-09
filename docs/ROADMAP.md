@@ -4,6 +4,21 @@ This sequence is binding unless `ARCHITECTURE.md` is explicitly revised.
 Correctness gates every phase. Status notes summarize delivered work and
 link measured claims back to the benchmark records.
 
+**Status (v0.0.8):** The quantized projections join BF16 on the Metal 4
+tensor units. `kipp_matmul_q8_0_tensor` and `kipp_matmul_affine4_tensor`
+dequantize each weight block into a threadgroup bf16 tile and feed
+`matmul2d`, taking **Q8_0 prefill @2,048 from 1,247 to 2,875 tok/s (2.31×)**
+and affine4 1,250 → 2,857 (2.29×) — same-session A/B against the simdgroup
+kernels each replaces, decode untouched. Selection is a pure function of
+token count so the paged/pooled bitwise gates stay single-class; the
+simdgroup quant kernels stay frozen for non-M5 devices,
+`KIPP_METAL_TENSOR_DISABLE`, and Q8_0 KV, with tensor-state quant
+fingerprints re-baselined. No llama.cpp head-to-head this release —
+llama-bench's quantized prefill is thermally unstable on this laptop chassis
+(2.1k–4.4k across thermal states in one session), so a fair same-session
+comparison could not be taken. Remaining after this release: server prefill
+chunk tuning, a token-budget scheduler, CUDA revalidation, and 4-bit KV.
+
 **Status (v0.0.7):** Long-context prefill attention — the lever v0.0.6
 named as next — now runs on the Metal 4 tensor units. Batched-prefill GQA
 is processed one 1,024-KV-position panel at a time (block-table gather →
@@ -145,11 +160,13 @@ and placement invariance. The **Metal 4 `mpp::tensor_ops` matmul path** is
 delivered for BF16 projections on M5-class devices (prefill 2.80× at 2,048
 tokens, at parity with llama.cpp's tensor path; the previously planned
 K-blocked matmul was measured unnecessary — the simdgroup kernels were
-compute-bound, not traffic-bound), and **panel-flash attention** puts
+compute-bound, not traffic-bound), **panel-flash attention** puts
 long-context prefill GQA on the same tensor units (v0.0.7: +37% at 12,800
-tokens, leading llama.cpp 1.54× there). Remaining: quantized tensor-matmul
-variants, server prefill chunk tuning, a small-part panel-threshold, a
-token-budget scheduler, and 4-bit KV, each behind its own CPU-vs-GPU gate.
+tokens, leading llama.cpp 1.54× there), and the **quantized projections**
+followed (v0.0.8: Q8_0/affine4 prefill 2.3× via a dequant-to-threadgroup
+tile feeding `matmul2d`). Remaining: server prefill chunk tuning, a
+small-part panel-threshold, a token-budget scheduler, and 4-bit KV, each
+behind its own CPU-vs-GPU gate.
 Prompt-lookup and draft-model speculative decoding plus generated-token
 logprobs are already delivered.
 
