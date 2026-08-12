@@ -92,6 +92,12 @@ enum { KIPP_METAL_GPU_FAMILY_METAL4 = 5002 };
 typedef struct {
     BOOL matrix; /* bfloat simdgroup-matrix kernels */
     BOOL tensor; /* Metal 4 mpp::tensor_ops kernels */
+    /* Subset of `tensor`: the quant projections' matmul2d kernels feed a
+     * dequantized threadgroup-address-space operand, which a device can reject
+     * while still building the device-source bf16/panel kernels. Tracked
+     * separately so quant-tensor demotes to the simdgroup quant matmuls alone,
+     * rather than dragging down the whole tensor path or hard-failing load. */
+    BOOL quantTensor;
 } kipp_metal_kernel_caps;
 
 typedef struct {
@@ -208,6 +214,9 @@ typedef struct {
 @property(nonatomic) kipp_model_config config;
 @property(nonatomic) BOOL matrixKernelAvailable;
 @property(nonatomic) BOOL tensorKernelAvailable;
+/* Subset of tensorKernelAvailable: the quant-tensor projection kernels built
+ * (else quant projections use the simdgroup matmuls). */
+@property(nonatomic) BOOL quantTensorKernelAvailable;
 @property(nonatomic, strong) id<MTLBuffer> batchLogits;
 @property(nonatomic, strong) KippMetalSession *oracleSession;
 /* Shared KV slab for pooled sessions (kv_pool_blocks > 0). */
@@ -692,10 +701,11 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
      * transposed grid and tile geometry as the bf16 tensor kernel. Gated at a
      * full token tile so the dequant prologue is amortized (below it the
      * simdgroup quant kernels win); still a pure function of token count, and
-     * every --prefill-metal gate part (512/200/138 tokens) clears it. Q8_0 KV
-     * and non-M5 / TENSOR_DISABLE fall through to the simdgroup kernels via
-     * tensorKernelAvailable. */
-    if (model.tensorKernelAvailable &&
+     * every --prefill-metal gate part (512/200/138 tokens) clears it. Q8_0 KV,
+     * non-M5 / TENSOR_DISABLE, and a device where only the quant-tensor
+     * kernels failed to build fall through to the simdgroup kernels via
+     * quantTensorKernelAvailable. */
+    if (model.quantTensorKernelAvailable &&
         (weight->type == KIPP_TENSOR_Q8_0 ||
          weight->type == KIPP_TENSOR_AFFINE4_GS32) &&
         tokenCount >= KIPP_METAL_MM_TENSOR_TOKEN_TILE) {
@@ -1743,8 +1753,8 @@ static int metal_compile_pipelines(
     }
     if (tensorKernel) {
         tiles[@"kipp_matmul_bf16_tensor"] = @0;
-        tiles[@"kipp_matmul_q8_0_tensor"] = @0;
-        tiles[@"kipp_matmul_affine4_tensor"] = @0;
+        /* kipp_matmul_q8_0_tensor / kipp_matmul_affine4_tensor are built
+         * separately after the main loop (they may demote independently). */
         tiles[@"kipp_fa_panel_gather"] = @0;
         tiles[@"kipp_fa_panel_qk"] = @0;
         tiles[@"kipp_fa_panel_softmax"] = @0;
@@ -1810,6 +1820,59 @@ static int metal_compile_pipelines(
         }
         pipelines[name] = pipeline;
     }
+    /* Quant-tensor kernels build separately: the threadgroup-source matmul2d
+     * they need can fail on a device that builds the device-source bf16/panel
+     * kernels, so a failure here demotes quant projections to the simdgroup
+     * quant matmuls alone (quantTensor = NO) instead of failing model load or
+     * disabling the whole tensor path. KIPP_METAL_REQUIRE_TENSOR still hard-
+     * fails, matching the anti-silent-fallback discipline the gates rely on. */
+    BOOL quantTensor = NO;
+    if (tensorKernel) {
+        quantTensor = YES;
+        for (NSString *qname in @[ @"kipp_matmul_q8_0_tensor",
+                                   @"kipp_matmul_affine4_tensor" ]) {
+            MTLFunctionConstantValues *values =
+                [[MTLFunctionConstantValues alloc] init];
+            [values setConstantValue:&embeddingLength
+                                type:MTLDataTypeUInt
+                             atIndex:1];
+            [values setConstantValue:&queryHeadCount
+                                type:MTLDataTypeUInt
+                             atIndex:2];
+            NSError *quantError = nil;
+            id<MTLFunction> function =
+                [library newFunctionWithName:qname
+                              constantValues:values
+                                       error:&quantError];
+            id<MTLComputePipelineState> pipeline =
+                function == nil ? nil
+                                : [device newComputePipelineStateWithFunction:
+                                              function
+                                                                       error:
+                                                                           &quantError];
+            if (pipeline == nil ||
+                pipeline.maxTotalThreadsPerThreadgroup < KIPP_METAL_GROUP_THREADS) {
+                fprintf(stderr,
+                        "kipp-metal: quant tensor kernels unavailable (%s); "
+                        "using the simdgroup quant matmuls\n",
+                        quantError.localizedDescription.UTF8String);
+                quantTensor = NO;
+                [pipelines removeObjectForKey:@"kipp_matmul_q8_0_tensor"];
+                [pipelines removeObjectForKey:@"kipp_matmul_affine4_tensor"];
+                break;
+            }
+            pipelines[qname] = pipeline;
+        }
+        if (!quantTensor) {
+            const char *require = getenv("KIPP_METAL_REQUIRE_TENSOR");
+            if (require != NULL && require[0] == '1') {
+                return metal_fail(
+                    error, KIPP_ERROR_UNSUPPORTED,
+                    "KIPP_METAL_REQUIRE_TENSOR is set but the quant tensor "
+                    "kernels did not build");
+            }
+        }
+    }
     if (metal_verify_mm_geometry(device, pipelines, tensorKernel, error) != 0) {
         return -1;
     }
@@ -1817,6 +1880,7 @@ static int metal_compile_pipelines(
     *outPipelines = pipelines;
     outCaps->matrix = matrixKernel;
     outCaps->tensor = tensorKernel;
+    outCaps->quantTensor = quantTensor;
     return 0;
 }
 
@@ -1849,7 +1913,7 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
 
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
-        kipp_metal_kernel_caps caps = {NO, NO};
+        kipp_metal_kernel_caps caps = {NO, NO, NO};
         if (metal_compile_pipelines(device, view->config.embedding_length,
                                     view->config.attention_head_count,
                                     &library, &pipelines, &caps,
@@ -1876,6 +1940,7 @@ static int metal_model_create(const kipp_model_view *view, void **backendModel,
         model.config = view->config;
         model.matrixKernelAvailable = caps.matrix;
         model.tensorKernelAvailable = caps.tensor;
+        model.quantTensorKernelAvailable = caps.quantTensor;
         model.batchLogits = metal_new_shared_buffer(
             device, (NSUInteger)KIPP_METAL_LOGIT_ROWS * KIPP_VOCAB_SIZE *
                         sizeof(float));
@@ -2293,7 +2358,7 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
         }
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
-        kipp_metal_kernel_caps caps = {NO, NO};
+        kipp_metal_kernel_caps caps = {NO, NO, NO};
         if (metal_compile_pipelines(device, KIPP_TEST_EMBED,
                                     KIPP_TEST_Q_HEADS, &library, &pipelines,
                                     &caps, error) != 0) {
@@ -2961,15 +3026,21 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             }
         }
 
-        if (caps.tensor) {
+        if (caps.quantTensor) {
             /* Quant tensor-path matmul against an exact-integer reference.
              * The dequantized weights are bf16-exact (0.5*int8, 0.5*nibble-3.5)
              * and the activations are small integers, so both matmul2d operands
              * are bf16-representable and the result is exact despite matmul2d's
-             * internal f32->bf16 source truncation — tolerance 0.0. Ragged 72
-             * rows exercises the manual dequant row-guard (no production
-             * projection is non-64-aligned) and 133 tokens spans two 128-token
-             * tiles; columns stay 32-block-aligned. */
+             * internal f32->bf16 source truncation — tolerance 0.0. 133 tokens
+             * spans two 128-token tiles and columns are two 32-blocks, so the
+             * token/K tiling is covered; 72 rows leaves the top group ragged.
+             * NOTE: the ragged rows do NOT test the `row_base + r < rows`
+             * dequant read-guard -- those rows are clipped by the output
+             * tensor extents on store before reaching this comparison, so a
+             * broken guard would still pass here. The guard is defensive only
+             * (every registry projection is 64-row-aligned, so it never fires
+             * in production); its job is to avoid an out-of-bounds weight read,
+             * which no output check can observe. */
             enum {
                 QT_ROWS = 72,
                 QT_COLS = 64,
@@ -3600,7 +3671,7 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
         }
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
-        kipp_metal_kernel_caps caps = {NO, NO};
+        kipp_metal_kernel_caps caps = {NO, NO, NO};
         if (metal_compile_pipelines(device, KIPP_TEST_EMBED, KIPP_TEST_Q_HEADS,
                                     &library, &pipelines, &caps,
                                     error) != 0) {
@@ -3810,7 +3881,7 @@ int kipp_metal_run_fa_bench(kipp_error *error) {
         }
         id<MTLLibrary> library = nil;
         NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines = nil;
-        kipp_metal_kernel_caps caps = {NO, NO};
+        kipp_metal_kernel_caps caps = {NO, NO, NO};
         if (metal_compile_pipelines(device, KIPP_TEST_EMBED, KIPP_TEST_Q_HEADS,
                                     &library, &pipelines, &caps,
                                     error) != 0) {
