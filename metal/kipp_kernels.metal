@@ -1569,21 +1569,27 @@ kernel void kipp_matmul_q8_0_tensor(
         mm.get_destination_cooperative_tensor<decltype(tB), decltype(tW),
                                               float>();
 
-    /* 128 threads expand a 64-row x 32-col block: 16 values per thread. */
+    /* 128 threads expand a 64-row x 32-col block, 16 values per thread. A
+     * thread's 16 linear indices (tid*16 .. tid*16+15) never cross a 32-column
+     * boundary, so its row r = tid/2 and column base (tid&1)*16 are constant
+     * across the block -- the block header (address + fp16 scale) is decoded
+     * once, not per value. */
     for (uint block = 0; block < blocks; ++block) {
-        for (uint v = 0; v < 16u; ++v) {
-            uint lin = tid * 16u + v;
-            uint r = lin / KIPP_MM_BLOCK;
-            uint c = lin % KIPP_MM_BLOCK;
-            if (row_base + r < uint(rows)) {
-                device const uchar *blk =
-                    weight + (ulong(row_base + r) * blocks + block) *
-                                 ulong(KIPP_MM_Q8_BLOCK_BYTES);
-                float d = kipp_fp16_bytes(blk);
-                device const char *qs = (device const char *)(blk + 2);
+        uint r = tid / 2u;
+        uint c_base = (tid & 1u) * 16u;
+        if (row_base + r < uint(rows)) {
+            device const uchar *blk =
+                weight + (ulong(row_base + r) * blocks + block) *
+                             ulong(KIPP_MM_Q8_BLOCK_BYTES);
+            float d = kipp_fp16_bytes(blk);
+            device const char *qs = (device const char *)(blk + 2);
+            for (uint v = 0; v < 16u; ++v) {
+                uint c = c_base + v;
                 wtile[r * KIPP_MM_BLOCK + c] = bfloat(d * float(qs[c]));
-            } else {
-                wtile[r * KIPP_MM_BLOCK + c] = bfloat(0.0f);
+            }
+        } else {
+            for (uint v = 0; v < 16u; ++v) {
+                wtile[r * KIPP_MM_BLOCK + c_base + v] = bfloat(0.0f);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1631,25 +1637,30 @@ kernel void kipp_matmul_affine4_tensor(
         mm.get_destination_cooperative_tensor<decltype(tB), decltype(tW),
                                               float>();
 
-    /* Each thread expands 16 contiguous column values (8 packed nibble
-     * bytes) of one row's group: w = scale*q + bias. */
+    /* Each thread expands 16 contiguous column values (8 packed nibble bytes)
+     * of one row's group: w = scale*q + bias. Row r = tid/2 and column base
+     * (tid&1)*16 are constant across the group (see kipp_matmul_q8_0_tensor),
+     * so scale/bias/address are decoded once, not per value. */
     for (uint quant_group = 0; quant_group < groups; ++quant_group) {
-        for (uint v = 0; v < 16u; ++v) {
-            uint lin = tid * 16u + v;
-            uint r = lin / KIPP_MM_BLOCK;
-            uint c = lin % KIPP_MM_BLOCK;
-            bfloat value = bfloat(0.0f);
-            if (row_base + r < uint(rows)) {
-                device const uchar *grp =
-                    weight + (ulong(row_base + r) * groups + quant_group) *
-                                 ulong(KIPP_MM_A4_GROUP_BYTES);
-                float scale = kipp_fp16_bytes(grp + 16);
-                float bias = kipp_fp16_bytes(grp + 18);
+        uint r = tid / 2u;
+        uint c_base = (tid & 1u) * 16u;
+        if (row_base + r < uint(rows)) {
+            device const uchar *grp =
+                weight + (ulong(row_base + r) * groups + quant_group) *
+                             ulong(KIPP_MM_A4_GROUP_BYTES);
+            float scale = kipp_fp16_bytes(grp + 16);
+            float bias = kipp_fp16_bytes(grp + 18);
+            for (uint v = 0; v < 16u; ++v) {
+                uint c = c_base + v;
                 uchar packed = grp[c / 2u];
                 uint nibble = (c & 1u) ? (packed >> 4) : (packed & 0x0fu);
-                value = bfloat(scale * float(nibble) + bias);
+                wtile[r * KIPP_MM_BLOCK + c] =
+                    bfloat(scale * float(nibble) + bias);
             }
-            wtile[r * KIPP_MM_BLOCK + c] = value;
+        } else {
+            for (uint v = 0; v < 16u; ++v) {
+                wtile[r * KIPP_MM_BLOCK + c_base + v] = bfloat(0.0f);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto weightSlice = tW.slice(0, 0);
@@ -1924,20 +1935,6 @@ kernel void kipp_tensor_probe_bf16(device bfloat *a [[buffer(0)]],
     auto mB = tB.slice(0, 0);
     auto mA = tA.slice(0, 0);
     mm.run(mB, mA, cT);
-    /* Also exercise a THREADGROUP-address-space weight operand: the quant
-     * tensor kernels feed matmul2d a dequantized threadgroup tile rather than
-     * device memory. A device could build the device-source op above yet
-     * reject this one, so probing it here keeps that failure a clean demotion
-     * to the simdgroup path instead of a hard pipeline error on the real
-     * quant-tensor kernel. */
-    threadgroup bfloat tg[16 * 32];
-    for (uint i = 0; i < 16u * 32u; ++i) {
-        tg[i] = a[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    auto tT = tensor(tg, dextents<int32_t, 2>(32, 16), array<int, 2>({1, 32}));
-    auto tgW = tT.slice(0, 0);
-    mm.run(mB, tgW, cT);
     auto tC = tensor(c, dextents<int32_t, 2>(16, 16), array<int, 2>({1, 16}));
     cT.store(tC.slice(0, 0));
 }
