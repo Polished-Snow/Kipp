@@ -709,6 +709,47 @@ fingerprint <strong>33b605f4f5a05243</strong> (nmse vs CPU oracle 9.2e-07), affi
 with <code>KIPP_METAL_TENSOR_DISABLE=1</code>, and both classes must be checked on their
 own path. bf16 (721ea327c1facaed) and pooled (6.05480037e-07) reprint
 unchanged. CUDA was not revalidated this campaign.</p>
+<h3>Decode is weight-bandwidth-bound: the dequant-vectorization kill (2026-08-12)</h3>
+<p>With every prefill path on the tensor units (v0.0.6–v0.0.8), decode is the
+last axis where Kipp trails llama.cpp (~3–6% BF16/Q8_0, ~17% 4-bit). Decode
+generates one token at a time and <strong>streams every model weight per token</strong>, so
+it is memory-bandwidth-bound. Two independent signals confirm the floor:</p>
+<ul>
+<li><strong>The model-size sweep is a clean inverse-with-weight-bytes law</strong> — BF16
+decode 0.6B <strong>269</strong>, 4B <strong>60.7</strong>, 8B <strong>33.5</strong> tok/s. Halving the streamed
+bytes (Q8_0 vs BF16) buys ~1.6×, not the ~2× a compute-bound kernel would
+give — decode tracks bytes, not FLOPs.</li>
+<li><strong>A roofline check</strong>: 4B BF16 at ~60 tok/s streams ~8 GB/token × 60 ≈
+480 GB/s, a large fraction of the M5 Max's unified-memory bandwidth. The
+BF16 matvec already reads each weight once via <code>ushort4</code>/<code>float4</code> loads with
+thousands of threadgroups resident — there is no occupancy or vectorization
+slack to reclaim.</li>
+</ul>
+<p><strong>The one lever with apparent headroom — measured, and killed.</strong> The Q8_0 and
+affine4 decode matvec <em>inner loops</em> were scalar (<code>float(qs[j])*in[j]</code> per
+weight, per-byte nibble unpack) while BF16 was vectorized, and Q8_0 decoding
+only ~1.6× faster than BF16 despite moving ~half the bytes suggested the quant
+kernels were partly ALU-bound on dequant. We vectorized both inner loops
+(<code>float4</code> activation loads + FMA, mirroring the BF16 kernel; correctness-gated:
+operator suite 38/0, oracle NMSE 9.2e-07/2.2e-06, tensor fingerprints frozen)
+and ran a same-session A/B (vectorized vs scalar). A naive sequential A/B read
+Q8_0 +2.3%, but the <strong>BF16 control — an untouched, identical kernel — read
++2.8% between the two binaries</strong>, i.e. the +2.3% was measurement drift, not a
+win. An interleaved, drift-cancelling A/B settled it: <strong>drift-corrected Q8_0
+−2.6%</strong> (vectorized is if anything <em>slightly slower</em> — extra register pressure,
+no fewer bytes) and affine4 neutral. The change was reverted. Quant decode is
+byte-bound, not ALU-bound; the dequant loop is not the bottleneck.</p>
+<p>Conclusion: the BF16/Q8_0 decode gap vs llama.cpp is a <strong>weight-bandwidth
+floor</strong>, not an implementation defect — both engines stream the same bytes and
+land within a few percent. The larger 4-bit gap is <strong>partly the format</strong>:
+Kipp's affine4 carries a per-group scale <em>and</em> bias (higher quality), which
+Q4_0's scale-only zero-point (<code>−8</code>) avoids, costing an extra term per block;
+closing it would mean a new scale-only 4-bit scheme, not a kernel tweak.</p>
+<p>Measurement note: decode is immune to GPU-clock DVFS and other-GPU
+contention, but <strong>not to Low Power Mode</strong>, which throttles unified-memory
+bandwidth SoC-wide — under LPM a BF16 decode control read 12.5 vs 59.7 (5×
+low). Every decode A/B here carries an untouched BF16 control as the
+validity gate.</p>
 <h2>Optimized Metal kernels on Apple M5 (v0.0.1)</h2>
 <p>Measured on 2026-07-13 with Kipp v0.0.1's batched Metal path: one serial compute
 encoder per command buffer, up to 32 prefill tokens per batch,
