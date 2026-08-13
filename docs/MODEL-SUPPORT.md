@@ -167,15 +167,23 @@ single-buffer cap that its 15.26 GiB BF16 artifact exceeded. 14B (Q8 ≈ 15
 GiB) still exceeds the cap and awaits 4-bit; 8B/14B/32B Q8_0 remain CUDA- and
 CPU-runnable.
 
-## Quantization (AFFINE4_GS32)
+## Quantization (AFFINE4_GS32, SCALE4_GS32)
 
-Kipp also implements a private 4-bit affine format with 32-weight groups:
-16 packed nibbles plus fp16 scale and bias (5.0 bits per weight). CPU and
-Metal have dedicated decode paths, and the converter emits the format with
-`--quant affine4_gs32`. Unlike Q8_0, this is a Q4-class lossy format; model
-gates therefore use an explicit per-vector tolerance rather than presenting
-it as near-lossless. A checkpoint gains a quantized support claim only after
-its full-logit and backend gates pass.
+Kipp also implements two private 4-bit formats with 32-weight groups. Both
+have dedicated CPU and Metal decode/prefill paths; both are Q4-class lossy
+formats, so model gates use an explicit per-vector tolerance rather than
+presenting them as near-lossless. A checkpoint gains a quantized support
+claim only after its full-logit and backend gates pass.
+
+- **affine4_gs32** — 16 packed nibbles plus fp16 scale and bias (20-byte
+  group, 5.0 bpw), `w = scale·q + bias`. Asymmetric per-group min/max fit;
+  the higher-quality 4-bit option. `--quant affine4_gs32`.
+- **scale4_gs32** — 16 packed nibbles plus fp16 scale only (18-byte group,
+  4.5 bpw), `w = scale·(q − 8)`. Q4_0-class: scale-only, symmetric via the
+  implicit −8 zero-point. 10% less 4-bit weight traffic than affine4, so it
+  is the faster option on bandwidth-bound decode, at a small quality cost.
+  `--quant scale4_gs32`. (Decode/prefill/quality numbers are recorded once a
+  converted artifact is measured in a steady-state session.)
 
 ## Backends
 

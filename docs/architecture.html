@@ -173,20 +173,28 @@ published format and Kipp's deliberately small required subset.</p>
 <h3>Weight quantization</h3>
 <p>An artifact may quantize the seven per-layer projection tensors while
 keeping the token embedding, lm_head, and all norms in BF16. A
-<code>kipp.quant.scheme</code> metadata string (<code>bf16</code>, <code>q8_0</code>, or <code>affine4_gs32</code>)
-records the scheme, and the tensor directory carries the per-tensor type;
-the loader validates both. Two formats, both operating on 32-weight blocks
-with <code>columns % 32 == 0</code> (true for every family dimension):</p>
+<code>kipp.quant.scheme</code> metadata string (<code>bf16</code>, <code>q8_0</code>, <code>affine4_gs32</code>, or
+<code>scale4_gs32</code>) records the scheme, and the tensor directory carries the
+per-tensor type; the loader validates both. Three quantized formats, all
+operating on 32-weight blocks with <code>columns % 32 == 0</code> (true for every family
+dimension):</p>
 <ul>
 <li><strong>Q8_0</strong> — <code>{fp16 scale; int8 qs[32]}</code>, 34 bytes/block (8.5 bpw),
 <code>w = scale·q</code>. Near-lossless (full-logit NMSE under the BF16 gate bound).</li>
 <li><strong>AFFINE4_GS32</strong> — <code>{16 packed nibbles; fp16 scale; fp16 bias}</code>, 20
-bytes/group (5.0 bpw), <code>w = scale·q + bias</code>, <code>q ∈ [0,15]</code>. Q4-class.</li>
+bytes/group (5.0 bpw), <code>w = scale·q + bias</code>, <code>q ∈ [0,15]</code>. Q4-class,
+asymmetric (per-group min/max fit).</li>
+<li><strong>SCALE4_GS32</strong> — <code>{16 packed nibbles; fp16 scale}</code>, 18 bytes/group
+(4.5 bpw), <code>w = scale·(q − 8)</code>, <code>q ∈ [0,15]</code>. Q4_0-class: scale-only,
+symmetric via the implicit −8 zero-point (no per-group bias). Trades a
+little quality for the smaller block — 10% less 4-bit weight traffic than
+affine4, which matters most for bandwidth-bound decode.</li>
 </ul>
 <p>The CPU reference dequantizes per block inside a type-dispatched matvec;
 Metal selects kernels by the weight tensor's type: token-tiled
-<code>kipp_matvec_q8_0</code>/<code>kipp_matvec_affine4</code> vector kernels for decode, and
-simdgroup-matrix <code>kipp_matmul_q8_0</code>/<code>kipp_matmul_affine4</code> kernels for
+<code>kipp_matvec_q8_0</code>/<code>kipp_matvec_affine4</code>/<code>kipp_matvec_scale4</code> vector kernels
+for decode, and simdgroup-matrix
+<code>kipp_matmul_q8_0</code>/<code>kipp_matmul_affine4</code>/<code>kipp_matmul_scale4</code> kernels for
 prefill (each 32-weight block dequantized once per 32-token tile, keeping
 quantized prefill at near-parity with BF16). Quantized artifacts
 gate as ordinary artifacts: argmax must match the BF16 reference exactly,

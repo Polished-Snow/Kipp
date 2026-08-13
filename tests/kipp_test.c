@@ -571,6 +571,18 @@ static void test_quant_matvec(void) {
     float a4_out = 0.0f;
     kipp_test_matvec_affine4_gs32(a4, a4_input, &a4_out, 1, 32);
     CHECK(nearly_equal(a4_out, -3.0f, 1.0e-6f));
+
+    /* SCALE4_GS32, one 32-group row (18 bytes, scale-only, w=scale*(q-8)):
+     * scale=0.25, q=[3,12,0..] -> packed[0]=0xC3; input=[8,2,5,0..].
+     * dot=3*8+12*2=48, actsum=15; out=0.25*(48 - 8*15) = -18.0. */
+    uint8_t s4[18] = {0};
+    s4[0] = 0xC3; /* q0=3 (lo), q1=12 (hi) */
+    s4[16] = 0x00;
+    s4[17] = 0x34; /* scale 0.25 */
+    float s4_input[32] = {8.0f, 2.0f, 5.0f};
+    float s4_out = 0.0f;
+    kipp_test_matvec_scale4_gs32(s4, s4_input, &s4_out, 1, 32);
+    CHECK(nearly_equal(s4_out, -18.0f, 1.0e-6f));
 }
 
 static void test_sample_ex(void) {
@@ -1310,12 +1322,15 @@ static int run_model_test(const char *model_path, const char *vector_directory) 
     /*
      * A quantized artifact is gated against the same BF16 reference, so its
      * full-logit NMSE reflects the quantization loss: Q8_0 is near-lossless
-     * (stays under the BF16 bound), but 4-bit affine needs a Q4-class bound.
-     * Argmax must still match the reference exactly.
+     * (stays under the BF16 bound), but the 4-bit schemes need a Q4-class
+     * bound. scale4_gs32 is scale-only/symmetric, so its loss is no smaller
+     * than affine4's, hence the same floor (raise it via nmse-max.txt if a
+     * measured run needs more headroom). Argmax must still match exactly.
      */
     kipp_model_info quant_info;
     if (kipp_model_get_info(model, &quant_info) == 0 &&
-        strcmp(quant_info.quant_scheme, "affine4_gs32") == 0 &&
+        (strcmp(quant_info.quant_scheme, "affine4_gs32") == 0 ||
+         strcmp(quant_info.quant_scheme, "scale4_gs32") == 0) &&
         nmse_max < 3.0e-2) {
         nmse_max = 3.0e-2;
     }

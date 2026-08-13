@@ -89,7 +89,7 @@ typedef struct {
     uint32_t context_length;
     float rope_theta;
     int tied_embeddings;
-    const char *quant_scheme; /* "bf16", "q8_0", or "affine4_gs32" */
+    const char *quant_scheme; /* "bf16", "q8_0", "affine4_gs32", or "scale4_gs32" */
     /* Generation should stop when it samples any of these tokens. */
     uint32_t stop_tokens[KIPP_MAX_STOP_TOKENS];
     uint32_t stop_token_count;
@@ -304,6 +304,8 @@ void kipp_test_matvec_q8_0(const uint8_t *weight, const float *input,
                            float *output, size_t rows, size_t columns);
 void kipp_test_matvec_affine4_gs32(const uint8_t *weight, const float *input,
                                    float *output, size_t rows, size_t columns);
+void kipp_test_matvec_scale4_gs32(const uint8_t *weight, const float *input,
+                                  float *output, size_t rows, size_t columns);
 int kipp_test_checked_add_size(size_t left, size_t right, size_t *result);
 int kipp_test_checked_multiply_size(size_t left, size_t right, size_t *result);
 uint64_t kipp_test_kv_cache_bytes(uint32_t block_count, uint32_t capacity);

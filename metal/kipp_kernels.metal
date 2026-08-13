@@ -367,6 +367,58 @@ kernel void kipp_matvec_affine4(device const uchar *weight [[buffer(0)]],
     }
 }
 
+/*
+ * SCALE4_GS32 matvec, token-tiled. Weight is rows * (columns/32) groups of
+ * 18 bytes: 16 packed nibbles (q[2k]=lo, q[2k+1]=hi) then fp16 scale.
+ * Scale-only, symmetric via the implicit -8 zero-point: w = scale*(q - 8),
+ * folded per group as scale*(dot - 8*actsum).
+ */
+kernel void kipp_matvec_scale4(device const uchar *weight [[buffer(0)]],
+                               device const float *input [[buffer(1)]],
+                               device float *output [[buffer(2)]],
+                               constant MatvecParams &params [[buffer(3)]],
+                               uint2 group_id [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint group [[simdgroup_index_in_threadgroup]]) {
+    uint row = group_id.x * KIPP_MV_ROWS_PER_GROUP + group;
+    if (row >= params.rows) {
+        return;
+    }
+    uint token_base = group_id.y * KIPP_MV_TOKEN_TILE;
+    uint tile = min(KIPP_MV_TOKEN_TILE, params.token_count - token_base);
+    uint groups = params.columns / 32u;
+    device const uchar *weight_row = weight + ulong(row) * groups * 18ul;
+    float accumulators[KIPP_MV_MAX_TILE] = {0.0f};
+    for (uint g = lane; g < groups; g += 32u) {
+        device const uchar *grp = weight_row + ulong(g) * 18ul;
+        float scale = kipp_fp16_bytes(grp + 16);
+        for (uint t = 0; t < KIPP_MV_TOKEN_TILE; ++t) {
+            if (t < tile) {
+                device const float *in =
+                    input + ulong(token_base + t) * params.columns + g * 32u;
+                float dot = 0.0f;
+                float actsum = 0.0f;
+                for (uint k = 0; k < 16u; ++k) {
+                    uchar p = grp[k];
+                    float a0 = in[2 * k];
+                    float a1 = in[2 * k + 1];
+                    dot += float(p & 0x0fu) * a0 + float(p >> 4) * a1;
+                    actsum += a0 + a1;
+                }
+                accumulators[t] += scale * (dot - 8.0f * actsum);
+            }
+        }
+    }
+    for (uint t = 0; t < KIPP_MV_TOKEN_TILE; ++t) {
+        if (t < tile) {
+            float total = simd_sum(accumulators[t]);
+            if (lane == 0) {
+                output[ulong(token_base + t) * params.rows + row] = total;
+            }
+        }
+    }
+}
+
 /* One thread per (KV value, token). */
 /* Logical position -> physical KV slot through the session's page table:
  * block_table[pos >> 5] selects the 32-slot physical block, (pos & 31) the
@@ -968,6 +1020,7 @@ constant uint KIPP_MM_BLOCK = 32;
 constant uint KIPP_MM_STAGED_STRIDE = KIPP_MM_BLOCK + 1;
 constant uint KIPP_MM_Q8_BLOCK_BYTES = 34;
 constant uint KIPP_MM_A4_GROUP_BYTES = 20;
+constant uint KIPP_MM_S4_GROUP_BYTES = 18;
 
 kernel void kipp_matmul_q8_0(device const uchar *weight [[buffer(0)]],
                              device const float *input [[buffer(1)]],
@@ -1138,6 +1191,128 @@ kernel void kipp_matmul_affine4(device const uchar *weight [[buffer(0)]],
                 scale * float(packed & 0x0fu) + bias;
             staged_weights[dq_row][2u * (dq_byte + k) + 1u] =
                 scale * float(packed >> 4) + bias;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint column = quant_group * KIPP_MM_BLOCK;
+        for (uint sub = 0; sub < KIPP_MM_BLOCK / 8u; ++sub) {
+            simdgroup_float8x8 activation[KIPP_MM_QUANT_TOKEN_FRAGMENTS];
+            for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
+                if (tf < token_blocks) {
+                    simdgroup_load(activation[tf],
+                                   input + (ulong)(token_base + tf * 8u) *
+                                               params.columns +
+                                       column + sub * 8u,
+                                   params.columns, 0, true);
+                }
+            }
+            for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS;
+                 ++row_block) {
+                simdgroup_float8x8 weights;
+                simdgroup_load(
+                    weights,
+                    &staged_weights[row_block * 8u][sub * 8u],
+                    KIPP_MM_STAGED_STRIDE);
+                for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
+                    if (tf < token_blocks) {
+                        simdgroup_multiply_accumulate(
+                            accumulators[row_block][tf], weights,
+                            activation[tf], accumulators[row_block][tf]);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
+        for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
+            uint sub_base = token_base + tf * 8u;
+            if (sub_base >= params.token_count) {
+                continue;
+            }
+            uint sub_tile = min(8u, params.token_count - sub_base);
+            if (sub_tile == 8u) {
+                simdgroup_store(accumulators[row_block][tf],
+                                output + (ulong)sub_base * params.rows +
+                                    row_base + row_block * 8u,
+                                params.rows, 0, true);
+            } else {
+                simdgroup_store(accumulators[row_block][tf], staged[group],
+                                8);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint index = lane; index < 64u; index += 32u) {
+                    uint row = index / 8u;
+                    uint token = index % 8u;
+                    if (token < sub_tile) {
+                        output[(ulong)(sub_base + token) * params.rows +
+                               row_base + row_block * 8u + row] =
+                            staged[group][index];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+
+/*
+ * SCALE4_GS32 simdgroup matmul. Mirrors kipp_matmul_affine4 but the 18-byte
+ * groups carry only a scale (no bias) and w = scale*(q - 8): the -8 zero-point
+ * folds into the dequantized staged tile, so the matmul body is unchanged.
+ */
+kernel void kipp_matmul_scale4(device const uchar *weight [[buffer(0)]],
+                               device const float *input [[buffer(1)]],
+                               device float *output [[buffer(2)]],
+                               constant MatvecParams &params [[buffer(3)]],
+                               uint2 group_id
+                                   [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint group [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float staged[KIPP_MM_SIMDGROUPS][64];
+    threadgroup float staged_weights[KIPP_MM_ROWS_PER_SIMDGROUP]
+                                    [KIPP_MM_STAGED_STRIDE];
+    uint row_base = group_id.x * KIPP_MM_ROWS_PER_SIMDGROUP;
+    /* Threadgroup-uniform, so it cannot strand the barriers below. */
+    if (row_base >= params.rows) {
+        return;
+    }
+    uint tile_base = group_id.y * KIPP_MM_QUANT_TOKEN_TILE;
+    /* See kipp_matmul_bf16: guards the unsigned wrap on an over-tall grid.
+     * Also threadgroup-uniform. */
+    if (tile_base >= params.token_count) {
+        return;
+    }
+    /* Each simdgroup owns a 16-token slice of the 64-token tile; a slice
+     * past the token count runs the loop for dequant and barriers only. */
+    uint token_base = tile_base + group * KIPP_MM_QUANT_SG_TOKEN_TILE;
+    uint tile = token_base < params.token_count
+                    ? min(KIPP_MM_QUANT_SG_TOKEN_TILE,
+                          params.token_count - token_base)
+                    : 0u;
+    uint groups = params.columns / KIPP_MM_BLOCK;
+
+    simdgroup_float8x8 accumulators[KIPP_MM_ROW_FRAGMENTS]
+                                   [KIPP_MM_QUANT_TOKEN_FRAGMENTS];
+    for (uint row_block = 0; row_block < KIPP_MM_ROW_FRAGMENTS; ++row_block) {
+        for (uint tf = 0; tf < KIPP_MM_QUANT_TOKEN_FRAGMENTS; ++tf) {
+            accumulators[row_block][tf] = simdgroup_float8x8(0.0f);
+        }
+    }
+    uint token_blocks = (tile + 7u) / 8u;
+    /* Thread t dequantizes nibble bytes 4*(t%4) .. 4*(t%4)+3 of row t/4's
+     * group (values 8*(t%4) .. 8*(t%4)+7): w = scale*(q - 8). */
+    uint dq_row = (group * 32u + lane) / 4u;
+    uint dq_byte = ((group * 32u + lane) % 4u) * 4u;
+    for (uint quant_group = 0; quant_group < groups; ++quant_group) {
+        device const uchar *grp = weight +
+            (ulong(row_base + dq_row) * groups + quant_group) *
+                ulong(KIPP_MM_S4_GROUP_BYTES);
+        float scale = kipp_fp16_bytes(grp + 16);
+        for (uint k = 0; k < 4u; ++k) {
+            uchar packed = grp[dq_byte + k];
+            staged_weights[dq_row][2u * (dq_byte + k)] =
+                scale * (float(packed & 0x0fu) - 8.0f);
+            staged_weights[dq_row][2u * (dq_byte + k) + 1u] =
+                scale * (float(packed >> 4) - 8.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint column = quant_group * KIPP_MM_BLOCK;
@@ -1656,6 +1831,76 @@ kernel void kipp_matmul_affine4_tensor(
                 uint nibble = (c & 1u) ? (packed >> 4) : (packed & 0x0fu);
                 wtile[r * KIPP_MM_BLOCK + c] =
                     bfloat(scale * float(nibble) + bias);
+            }
+        } else {
+            for (uint v = 0; v < 16u; ++v) {
+                wtile[r * KIPP_MM_BLOCK + c_base + v] = bfloat(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto weightSlice = tW.slice(0, 0);
+        auto activationSlice =
+            tB.slice((int)(quant_group * KIPP_MM_BLOCK), token_base);
+        mm.run(activationSlice, weightSlice, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    accumulator.store(tD.slice((int)row_base, token_base));
+}
+
+kernel void kipp_matmul_scale4_tensor(
+        device const uchar *weight [[buffer(0)]],
+        device float *input [[buffer(1)]],
+        device float *output [[buffer(2)]],
+        constant MatvecParams &params [[buffer(3)]],
+        uint2 group_id [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    const int columns = (int)params.columns;
+    const int rows = (int)params.rows;
+    const int tokens = (int)params.token_count;
+    const uint row_base = group_id.y * KIPP_MM_TENSOR_ROWS;
+    const int token_base = (int)(group_id.x * KIPP_MM_TENSOR_TOKEN_TILE);
+    const uint groups = params.columns / KIPP_MM_BLOCK;
+
+    threadgroup bfloat wtile[KIPP_MM_TENSOR_ROWS * KIPP_MM_BLOCK];
+
+    auto tB = tensor(input, dextents<int32_t, 2>(columns, tokens),
+                     array<int, 2>({1, columns}));
+    auto tD = tensor(output, dextents<int32_t, 2>(rows, tokens),
+                     array<int, 2>({1, rows}));
+    auto tW = tensor(wtile,
+                     dextents<int32_t, 2>((int)KIPP_MM_BLOCK,
+                                          (int)KIPP_MM_TENSOR_ROWS),
+                     array<int, 2>({1, (int)KIPP_MM_BLOCK}));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            (int)KIPP_MM_TENSOR_TOKEN_TILE, (int)KIPP_MM_TENSOR_ROWS,
+            (int)KIPP_MM_TENSOR_K_CHUNK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto accumulator =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tW),
+                                              float>();
+
+    /* Each thread expands 16 contiguous column values (8 packed nibble bytes)
+     * of one row's group: w = scale*(q - 8). Row r = tid/2 and column base
+     * (tid&1)*16 are constant across the group (see kipp_matmul_q8_0_tensor),
+     * so scale/address are decoded once, not per value. The -8 zero-point
+     * folds into each dequantized tile value, so matmul2d is unchanged. */
+    for (uint quant_group = 0; quant_group < groups; ++quant_group) {
+        uint r = tid / 2u;
+        uint c_base = (tid & 1u) * 16u;
+        if (row_base + r < uint(rows)) {
+            device const uchar *grp =
+                weight + (ulong(row_base + r) * groups + quant_group) *
+                             ulong(KIPP_MM_S4_GROUP_BYTES);
+            float scale = kipp_fp16_bytes(grp + 16);
+            for (uint v = 0; v < 16u; ++v) {
+                uint c = c_base + v;
+                uchar packed = grp[c / 2u];
+                uint nibble = (c & 1u) ? (packed >> 4) : (packed & 0x0fu);
+                wtile[r * KIPP_MM_BLOCK + c] =
+                    bfloat(scale * (float(nibble) - 8.0f));
             }
         } else {
             for (uint v = 0; v < 16u; ++v) {

@@ -20,6 +20,7 @@ GGUF_VERSION = 3
 GGML_TYPE_BF16 = 30
 GGML_TYPE_Q8_0 = 8
 GGML_TYPE_AFFINE4_GS32 = 1000  # Kipp-private id
+GGML_TYPE_SCALE4_GS32 = 1001  # Kipp-private id
 QUANT_BLOCK = 32
 
 # The seven per-layer projection tensors carry the model's quant scheme;
@@ -38,6 +39,7 @@ QUANT_TYPE_ID = {
     "bf16": GGML_TYPE_BF16,
     "q8_0": GGML_TYPE_Q8_0,
     "affine4_gs32": GGML_TYPE_AFFINE4_GS32,
+    "scale4_gs32": GGML_TYPE_SCALE4_GS32,
 }
 
 
@@ -55,6 +57,8 @@ def type_byte_count(type_id: int, element_count: int) -> int:
         return blocks * 34
     if type_id == GGML_TYPE_AFFINE4_GS32:
         return blocks * 20
+    if type_id == GGML_TYPE_SCALE4_GS32:
+        return blocks * 18
     raise ValueError(f"unknown tensor type id {type_id}")
 
 
@@ -112,12 +116,41 @@ def quantize_affine4_gs32(weights_f32) -> bytes:
     return out.tobytes()
 
 
+def quantize_scale4_gs32(weights_f32) -> bytes:
+    """(rows, cols) f32 -> SCALE4_GS32 groups (18 bytes): 16 packed nibbles
+    + fp16 scale, w = scale*(q - 8), q in [0,15]. Scale-only (no per-group
+    bias), symmetric via the implicit -8 zero-point. Mirrors llama.cpp Q4_0:
+    scale = (signed value of max magnitude) / -8, so the peak element is exact
+    and the stored fp16 scale can be negative. Quantizes against the fp16-
+    rounded scale so encoder and decoder agree."""
+    import numpy as np
+
+    w = np.ascontiguousarray(weights_f32, dtype=np.float32)
+    rows, cols = w.shape
+    groups = w.reshape(rows * cols // QUANT_BLOCK, QUANT_BLOCK)
+    amax_idx = np.argmax(np.abs(groups), axis=1)
+    signed_max = groups[np.arange(groups.shape[0]), amax_idx]
+    scale = (signed_max / -8.0).astype(np.float16)
+    sf = scale.astype(np.float32)
+    inv = np.where(sf != 0.0, 1.0 / sf, 0.0)
+    q = np.clip(np.rint(groups * inv[:, None] + 8.0), 0, 15).astype(np.uint8)
+    lo = q[:, 0::2]
+    hi = q[:, 1::2]
+    packed = (lo | (hi << 4)).astype(np.uint8)  # (ngroups, 16)
+    out = np.empty((groups.shape[0], 18), dtype=np.uint8)
+    out[:, 0:16] = packed
+    out[:, 16:18] = scale.view(np.uint8).reshape(-1, 2)
+    return out.tobytes()
+
+
 def quantize_tensor(raw: bytes, shape: tuple[int, ...], quant: str) -> bytes:
     weights = bf16_bytes_to_f32(raw, shape)
     if quant == "q8_0":
         return quantize_q8_0(weights)
     if quant == "affine4_gs32":
         return quantize_affine4_gs32(weights)
+    if quant == "scale4_gs32":
+        return quantize_scale4_gs32(weights)
     raise ValueError(f"unknown quant scheme {quant}")
 
 UINT8 = 0
@@ -604,7 +637,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="qwen3-4b-base")
     parser.add_argument(
-        "--quant", choices=["bf16", "q8_0", "affine4_gs32"], default="bf16"
+        "--quant",
+        choices=["bf16", "q8_0", "affine4_gs32", "scale4_gs32"],
+        default="bf16",
     )
     parser.add_argument("--source", type=pathlib.Path, default=None)
     parser.add_argument("--output", type=pathlib.Path, default=None)
