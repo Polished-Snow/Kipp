@@ -1,6 +1,6 @@
 [project]
 name = "kipp-tools"
-version = "0.0.8"
+version = "0.0.9"
 description = "Tooling-only dependencies for Kipp model preparation"
 requires-python = ">=3.12,<3.14"
 dependencies = [
