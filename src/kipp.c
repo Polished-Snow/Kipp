@@ -844,6 +844,14 @@ static bool tensor_type_byte_count(kipp_tensor_type type,
         }
         *bytes = element_count / KIPP_QUANT_BLOCK * KIPP_AFFINE4_GROUP_BYTES;
         return true;
+    case KIPP_TENSOR_SCALE4_GS32:
+        if (element_count % KIPP_QUANT_BLOCK != 0 ||
+            element_count / KIPP_QUANT_BLOCK > UINT64_MAX /
+                                                   KIPP_SCALE4_GROUP_BYTES) {
+            return false;
+        }
+        *bytes = element_count / KIPP_QUANT_BLOCK * KIPP_SCALE4_GROUP_BYTES;
+        return true;
     }
     return false;
 }
@@ -908,6 +916,8 @@ static int bind_model_weights(kipp_model_view *view, gguf_tensor_info *tensors,
         projection_type = KIPP_TENSOR_Q8_0;
     } else if (config->quant_scheme == KIPP_QUANT_AFFINE4_GS32) {
         projection_type = KIPP_TENSOR_AFFINE4_GS32;
+    } else if (config->quant_scheme == KIPP_QUANT_SCALE4_GS32) {
+        projection_type = KIPP_TENSOR_SCALE4_GS32;
     }
 #define BIND_VECTOR(target, tensor_name, length)                                  \
     do {                                                                          \
@@ -1088,6 +1098,8 @@ static int parse_model_mapping(kipp_model *model, kipp_error *error) {
         model->view.config.quant_scheme = KIPP_QUANT_Q8_0;
     } else if (strcmp(metadata.quant_scheme, "affine4_gs32") == 0) {
         model->view.config.quant_scheme = KIPP_QUANT_AFFINE4_GS32;
+    } else if (strcmp(metadata.quant_scheme, "scale4_gs32") == 0) {
+        model->view.config.quant_scheme = KIPP_QUANT_SCALE4_GS32;
     } else {
         fail(error, KIPP_ERROR_UNSUPPORTED,
              "unknown quantization scheme '%s'", metadata.quant_scheme);
@@ -1357,8 +1369,9 @@ int kipp_model_get_info(const kipp_model *model, kipp_model_info *out_info) {
     out_info->rope_theta = config->rope_theta;
     out_info->tied_embeddings = config->tied_embeddings ? 1 : 0;
     out_info->quant_scheme =
-        config->quant_scheme == KIPP_QUANT_Q8_0        ? "q8_0"
+        config->quant_scheme == KIPP_QUANT_Q8_0           ? "q8_0"
         : config->quant_scheme == KIPP_QUANT_AFFINE4_GS32 ? "affine4_gs32"
+        : config->quant_scheme == KIPP_QUANT_SCALE4_GS32  ? "scale4_gs32"
                                                           : "bf16";
     for (uint32_t index = 0; index < spec->stop_token_count; ++index) {
         out_info->stop_tokens[index] = spec->stop_tokens[index];
@@ -2295,6 +2308,42 @@ static void matvec_affine4_gs32(const uint8_t *weight, const float *input,
     }
 }
 
+/*
+ * SCALE4_GS32: each 32-weight group is 16 packed nibbles (q[2k]=lo,
+ * q[2k+1]=hi) then a little-endian fp16 scale (18 bytes). Scale-only,
+ * symmetric via the implicit -8 zero-point: w = scale*(q - 8), so the group
+ * contributes scale*(sum(q_i*in_i) - 8*sum(in_i)) (the -8 folds into the
+ * activation-sum term that affine4 spends on its bias).
+ */
+static void matvec_scale4_gs32(const uint8_t *weight, const float *input,
+                               float *output, size_t rows, size_t columns) {
+    const size_t groups = columns / KIPP_QUANT_BLOCK;
+    for (size_t row = 0; row < rows; ++row) {
+        const uint8_t *group =
+            weight + row * groups * KIPP_SCALE4_GROUP_BYTES;
+        float sum = 0.0f;
+        for (size_t g = 0; g < groups; ++g) {
+            const uint8_t *packed = group;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, group + 16, sizeof(scale_bits));
+            float scale = fp16_to_float(scale_bits);
+            const float *in = input + g * KIPP_QUANT_BLOCK;
+            float dot = 0.0f;
+            float activation_sum = 0.0f;
+            for (size_t k = 0; k < 16; ++k) {
+                uint8_t byte = packed[k];
+                float lo = (float)(byte & 0x0fu);
+                float hi = (float)(byte >> 4);
+                dot += lo * in[2 * k] + hi * in[2 * k + 1];
+                activation_sum += in[2 * k] + in[2 * k + 1];
+            }
+            sum += scale * (dot - 8.0f * activation_sum);
+            group += KIPP_SCALE4_GROUP_BYTES;
+        }
+        output[row] = sum;
+    }
+}
+
 /* Dispatch a projection matvec on the weight tensor's quantization type. */
 static void matvec_tensor(const kipp_tensor_view *weight, const float *input,
                           float *output, size_t rows, size_t columns) {
@@ -2304,6 +2353,9 @@ static void matvec_tensor(const kipp_tensor_view *weight, const float *input,
         break;
     case KIPP_TENSOR_AFFINE4_GS32:
         matvec_affine4_gs32(weight->data, input, output, rows, columns);
+        break;
+    case KIPP_TENSOR_SCALE4_GS32:
+        matvec_scale4_gs32(weight->data, input, output, rows, columns);
         break;
     case KIPP_TENSOR_BF16:
     default:
@@ -4050,6 +4102,11 @@ void kipp_test_matvec_q8_0(const uint8_t *weight, const float *input,
 void kipp_test_matvec_affine4_gs32(const uint8_t *weight, const float *input,
                                    float *output, size_t rows, size_t columns) {
     matvec_affine4_gs32(weight, input, output, rows, columns);
+}
+
+void kipp_test_matvec_scale4_gs32(const uint8_t *weight, const float *input,
+                                  float *output, size_t rows, size_t columns) {
+    matvec_scale4_gs32(weight, input, output, rows, columns);
 }
 
 int kipp_test_checked_add_size(size_t left, size_t right, size_t *result) {

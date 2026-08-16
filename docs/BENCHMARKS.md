@@ -568,6 +568,55 @@ bandwidth SoC-wide — under LPM a BF16 decode control read 12.5 vs 59.7 (5×
 low). Every decode A/B here carries an untouched BF16 control as the
 validity gate.
 
+### Scale-only 4-bit (scale4_gs32): +4.5% decode over affine4, prefill parity (2026-08-14)
+
+The decode-kill section above named the remaining 4-bit lever: not a kernel
+tweak but a new **scale-only** format. `scale4_gs32` is it — 32-weight groups
+of 16 packed nibbles plus one fp16 scale (18 bytes, 4.5 bpw), symmetric via
+the implicit −8 zero-point: `w = scale·(q − 8)`. It drops affine4's per-group
+bias (20 → 18 bytes), so it is Q4_0-class where affine4 is Q4_1-class. The
+converter mirrors llama.cpp's Q4_0 (`scale = signed-max-magnitude / −8`,
+quantized against the fp16-rounded scale), and the three Metal kernels
+(matvec decode, simdgroup prefill, tensor prefill) reuse the affine4 shapes
+with the bias term removed and the −8 folded per value.
+
+**Decode: +4.5% over affine4** — a same-session interleaved A/B (2 rounds ×
+10 runs each, drift-cancelled): scale4 **131.9** vs affine4 **126.3** tok/s
+(MAD ≤1.1%), with the untouched BF16 control at **59.41** (≈ the known-good
+59.7 — session valid, not throttled). Why +4.5% and not the naive 18/20 = 10%:
+the byte saving is only on the seven 4-bit *projections*; decode also streams
+the unchanged BF16 lm_head, embeddings, and norms plus the KV cache, and pays
+fixed per-step overhead. The whole artifact is **7.4% smaller** (3.05 → 2.83
+GiB), and the realized decode win tracks a bit under that — exactly the
+weight-bandwidth law the kill section established. **Prefill is parity** with
+affine4 (same-session A/B: scale4-tensor 3,752 vs affine4-tensor 3,811 tok/s,
+−1.6%; scale4's tensor kernel is 4.15× its own simdgroup path), as expected:
+prefill is compute-bound on `matmul2d`, so dropping one dequant term per block
+is marginal.
+
+Quality is a small, honest cost of the symmetric format: the full-vocab logit
+**NMSE is 4.4e-3** against the BF16 reference with **argmax exact** (bound
+3e-2, shared with affine4) — well inside the Q4-class gate. Correctness is
+frozen by fingerprint in both env states: tensor prefill
+**18bed8f354933b6a** (matrix-vs-vector NMSE 3.0e-06, vs CPU oracle 1.6e-06),
+simdgroup (`KIPP_METAL_TENSOR_DISABLE=1`) **4bb690d2528803fe**; the operator
+suite (38/0) exercises both scale4 kernels against an integer-exact synthetic
+reference at tolerance 0. Records:
+[`4b-scale4_gs32-decode`](../bench/results/4b-scale4_gs32-decode.json) 128.9,
+[`-prefill`](../bench/results/4b-scale4_gs32-prefill.json) 2,460,
+[`-prefill2k`](../bench/results/4b-scale4_gs32-prefill2k.json) 3,842 tok/s.
+
+Note on comparability: the +4.5% and the prefill-parity figures are
+**same-session interleaved A/Bs**, not subtractions of committed records —
+cross-session record subtraction is unreliable here (affine4's committed
+prefill2k of 2,868 is a cooler v0.0.8 session; this session affine4 prefill
+measured ~3,811). Against llama.cpp, scale4 is now **format-matched** to Q4_0
+(both scale-only 4-bit, same 18-byte block), so the residual decode gap
+(Kipp ~132, llama.cpp Q4_0 149.6, ≈1.13× — down from affine4's 1.17×) is
+engine efficiency, not format. Perplexity was not re-run for this release
+(the full wikitext-2 sweep is ~2.4 h/scheme); the NMSE above is the quality
+gate, and a scale4 ppl entry can be added to `ppl-4b.json` later.
+
 ## Optimized Metal kernels on Apple M5 (v0.0.1)
 
 Measured on 2026-07-13 with Kipp v0.0.1's batched Metal path: one serial compute

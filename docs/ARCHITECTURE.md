@@ -165,20 +165,28 @@ published format and Kipp's deliberately small required subset.
 
 An artifact may quantize the seven per-layer projection tensors while
 keeping the token embedding, lm_head, and all norms in BF16. A
-`kipp.quant.scheme` metadata string (`bf16`, `q8_0`, or `affine4_gs32`)
-records the scheme, and the tensor directory carries the per-tensor type;
-the loader validates both. Two formats, both operating on 32-weight blocks
-with `columns % 32 == 0` (true for every family dimension):
+`kipp.quant.scheme` metadata string (`bf16`, `q8_0`, `affine4_gs32`, or
+`scale4_gs32`) records the scheme, and the tensor directory carries the
+per-tensor type; the loader validates both. Three quantized formats, all
+operating on 32-weight blocks with `columns % 32 == 0` (true for every family
+dimension):
 
 - **Q8_0** — `{fp16 scale; int8 qs[32]}`, 34 bytes/block (8.5 bpw),
   `w = scale·q`. Near-lossless (full-logit NMSE under the BF16 gate bound).
 - **AFFINE4_GS32** — `{16 packed nibbles; fp16 scale; fp16 bias}`, 20
-  bytes/group (5.0 bpw), `w = scale·q + bias`, `q ∈ [0,15]`. Q4-class.
+  bytes/group (5.0 bpw), `w = scale·q + bias`, `q ∈ [0,15]`. Q4-class,
+  asymmetric (per-group min/max fit).
+- **SCALE4_GS32** — `{16 packed nibbles; fp16 scale}`, 18 bytes/group
+  (4.5 bpw), `w = scale·(q − 8)`, `q ∈ [0,15]`. Q4_0-class: scale-only,
+  symmetric via the implicit −8 zero-point (no per-group bias). Trades a
+  little quality for the smaller block — 10% less 4-bit weight traffic than
+  affine4, which matters most for bandwidth-bound decode.
 
 The CPU reference dequantizes per block inside a type-dispatched matvec;
 Metal selects kernels by the weight tensor's type: token-tiled
-`kipp_matvec_q8_0`/`kipp_matvec_affine4` vector kernels for decode, and
-simdgroup-matrix `kipp_matmul_q8_0`/`kipp_matmul_affine4` kernels for
+`kipp_matvec_q8_0`/`kipp_matvec_affine4`/`kipp_matvec_scale4` vector kernels
+for decode, and simdgroup-matrix
+`kipp_matmul_q8_0`/`kipp_matmul_affine4`/`kipp_matmul_scale4` kernels for
 prefill (each 32-weight block dequantized once per 32-token tile, keeping
 quantized prefill at near-parity with BF16). Quantized artifacts
 gate as ordinary artifacts: argmax must match the BF16 reference exactly,

@@ -119,9 +119,12 @@ prefill re-measured 2026-08-09 on the tensor path; decode rows from the
 </tr>
 </tbody>
 </table>
-<p>* affine4 (scale+bias, gs32) and Q4_0 (scale-only) are the closest available
-4-bit schemes, not identical ones — Q4_0 dequantizes more cheaply, affine4
-carries a bias term.</p>
+<p>* affine4 (scale+bias, gs32) is Kipp's higher-quality Q4_1-class 4-bit scheme.
+Kipp also ships <strong>scale4_gs32</strong> (v0.0.9) — scale-only, 18-byte group, now
+format-matched to Q4_0 — which decodes <strong>+4.5% over affine4</strong> (same-session
+A/B, BF16 control valid), narrowing the llama.cpp Q4_0 decode gap to ~1.13×,
+at prefill parity and a full-vocab NMSE of 4.4e-3. See
+<a href="benchmarks.html">BENCHMARKS</a>.</p>
 <p>† The 12,800-token row is a cool-start median (idle-GPU cooldown before each
 run, both engines): the M5 laptop chassis cannot hold steady state under
 sustained long-context prefill. See <a href="benchmarks.html">BENCHMARKS</a>.</p>
@@ -152,7 +155,8 @@ accelerators. Every number traces to a committed file in
 explains why they are all same-session medians rather than best-of runs.</p>
 <p>Also measured: <strong>175× faster TTFT</strong> on a repeated 6,890-token prompt via
 cross-request prefix reuse, Q8_0 perplexity within <strong>0.02%</strong> of BF16, and 4-bit
-affine weights at <strong>128 tok/s</strong> decode.</p>
+decode at <strong>128 tok/s</strong> (affine4) — or <strong>+4.5%</strong> on the new scale-only
+<code>scale4_gs32</code> (v0.0.9), a 2.83 GiB artifact at 4.4e-3 logit NMSE.</p>
 <h3>What it is</h3>
 <ul>
 <li><strong>Readable by design</strong> — follow one token from embeddings to logits through

@@ -617,6 +617,8 @@ static void metal_encode_matvec(id<MTLComputeCommandEncoder> target,
         base = @"kipp_matvec_q8_0";
     } else if (weight->type == KIPP_TENSOR_AFFINE4_GS32) {
         base = @"kipp_matvec_affine4";
+    } else if (weight->type == KIPP_TENSOR_SCALE4_GS32) {
+        base = @"kipp_matvec_scale4";
     }
     NSString *name = [base stringByAppendingString:tokenCount == 1
                                                        ? @"_decode"
@@ -707,7 +709,8 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
      * quantTensorKernelAvailable. */
     if (model.quantTensorKernelAvailable &&
         (weight->type == KIPP_TENSOR_Q8_0 ||
-         weight->type == KIPP_TENSOR_AFFINE4_GS32) &&
+         weight->type == KIPP_TENSOR_AFFINE4_GS32 ||
+         weight->type == KIPP_TENSOR_SCALE4_GS32) &&
         tokenCount >= KIPP_METAL_MM_TENSOR_TOKEN_TILE) {
         (void)workspace;
         metal_matvec_params params = {rows, columns, tokenCount};
@@ -719,7 +722,9 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
             KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP;
         NSString *quantName =
             weight->type == KIPP_TENSOR_Q8_0 ? @"kipp_matmul_q8_0_tensor"
-                                             : @"kipp_matmul_affine4_tensor";
+            : weight->type == KIPP_TENSOR_AFFINE4_GS32
+                ? @"kipp_matmul_affine4_tensor"
+                : @"kipp_matmul_scale4_tensor";
         metal_enc_groups(
             target, metal_pipeline(model, quantName), tokenGroups, rowGroups,
             KIPP_METAL_GROUP_THREADS, ^(id<MTLComputeCommandEncoder> encoder) {
@@ -743,6 +748,11 @@ static void metal_encode_projection(id<MTLComputeCommandEncoder> target,
         rowsPerGroup = KIPP_METAL_MM_QUANT_ROWS_PER_GROUP;
     } else if (weight->type == KIPP_TENSOR_AFFINE4_GS32) {
         name = @"kipp_matmul_affine4";
+        activations = input;
+        tokenTile = KIPP_METAL_MM_QUANT_TOKEN_TILE;
+        rowsPerGroup = KIPP_METAL_MM_QUANT_ROWS_PER_GROUP;
+    } else if (weight->type == KIPP_TENSOR_SCALE4_GS32) {
+        name = @"kipp_matmul_scale4";
         activations = input;
         tokenTile = KIPP_METAL_MM_QUANT_TOKEN_TILE;
         rowsPerGroup = KIPP_METAL_MM_QUANT_ROWS_PER_GROUP;
@@ -1743,11 +1753,14 @@ static int metal_compile_pipelines(
           @"kipp_matvec_q8_0_prefill" : @KIPP_METAL_TOKEN_TILE,
           @"kipp_matvec_affine4_decode" : @1,
           @"kipp_matvec_affine4_prefill" : @KIPP_METAL_TOKEN_TILE,
+          @"kipp_matvec_scale4_decode" : @1,
+          @"kipp_matvec_scale4_prefill" : @KIPP_METAL_TOKEN_TILE,
         }];
     if (matrixKernel) {
         tiles[@"kipp_matmul_bf16"] = @0;
         tiles[@"kipp_matmul_q8_0"] = @0;
         tiles[@"kipp_matmul_affine4"] = @0;
+        tiles[@"kipp_matmul_scale4"] = @0;
         tiles[@"kipp_flash_gqa_prefill"] = @0;
         tiles[@"kipp_mm_geometry"] = @0;
     }
@@ -1830,7 +1843,8 @@ static int metal_compile_pipelines(
     if (tensorKernel) {
         quantTensor = YES;
         for (NSString *qname in @[ @"kipp_matmul_q8_0_tensor",
-                                   @"kipp_matmul_affine4_tensor" ]) {
+                                   @"kipp_matmul_affine4_tensor",
+                                   @"kipp_matmul_scale4_tensor" ]) {
             MTLFunctionConstantValues *values =
                 [[MTLFunctionConstantValues alloc] init];
             [values setConstantValue:&embeddingLength
@@ -1859,6 +1873,7 @@ static int metal_compile_pipelines(
                 quantTensor = NO;
                 [pipelines removeObjectForKey:@"kipp_matmul_q8_0_tensor"];
                 [pipelines removeObjectForKey:@"kipp_matmul_affine4_tensor"];
+                [pipelines removeObjectForKey:@"kipp_matmul_scale4_tensor"];
                 break;
             }
             pipelines[qname] = pipeline;
@@ -2801,23 +2816,30 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                 QM_PADDED_TOKENS = 72,
                 QM_BLOCKS = QM_COLS / 32,
                 QM_Q8_ROW_BYTES = QM_BLOCKS * 34,
-                QM_A4_ROW_BYTES = QM_BLOCKS * 20
+                QM_A4_ROW_BYTES = QM_BLOCKS * 20,
+                QM_S4_ROW_BYTES = QM_BLOCKS * 18
             };
             uint8_t *q8Host = calloc(QM_ROWS, QM_Q8_ROW_BYTES);
             uint8_t *a4Host = calloc(QM_ROWS, QM_A4_ROW_BYTES);
+            uint8_t *s4Host = calloc(QM_ROWS, QM_S4_ROW_BYTES);
             float *inputHost = calloc(QM_PADDED_TOKENS * QM_COLS,
                                       sizeof(*inputHost));
             float *q8Expected = calloc((size_t)QM_TOKENS * QM_ROWS,
                                        sizeof(*q8Expected));
             float *a4Expected = calloc((size_t)QM_TOKENS * QM_ROWS,
                                        sizeof(*a4Expected));
-            if (q8Host == NULL || a4Host == NULL || inputHost == NULL ||
-                q8Expected == NULL || a4Expected == NULL) {
+            float *s4Expected = calloc((size_t)QM_TOKENS * QM_ROWS,
+                                       sizeof(*s4Expected));
+            if (q8Host == NULL || a4Host == NULL || s4Host == NULL ||
+                inputHost == NULL || q8Expected == NULL ||
+                a4Expected == NULL || s4Expected == NULL) {
                 free(q8Host);
                 free(a4Host);
+                free(s4Host);
                 free(inputHost);
                 free(q8Expected);
                 free(a4Expected);
+                free(s4Expected);
                 return metal_fail(error, KIPP_ERROR_MEMORY,
                                   "quantized matmul test allocation failed");
             }
@@ -2836,19 +2858,24 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                         qs[j] = (int8_t)((int)((r + b + 3 * j) % 11) - 5);
                     }
                     uint8_t *grp = a4Host + r * QM_A4_ROW_BYTES + b * 20;
+                    uint8_t *s4 = s4Host + r * QM_S4_ROW_BYTES + b * 18;
                     for (uint32_t k = 0; k < 16; ++k) {
                         uint8_t low = (uint8_t)((r + b + 2 * k) % 16);
                         uint8_t high = (uint8_t)((r + 3 * b + 2 * k + 1) % 16);
                         grp[k] = (uint8_t)(low | (high << 4));
+                        s4[k] = grp[k];
                     }
                     metal_test_store_fp16(grp + 16, 0.5f);
                     metal_test_store_fp16(grp + 18, -3.5f);
+                    /* scale4: same nibbles, scale 0.5, no bias, w=0.5*(q-8). */
+                    metal_test_store_fp16(s4 + 16, 0.5f);
                 }
             }
             for (uint32_t t = 0; t < QM_TOKENS; ++t) {
                 for (uint32_t r = 0; r < QM_ROWS; ++r) {
                     float q8Sum = 0.0f;
                     float a4Sum = 0.0f;
+                    float s4Sum = 0.0f;
                     for (uint32_t c = 0; c < QM_COLS; ++c) {
                         uint32_t b = c / 32;
                         uint32_t j = c % 32;
@@ -2861,11 +2888,14 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                                 ? (float)((r + b + 2 * k) % 16)
                                 : (float)((r + 3 * b + 2 * k + 1) % 16);
                         float a4Weight = 0.5f * nibble - 3.5f;
+                        float s4Weight = 0.5f * (nibble - 8.0f);
                         q8Sum += q8Weight * activation;
                         a4Sum += a4Weight * activation;
+                        s4Sum += s4Weight * activation;
                     }
                     q8Expected[t * QM_ROWS + r] = q8Sum;
                     a4Expected[t * QM_ROWS + r] = a4Sum;
+                    s4Expected[t * QM_ROWS + r] = s4Sum;
                 }
             }
             id<MTLBuffer> inputBuffer = [device
@@ -2880,14 +2910,16 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                 uint8_t *weights;
                 NSUInteger weightBytes;
                 float *expected;
-            } cases[2] = {
+            } cases[3] = {
                 {"matmul_q8_0", @"kipp_matmul_q8_0", q8Host,
                  (NSUInteger)QM_ROWS * QM_Q8_ROW_BYTES, q8Expected},
                 {"matmul_affine4", @"kipp_matmul_affine4", a4Host,
                  (NSUInteger)QM_ROWS * QM_A4_ROW_BYTES, a4Expected},
+                {"matmul_scale4", @"kipp_matmul_scale4", s4Host,
+                 (NSUInteger)QM_ROWS * QM_S4_ROW_BYTES, s4Expected},
             };
             int status = 0;
-            for (int index = 0; index < 2 && status == 0; ++index) {
+            for (int index = 0; index < 3 && status == 0; ++index) {
                 id<MTLBuffer> weightBuffer = [device
                     newBufferWithBytes:cases[index].weights
                                 length:cases[index].weightBytes
@@ -2920,9 +2952,11 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             }
             free(q8Host);
             free(a4Host);
+            free(s4Host);
             free(inputHost);
             free(q8Expected);
             free(a4Expected);
+            free(s4Expected);
             if (status != 0) {
                 return -1;
             }
@@ -3047,23 +3081,30 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                 QT_TOKENS = 133,
                 QT_BLOCKS = QT_COLS / 32,
                 QT_Q8_ROW_BYTES = QT_BLOCKS * 34,
-                QT_A4_ROW_BYTES = QT_BLOCKS * 20
+                QT_A4_ROW_BYTES = QT_BLOCKS * 20,
+                QT_S4_ROW_BYTES = QT_BLOCKS * 18
             };
             uint8_t *q8Host = calloc(QT_ROWS, QT_Q8_ROW_BYTES);
             uint8_t *a4Host = calloc(QT_ROWS, QT_A4_ROW_BYTES);
+            uint8_t *s4Host = calloc(QT_ROWS, QT_S4_ROW_BYTES);
             float *inputHost =
                 calloc((size_t)QT_TOKENS * QT_COLS, sizeof(*inputHost));
             float *q8Expected =
                 calloc((size_t)QT_TOKENS * QT_ROWS, sizeof(*q8Expected));
             float *a4Expected =
                 calloc((size_t)QT_TOKENS * QT_ROWS, sizeof(*a4Expected));
-            if (q8Host == NULL || a4Host == NULL || inputHost == NULL ||
-                q8Expected == NULL || a4Expected == NULL) {
+            float *s4Expected =
+                calloc((size_t)QT_TOKENS * QT_ROWS, sizeof(*s4Expected));
+            if (q8Host == NULL || a4Host == NULL || s4Host == NULL ||
+                inputHost == NULL || q8Expected == NULL ||
+                a4Expected == NULL || s4Expected == NULL) {
                 free(q8Host);
                 free(a4Host);
+                free(s4Host);
                 free(inputHost);
                 free(q8Expected);
                 free(a4Expected);
+                free(s4Expected);
                 return metal_fail(error, KIPP_ERROR_MEMORY,
                                   "quant tensor matmul test allocation failed");
             }
@@ -3081,19 +3122,24 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                         qs[j] = (int8_t)((int)((r + b + 3 * j) % 11) - 5);
                     }
                     uint8_t *grp = a4Host + r * QT_A4_ROW_BYTES + b * 20;
+                    uint8_t *s4 = s4Host + r * QT_S4_ROW_BYTES + b * 18;
                     for (uint32_t k = 0; k < 16; ++k) {
                         uint8_t low = (uint8_t)((r + b + 2 * k) % 16);
                         uint8_t high = (uint8_t)((r + 3 * b + 2 * k + 1) % 16);
                         grp[k] = (uint8_t)(low | (high << 4));
+                        s4[k] = grp[k];
                     }
                     metal_test_store_fp16(grp + 16, 0.5f);
                     metal_test_store_fp16(grp + 18, -3.5f);
+                    /* scale4: same nibbles, scale 0.5, no bias, w=0.5*(q-8). */
+                    metal_test_store_fp16(s4 + 16, 0.5f);
                 }
             }
             for (uint32_t t = 0; t < QT_TOKENS; ++t) {
                 for (uint32_t r = 0; r < QT_ROWS; ++r) {
                     float q8Sum = 0.0f;
                     float a4Sum = 0.0f;
+                    float s4Sum = 0.0f;
                     for (uint32_t c = 0; c < QT_COLS; ++c) {
                         uint32_t b = c / 32;
                         uint32_t j = c % 32;
@@ -3106,11 +3152,14 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                                 ? (float)((r + b + 2 * k) % 16)
                                 : (float)((r + 3 * b + 2 * k + 1) % 16);
                         float a4Weight = 0.5f * nibble - 3.5f;
+                        float s4Weight = 0.5f * (nibble - 8.0f);
                         q8Sum += q8Weight * activation;
                         a4Sum += a4Weight * activation;
+                        s4Sum += s4Weight * activation;
                     }
                     q8Expected[t * QT_ROWS + r] = q8Sum;
                     a4Expected[t * QT_ROWS + r] = a4Sum;
+                    s4Expected[t * QT_ROWS + r] = s4Sum;
                 }
             }
             id<MTLBuffer> inputBuffer = [device
@@ -3125,14 +3174,16 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
                 uint8_t *weights;
                 NSUInteger weightBytes;
                 float *expected;
-            } cases[2] = {
+            } cases[3] = {
                 {"matmul_q8_0_tensor", @"kipp_matmul_q8_0_tensor", q8Host,
                  (NSUInteger)QT_ROWS * QT_Q8_ROW_BYTES, q8Expected},
                 {"matmul_affine4_tensor", @"kipp_matmul_affine4_tensor", a4Host,
                  (NSUInteger)QT_ROWS * QT_A4_ROW_BYTES, a4Expected},
+                {"matmul_scale4_tensor", @"kipp_matmul_scale4_tensor", s4Host,
+                 (NSUInteger)QT_ROWS * QT_S4_ROW_BYTES, s4Expected},
             };
             int status = 0;
-            for (int index = 0; index < 2 && status == 0; ++index) {
+            for (int index = 0; index < 3 && status == 0; ++index) {
                 id<MTLBuffer> weightBuffer = [device
                     newBufferWithBytes:cases[index].weights
                                 length:cases[index].weightBytes
@@ -3166,9 +3217,11 @@ int kipp_metal_run_operator_tests(kipp_error *error) {
             }
             free(q8Host);
             free(a4Host);
+            free(s4Host);
             free(inputHost);
             free(q8Expected);
             free(a4Expected);
+            free(s4Expected);
             if (status != 0) {
                 return -1;
             }
@@ -3661,6 +3714,11 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
          KIPP_METAL_MM_QUANT_ROWS_PER_GROUP, 0, 0},
         {"affine4", "kipp_matmul_affine4", KIPP_METAL_MM_QUANT_TOKEN_TILE,
          KIPP_METAL_MM_QUANT_ROWS_PER_GROUP, 0, 0},
+        {"scale4", "kipp_matmul_scale4", KIPP_METAL_MM_QUANT_TOKEN_TILE,
+         KIPP_METAL_MM_QUANT_ROWS_PER_GROUP, 0, 0},
+        {"scale4-tensor", "kipp_matmul_scale4_tensor",
+         KIPP_METAL_MM_TENSOR_TOKEN_TILE, KIPP_METAL_MM_TENSOR_ROWS_PER_GROUP,
+         1, 1},
     };
     metal_clear_error(error);
     @autoreleasepool {
@@ -3706,6 +3764,8 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
                     rowBytes = (size_t)columns * sizeof(uint16_t);
                 } else if (strcmp(schemes[s].name, "q8_0") == 0) {
                     rowBytes = (size_t)(columns / 32) * 34;
+                } else if (strncmp(schemes[s].name, "scale4", 6) == 0) {
+                    rowBytes = (size_t)(columns / 32) * 18;
                 } else {
                     rowBytes = (size_t)(columns / 32) * 20;
                 }
@@ -3723,9 +3783,9 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
                             (float)((int)(i % 7) - 3));
                     }
                 } else {
-                    /* Per 32-value block: an FP16 scale (0.5 = 0x3800; the
-                     * affine kernel adds bias -3.5 = 0xc300 at offset 18) in
-                     * front of patterned int8 or packed-nibble payloads. */
+                    /* Per 32-value block: an FP16 scale (0.5 = 0x3800; affine4
+                     * adds bias -3.5 = 0xc300 at offset 18, scale4 has no bias)
+                     * in front of patterned int8 or packed-nibble payloads. */
                     uint8_t *w = weights[0].contents;
                     size_t blockBytes = rowBytes / (columns / 32);
                     for (size_t b = 0; b < weightBytes / blockBytes; ++b) {
@@ -3737,13 +3797,17 @@ int kipp_metal_run_mm_bench(kipp_error *error) {
                                 block[2 + i] = (uint8_t)(i * 5 + b);
                             }
                         } else {
+                            /* 4-bit: 16 packed nibbles then the fp16 scale;
+                             * affine4 (20B) also carries an fp16 bias. */
                             for (size_t i = 0; i < 16; ++i) {
                                 block[i] = (uint8_t)(i * 3 + b);
                             }
                             block[16] = 0x00;
                             block[17] = 0x38;
-                            block[18] = 0x00;
-                            block[19] = 0xc3;
+                            if (blockBytes == 20) {
+                                block[18] = 0x00;
+                                block[19] = 0xc3;
+                            }
                         }
                     }
                 }

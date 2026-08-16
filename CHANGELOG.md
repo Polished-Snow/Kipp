@@ -3,6 +3,34 @@
 All notable changes to Kipp are recorded here. Versions are pinned to the
 BF16 reference behavior: the v0.0.1 forward pass remains byte-identical.
 
+## v0.0.9 — 2026-08-14
+
+### A scale-only 4-bit weight scheme (`scale4_gs32`)
+- **New Q4_0-class quantization scheme** alongside affine4. Each 32-weight
+  group is 16 packed nibbles plus one fp16 scale (18 bytes, 4.5 bpw),
+  symmetric via the implicit −8 zero-point: `w = scale·(q − 8)`. It drops
+  affine4's per-group bias (20 → 18 bytes), so it is scale-only where affine4
+  is affine — format-matched to llama.cpp's Q4_0. Convert with
+  `tools/convert_to_gguf.py --quant scale4_gs32`; the scheme is selected by
+  the loaded artifact, no runtime flag.
+- **Decode +4.5% over affine4** on an M5 Max — a same-session interleaved A/B
+  (scale4 131.9 vs affine4 126.3 tok/s, MAD ≤1.1%, BF16 control 59.41 valid).
+  The 18/20 byte saving lands only on the 4-bit projections (decode also
+  streams BF16 lm_head/embeddings/norms + KV), so the whole artifact is 7.4%
+  smaller (3.05 → 2.83 GiB) and the decode win tracks a bit under that — the
+  weight-bandwidth floor, not a kernel defect. **Prefill is parity** with
+  affine4 (compute-bound on `matmul2d`; same-session A/B −1.6%).
+- **Quality:** full-vocab logit NMSE 4.4e-3 vs BF16 with argmax exact (bound
+  3e-2, shared with affine4). A small, honest cost of the symmetric format;
+  perplexity was not re-run (the wikitext-2 sweep is ~2.4 h/scheme).
+- **Full backend + gate parity:** CPU oracle, all three Metal kernels (matvec
+  decode, simdgroup prefill, tensor prefill, inheriting the graceful
+  quant-tensor demotion / `REQUIRE_TENSOR` gate), and the converter. Frozen by
+  fingerprint in both env states — tensor `18bed8f354933b6a`, simdgroup
+  `4bb690d2528803fe` — and by a tolerance-0 synthetic operator case (suite
+  38/0). CUDA stays BF16-only, as with q8_0/affine4. BF16/Q8_0/affine4
+  behavior is byte-identical; the change is purely additive.
+
 ## v0.0.8 — 2026-08-09
 
 ### Quantized projections on the Metal 4 tensor pipeline

@@ -42,7 +42,8 @@ typedef struct {
 typedef enum {
     KIPP_QUANT_BF16 = 0,
     KIPP_QUANT_Q8_0 = 1,
-    KIPP_QUANT_AFFINE4_GS32 = 2
+    KIPP_QUANT_AFFINE4_GS32 = 2,
+    KIPP_QUANT_SCALE4_GS32 = 3
 } kipp_quant_scheme;
 
 /*
@@ -77,20 +78,24 @@ typedef struct {
 } kipp_model_config;
 
 /*
- * ggml type ids for BF16 (30) and Q8_0 (8); AFFINE4_GS32 is a Kipp-private
- * id. Q8_0 packs 32 weights as {fp16 scale; int8 qs[32]} = 34 bytes;
- * AFFINE4_GS32 packs 32 as {uint8 nibbles[16]; fp16 scale; fp16 bias} = 20
- * bytes with w = scale*q + bias.
+ * ggml type ids for BF16 (30) and Q8_0 (8); AFFINE4_GS32 and SCALE4_GS32 are
+ * Kipp-private ids. Q8_0 packs 32 weights as {fp16 scale; int8 qs[32]} = 34
+ * bytes; AFFINE4_GS32 packs 32 as {uint8 nibbles[16]; fp16 scale; fp16 bias}
+ * = 20 bytes with w = scale*q + bias; SCALE4_GS32 packs 32 as {uint8
+ * nibbles[16]; fp16 scale} = 18 bytes with w = scale*(q - 8) (scale-only,
+ * symmetric via the implicit -8 zero-point, no per-group bias).
  */
 typedef enum {
     KIPP_TENSOR_Q8_0 = 8,
     KIPP_TENSOR_BF16 = 30,
-    KIPP_TENSOR_AFFINE4_GS32 = 1000
+    KIPP_TENSOR_AFFINE4_GS32 = 1000,
+    KIPP_TENSOR_SCALE4_GS32 = 1001
 } kipp_tensor_type;
 
 #define KIPP_QUANT_BLOCK 32u
 #define KIPP_Q8_0_BLOCK_BYTES 34u
 #define KIPP_AFFINE4_GROUP_BYTES 20u
+#define KIPP_SCALE4_GROUP_BYTES 18u
 
 typedef struct {
     const char *name;
